@@ -1,0 +1,14 @@
+[build-system]
+requires = ["scikit-build-core>=0.7", "pybind11>=2.11"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "proumap"
+version = "0.0.1"
+requires-python = ">=3.9"
+dependencies = ["numpy"]
+
+[tool.scikit-build]
+cmake.minimum-version = "3.24"
+build-dir = "build/{wheel_tag}"
+wheel.packages = ["python/proumap"]

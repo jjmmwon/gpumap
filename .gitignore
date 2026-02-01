@@ -1,0 +1,110 @@
+# -----------------------------
+# Build directories
+# -----------------------------
+build/
+build-*/
+out/
+bin/
+lib/
+
+# CMake cache and files
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+compile_commands.json
+CTestTestfile.cmake
+*.cmake.user
+
+# Ninja / Make
+.ninja*
+.ninja_deps
+.ninja_log
+
+# -----------------------------
+# Object / binary files
+# -----------------------------
+*.o
+*.obj
+*.a
+*.so
+*.so.*
+*.dll
+*.dylib
+*.exe
+*.out
+
+# CUDA intermediate files
+*.cu.o
+*.ptx
+*.cubin
+*.fatbin
+*.nvvp
+*.gpudmp
+
+# -----------------------------
+# Python
+# -----------------------------
+__pycache__/
+*.py[cod]
+*.pyd
+*.pyo
+*.egg-info/
+dist/
+build/
+*.whl
+
+# venv / conda / poetry
+.venv/
+venv/
+env/
+.conda/
+poetry.lock
+
+# -----------------------------
+# IDE / Editor
+# -----------------------------
+.vscode/
+.idea/
+*.swp
+*.swo
+*.swn
+*~
+
+# clangd / LSP
+.cache/
+.clangd/
+.clang-format
+.clang-tidy
+
+# -----------------------------
+# OS
+# -----------------------------
+.DS_Store
+Thumbs.db
+
+# -----------------------------
+# Logs / temp
+# -----------------------------
+*.log
+*.tmp
+*.bak
+
+# -----------------------------
+# Dataset / Large outputs (optional)
+# -----------------------------
+data/
+outputs/
+checkpoints/
+results/
+
+
+# -----------------------------
+# Test files
+# -----------------------------
+tests/
+
+# -----------------------------
+# Misc
+# -----------------------------
+build_scripts.txt

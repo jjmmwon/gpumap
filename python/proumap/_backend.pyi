@@ -1,0 +1,6 @@
+import cupy as cp
+
+def add_f32(a: cp.ndarray, b: cp.ndarray, out: cp.ndarray) -> None: ...
+def print_device_matrix_f32(
+    x: cp.ndarray, max_rows: int = 4, max_cols: int = 8
+) -> None: ...
