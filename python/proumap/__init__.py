@@ -1,3 +1,3 @@
-from .api import print_device_matrix_f32, add_f32
+from .proumap import ProUMAP
 
-__all__ = ["print_device_matrix_f32", "add_f32"]
+__all__ = ["ProUMAP"]

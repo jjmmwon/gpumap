@@ -27,15 +27,9 @@ set_target_properties(_backend PROPERTIES
   CUDA_RESOLVE_DEVICE_SYMBOLS ON
 )
 
-get_target_property(_inc _backend INCLUDE_DIRECTORIES)
-message(STATUS "_backend INCLUDE_DIRECTORIES=${_inc}")
-
 
 install(TARGETS _backend
   LIBRARY DESTINATION proumap
   RUNTIME DESTINATION proumap
   ARCHIVE DESTINATION proumap
 )
-
-get_target_property(_libs _backend LINK_LIBRARIES)
-message(STATUS "_backend LINK_LIBRARIES=${_libs}")
