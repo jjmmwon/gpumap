@@ -5,7 +5,7 @@ import cupy as cp
 
 from proumap.types import ProUMAPConfig
 from proumap.validators import validate_data_chunk
-from . import _core
+import proumap._core as core
 
 
 class ProUMAP:
@@ -18,7 +18,7 @@ class ProUMAP:
 
     def __init__(self, config: Optional[ProUMAPConfig] = None):
         self.config = config or ProUMAPConfig()
-        self._impl: _core.ProUMAPImpl = _core.ProUMAPImpl(self.config)
+        self._impl: core.ProUMAPImpl = core.ProUMAPImpl(self.config)
 
         self._feature_dim: Optional[int] = None
 
