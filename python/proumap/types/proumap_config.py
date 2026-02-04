@@ -23,7 +23,6 @@ class ProUMAPConfig:
 
     n_neighbors: int = 15
     n_components: int = 2
-    max_instances: int = 1000000
     metric: str = "euclidean"
     n_epochs: int = 200
     min_dist: float = 0.1
@@ -33,4 +32,5 @@ class ProUMAPConfig:
     random_state: int = 42
 
     # parameters for progressive algorithm
+    max_instances: int = 1000000
     batch_size_hint: int = 1024
