@@ -28,10 +28,10 @@ public:
   Idx_t n_rows = 0;
 
   // Four matrices for different purposes
-  DeviceMatrix2D<Data_t, Idx_t> progressive_data;   // Progressive data matrix
-  DeviceMatrix2D<Idx_t, Idx_t> neighbor_indices;    // Neighbor indices
-  DeviceMatrix2D<Data_t, Idx_t> neighbor_distances; // Neighbor distances
-  DeviceMatrix2D<Data_t, Idx_t> embedding_matrix;   // Current embeddings
+  DeviceMatrix2D<Data_t, Idx_t> progressive_data;  // Progressive data matrix
+  DeviceMatrix2D<Idx_t, Idx_t> neighbor_indices;   // Neighbor indices
+  DeviceMatrix2D<float, Idx_t> neighbor_distances; // Neighbor distances
+  DeviceMatrix2D<float, Idx_t> embedding_matrix;   // Current embeddings
 
   StorageManager() = default;
 

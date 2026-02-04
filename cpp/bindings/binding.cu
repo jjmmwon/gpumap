@@ -6,9 +6,6 @@
 #include <string>
 #include <vector>
 
-#include "proumap/print_device.cuh"
-#include "proumap/vector_add.cuh"
-
 namespace py = pybind11;
 
 // ---------- CUDA array interface parsing helpers ----------
