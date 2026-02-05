@@ -7,12 +7,14 @@ find_package(raft CONFIG REQUIRED)
 find_package(cuvs CONFIG REQUIRED)
 
 pybind11_add_module(_core MODULE
-  ${PROJECT_SOURCE_DIR}/bindings/binding.cu
-  ${PROJECT_SOURCE_DIR}/cpp/src/proumap.cu
+  ${CMAKE_CURRENT_SOURCE_DIR}/bindings/binding.cu
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/proumap_impl.cu
 )
 
 target_include_directories(_core PRIVATE
-  ${PROJECT_SOURCE_DIR}/cpp/include
+  ${CMAKE_CURRENT_SOURCE_DIR}/include
+  ${CMAKE_CURRENT_SOURCE_DIR}/src
+  ${CMAKE_CURRENT_SOURCE_DIR}/bindings
 )
 
 target_link_libraries(_core PRIVATE pybind11::headers)
@@ -22,6 +24,10 @@ target_link_libraries(_core PRIVATE
   rmm::rmm
   raft::raft
   cuvs::cuvs
+)
+
+target_compile_definitions(_core PRIVATE
+  LIBCUDACXX_ENABLE_EXPERIMENTAL_MEMORY_RESOURCE
 )
 
 
