@@ -1,13 +1,7 @@
-from typing import Optional
-
 import numpy as np
-import cupy as cp
 
 
-def validate_data_chunk(
-    data_chunk: np.ndarray | cp.ndarray, feature_dim: Optional[int]
-) -> int:
-
+def validate_data_chunk(data_chunk: np.ndarray, feature_dim: int) -> int:
     shape = data_chunk.shape
 
     if len(shape) != 2:

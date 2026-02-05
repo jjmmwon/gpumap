@@ -1,3 +1,6 @@
-from .proumap import ProUMAP
+from __future__ import annotations
 
-__all__ = ["ProUMAP"]
+from .proumap import ProUMAP
+from ._core import ProUMAPConfig
+
+__all__ = ["ProUMAP", "ProUMAPConfig"]

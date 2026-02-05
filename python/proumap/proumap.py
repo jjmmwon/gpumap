@@ -1,11 +1,12 @@
-from typing import Optional
+from __future__ import annotations
 
 import numpy as np
 import cupy as cp
 
-from proumap.types import ProUMAPConfig
 from proumap.validators import validate_data_chunk
-import proumap._core as core
+from proumap.utils import _as_f32_c_contig_2d
+
+from . import _core
 
 
 class ProUMAP:
@@ -16,36 +17,33 @@ class ProUMAP:
             default configuration will be used.
     """
 
-    def __init__(self, config: Optional[ProUMAPConfig] = None):
-        self.config = config or ProUMAPConfig()
-        self._impl: core.ProUMAPImpl = core.ProUMAPImpl(self.config)
-
-        self._feature_dim: Optional[int] = None
+    def __init__(self, config: _core.ProUMAPConfig):
+        self._config = config
+        self._impl = _core.ProUMAP(self.config)
 
         self._closed = False
+
+    @property
+    def config(self) -> _core.ProUMAPConfig:
+        return self._config
 
     def close(self):
         if not self._closed:
             self._impl.close()
             self._closed = True
 
-    def append(self, data_chunk: np.ndarray | cp.ndarray):
+    def append(self, data_chunk: np.ndarray):
         try:
-            self._feature_dim = validate_data_chunk(data_chunk, self._feature_dim)
+            validate_data_chunk(data_chunk, self._config.n_features)
+            data_chunk = _as_f32_c_contig_2d(data_chunk)
         except ValueError as e:
             print(f"Error validating data chunk: {e}")
             return
 
-        self._impl.append(data_chunk)
+        self._impl.append_data(data_chunk)
 
-    def run_nn(self, chunk_size: int) -> None:
-        self._impl.run_nn(chunk_size)
+    def run_nng_build(self, chunk_size: int) -> None:
+        self._impl.run_nng_build()
 
-    def run_embedding(self, chunk_size: int) -> None:
-        self._impl.run_embedding(chunk_size)
-
-    def get_embeddings(self) -> np.ndarray | cp.ndarray:
-        return self._impl.get_embeddings()
-
-    def get_current_status(self):
-        return self._impl.get_current_status()
+    def run_optimize_embeddings(self, chunk_size: int) -> None:
+        self._impl.run_optimize_embeddings()
