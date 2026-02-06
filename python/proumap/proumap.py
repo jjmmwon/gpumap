@@ -47,3 +47,7 @@ class ProUMAP:
 
     def run_optimize_embeddings(self, chunk_size: int) -> None:
         self._impl.run_optimize_embeddings()
+
+    def get_data_view(self) -> cp.ndarray:
+        data_view = cp.asarray(self._impl.get_data_view())
+        return data_view

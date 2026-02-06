@@ -5,6 +5,7 @@
 #include <pybind11/stl.h>
 
 #include "proumap/proumap.cuh"
+#include "utils/cai_wrapper.cuh"
 #include "utils/numpy_utils.cuh"
 
 namespace py = pybind11;
@@ -36,5 +37,13 @@ public:
   }
 
   void run_nng_build() { model.run_nng_build(); }
-  void run_optimize_embeddings() { model.run_optimize_embeddings(); }
+  void run_embedding_optimization() { model.run_embedding_optimization(); }
+
+  py::object get_data_view() const {
+    return binding_utils::to_cai_object(model.get_data_view());
+  }
+
+  py::object get_embedding_view() const {
+    return binding_utils::to_cai_object(model.get_embedding_view());
+  }
 };

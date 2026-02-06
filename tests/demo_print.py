@@ -1,13 +1,34 @@
-import cupy as cp
-from proumap import add_f32, print_device_matrix_f32
+import numpy as np
 
-a = cp.arange(10, dtype=cp.float32)
-b = cp.ones(10, dtype=cp.float32) * 2
+from proumap import ProUMAP
+from proumap._core import ProUMAPConfig
 
-c = add_f32(a, b)
-print(c)
-print(cp.asnumpy(c))
 
-# (옵션) matrix print도 확인
-x = cp.arange(5 * 12, dtype=cp.float32).reshape(5, 12)
-print_device_matrix_f32(x, max_rows=3, max_cols=6)
+def main() -> None:
+    pumap_cfg = ProUMAPConfig()
+    pumap_cfg.n_neighbors = 15
+    pumap_cfg.n_components = 2
+    pumap_cfg.min_dist = 0.1
+    pumap_cfg.n_epochs = 200
+    pumap_cfg.negative_sample_rate = 5
+    pumap_cfg.verbose = True
+    pumap_cfg.max_instances = 100000
+    pumap_cfg.batch_size_hint = 1024
+    pumap_cfg.n_features = 10
+
+    model = ProUMAP(pumap_cfg)
+
+    for i in range(10):
+        data_chunk = np.random.rand(1024, 10).astype(np.float32)
+
+        model.append(data_chunk)
+        data = model.get_data_view()
+
+        print(f"Data chunk tail:\n{data_chunk[-5:]}")
+        print(f"Data tail: \n{data[-5:]}")
+        print(f"Data shape: {data.shape}")
+        print(data.device)
+
+
+if __name__ == "__main__":
+    main()

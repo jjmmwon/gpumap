@@ -18,7 +18,9 @@ void ProUMAP::append_data(const float *ptr, Idx_t rows, Idx_t cols) {
 
 void ProUMAP::run_nng_build() { impl_->run_nng_build(); }
 
-void ProUMAP::run_optimize_embeddings() { impl_->run_optimize_embeddings(); }
+void ProUMAP::run_embedding_optimization() {
+  impl_->run_embedding_optimization();
+}
 
 ProUMAP::DataView ProUMAP::get_data_view() const {
   return impl_->get_data_view();

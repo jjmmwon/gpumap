@@ -31,5 +31,8 @@ PYBIND11_MODULE(_core, m) {
       .def(py::init<const proumap::ProUMAPConfig &>(), py::arg("config"))
       .def("append_data", &ProUMAPWrapper::append_data, py::arg("x"))
       .def("run_nng_build", &ProUMAPWrapper::run_nng_build)
-      .def("run_optimize_embeddings", &ProUMAPWrapper::run_optimize_embeddings);
+      .def("run_embedding_optimization",
+           &ProUMAPWrapper::run_embedding_optimization)
+      .def("get_data_view", &ProUMAPWrapper::get_data_view)
+      .def("get_embedding_view", &ProUMAPWrapper::get_embedding_view);
 };

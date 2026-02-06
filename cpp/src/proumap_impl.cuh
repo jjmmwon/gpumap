@@ -12,6 +12,7 @@ struct ProUMAP::Impl {
 
   ProUMAPConfig config;
 
+  // queue obj
   storage::StorageManager<Data_t, Idx_t> storage_manager;
 
   Impl(const ProUMAPConfig &config_)
@@ -25,8 +26,12 @@ struct ProUMAP::Impl {
                                 n_new_rows);
   }
 
-  void run_nng_build() {}
-  void run_optimize_embeddings() {}
+  void run_nng_build(int n_items) {
+    // NNG build implementation placeholder
+  }
+  void run_embedding_optimization(int n_items) {
+    // Embedding optimization implementation placeholder
+  }
 
   auto get_data_view() const
       -> raft::device_matrix_view<const Data_t, Idx_t, raft::row_major> {

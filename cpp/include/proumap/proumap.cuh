@@ -52,7 +52,7 @@ public:
   void append_data(const float *ptr, Idx_t n_new_rows, Idx_t n_new_cols);
 
   void run_nng_build();
-  void run_optimize_embeddings();
+  void run_embedding_optimization();
 
   DataView get_data_view() const;
   EmbedView get_embedding_view() const;
