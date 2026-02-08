@@ -48,6 +48,15 @@ template <typename Data_t, typename Idx_t = uint32_t> struct DeviceMatrix2D {
     return raft::make_device_matrix_view<const Data_t, Idx_t, raft::row_major>(
         ptr, n_sub_rows, max_cols);
   }
+
+  void append_device(const Data_t *src_device, Idx_t n_new_rows,
+                     rmm::cuda_stream_view stream = rmm::cuda_stream_default);
+  void append_host(const Data_t *src_host, Idx_t n_new_rows,
+                   rmm::cuda_stream_view stream = rmm::cuda_stream_default);
+  void
+  overwrite_device(const Data_t *src_device, Idx_t row_start,
+                   Idx_t n_overwrite_rows,
+                   rmm::cuda_stream_view stream = rmm::cuda_stream_default);
 };
 } // namespace storage
 } // namespace proumap

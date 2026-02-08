@@ -1,8 +1,8 @@
 #pragma once
 
 #include "proumap/proumap.cuh"
-#include "storage/matrix_utils.cuh"
-#include "storage/storage_manager.cuh"
+#include "proumap_queue.cuh"
+#include "proumap_storage.cuh"
 
 namespace proumap {
 
@@ -12,35 +12,31 @@ struct ProUMAP::Impl {
 
   ProUMAPConfig config;
 
-  // queue obj
-  storage::StorageManager<Data_t, Idx_t> storage_manager;
+  storage::Storage<Data_t, Idx_t> storage;
 
   Impl(const ProUMAPConfig &config_)
-      : config(config_),
-        storage_manager(config_.max_instances, config_.n_features,
-                        config_.n_neighbors, 4) {}
+      : config(config_), storage(config_.max_instances, config_.n_features,
+                                 config_.n_neighbors) {}
 
   void append_data(const Data_t *ptr, Idx_t n_new_rows, Idx_t n_new_cols) {
-    storage::utils::append_host(storage_manager.get_data_manage_resources(),
-                                storage_manager.progressive_data, ptr,
-                                n_new_rows);
+    storage.data.append_device(ptr, n_new_rows, rmm::cuda_stream_default);
   }
 
-  void run_nng_build(int n_items) {
+  void run_nng_build() {
     // NNG build implementation placeholder
   }
-  void run_embedding_optimization(int n_items) {
+  void run_embedding_optimization() {
     // Embedding optimization implementation placeholder
   }
 
   auto get_data_view() const
       -> raft::device_matrix_view<const Data_t, Idx_t, raft::row_major> {
-    return storage_manager.get_data_view();
+    return storage.data.view();
   }
 
   auto get_embedding_view() const
       -> raft::device_matrix_view<const Data_t, Idx_t, raft::row_major> {
-    return storage_manager.get_embedding_view();
+    return storage.embedding.view();
   }
 };
 } // namespace proumap
