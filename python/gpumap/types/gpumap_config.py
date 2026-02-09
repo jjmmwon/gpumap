@@ -49,7 +49,6 @@ class GPUMAPConfig(UMAPConfig):
         batch_size_hint (int): Hint for the batch size in the progressive algorithm.
     """
 
-    # parameters for progressive algorithm
-    max_instances: int = 1000000
-    batch_size_hint: int = 1024
-    n_features: int = 0
+    n_instances: int
+    n_dims: int
+
