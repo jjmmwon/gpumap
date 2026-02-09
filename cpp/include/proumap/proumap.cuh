@@ -1,4 +1,4 @@
-// include/gpumap/gpumap.cuh
+// include/proumap/proumap.cuh
 #pragma once
 
 #include <cstdint>
@@ -8,30 +8,26 @@
 #include <raft/core/device_mdspan.hpp>
 #include <raft/core/mdspan_types.hpp>
 
-namespace gpumap {
+namespace proumap {
 
 struct UMAPConfig {
-  size_t n_neighbors = 15;
-  size_t n_components = 2;
+  int n_neighbors = 15;
+  int n_components = 2;
   float min_dist = 0.1f;
-  size_t n_epochs = 200;
-  size_t negative_sample_rate = 5;
+  int n_epochs = 200;
+  int negative_sample_rate = 5;
   bool verbose = false;
 };
 
-struct GPUMAPConfig : public UMAPConfig {
-  size_t n_instances;
-  size_t n_features;
-
-  GPUMAPConfig(size_t n_instances_, size_t n_features_)
-      : n_instances(n_instances_), n_features(n_features_) {}
-
-  // size_t batch_size_hint = 1024;
+struct ProUMAPConfig : public UMAPConfig {
+  int max_instances = 1000000;
+  int batch_size_hint = 1024;
+  int n_features = 0;
 };
 
 // Public, non-template API (bind this from pybind).
 // Internals (StorageManager, streams, RMM, etc.) stay in src via PImpl.
-class GPUMAP {
+class ProUMAP {
 public:
   using Data_t = float;
   using Idx_t = uint32_t;
@@ -40,17 +36,17 @@ public:
   using EmbedView =
       raft::device_matrix_view<const Data_t, Idx_t, raft::row_major>;
 
-  GPUMAP(const GPUMAPConfig &config);
+  ProUMAP();
+  ProUMAP(const ProUMAPConfig &config);
 
   // Move-only
-  GPUMAP(const GPUMAP &) = delete;
-  GPUMAP &operator=(const GPUMAP &) = delete;
-  GPUMAP(GPUMAP &&) noexcept;
-  GPUMAP &operator=(GPUMAP &&) noexcept;
+  ProUMAP(const ProUMAP &) = delete;
+  ProUMAP &operator=(const ProUMAP &) = delete;
+  ProUMAP(ProUMAP &&) noexcept;
+  ProUMAP &operator=(ProUMAP &&) noexcept;
 
-  ~GPUMAP();
+  ~ProUMAP();
 
-  
   // Host pointer input: binding layer should guarantee contiguous layout.
   // (If you want to accept stride/ld, add it here explicitly.)
   void append_data(const float *ptr, Idx_t n_new_rows, Idx_t n_new_cols);
@@ -62,11 +58,11 @@ public:
   EmbedView get_embedding_view() const;
 
   // Get current configuration
-  const GPUMAPConfig &get_config() const;
+  const ProUMAPConfig &get_config() const;
 
 private:
   struct Impl;
   std::unique_ptr<Impl> impl_;
 };
 
-} // namespace gpumap
+} // namespace proumap

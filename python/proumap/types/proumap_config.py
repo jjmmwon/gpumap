@@ -1,9 +1,5 @@
-from __future__ import annotations
-
-from typing import Any
 from dataclasses import dataclass
 
-import numpy as np
 
 @dataclass(frozen=True)
 class UMAPConfig:
@@ -19,18 +15,19 @@ class UMAPConfig:
         init (str): Initialization method for UMAP embedding.
         negative_sample_rate (int): Number of negative samples per positive sample.
         verbose (bool): Whether to print progress messages.
-        random_state (int): Seed for random number generator.
+        random_state (int): Seed
     """
 
     n_neighbors: int = 15
     n_components: int = 2
-    # metric: str = "euclidean"
-    min_dist: float = 0.1
+    metric: str = "euclidean"
     n_epochs: int = 200
-    # init: str = "spectral"
+    min_dist: float = 0.1
+    init: str = "spectral"
     negative_sample_rate: int = 5
     verbose: bool = False
-    # random_state: int = 42
+    random_state: int = 42
+
 
 @dataclass(frozen=True)
 class ProUMAPConfig(UMAPConfig):
@@ -56,11 +53,3 @@ class ProUMAPConfig(UMAPConfig):
     max_instances: int = 1000000
     batch_size_hint: int = 1024
     n_features: int = 0
-
-class ProUMAP:
-    def __init__(self, config: GPUMAPConfig) -> None: ...
-    def close(self) -> None: ...
-    def append_data(self, x: np.ndarray) -> None: ...
-    def run_nng_build(self) -> None: ...
-    def run_optimize_embeddings(self) -> None: ...
-    def get_data_view(self) -> Any: ...

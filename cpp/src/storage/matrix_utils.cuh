@@ -3,7 +3,7 @@
 #include "matrix2D.cuh"
 #include <stdexcept>
 
-namespace gpumap {
+namespace proumap {
 namespace storage {
 
 // Append device data to matrix
@@ -66,4 +66,4 @@ void DeviceMatrix2D<T, Idx_t>::overwrite_device(T const *src_device,
 }
 
 } // namespace storage
-} // namespace gpumap
+} // namespace proumap

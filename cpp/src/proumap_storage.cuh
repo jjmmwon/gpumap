@@ -2,7 +2,7 @@
 
 #include "storage/matrix2D.cuh"
 
-namespace gpumap {
+namespace proumap {
 namespace storage {
 template <typename Data_t, typename Idx_t = uint32_t> struct Storage {
 
@@ -44,4 +44,4 @@ template <typename Data_t, typename Idx_t = uint32_t> struct Storage {
 };
 
 } // namespace storage
-} // namespace gpumap
+} // namespace proumap

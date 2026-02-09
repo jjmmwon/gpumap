@@ -8,7 +8,7 @@
 #include <stdexcept>
 #include <sys/types.h>
 
-namespace gpumap {
+namespace proumap {
 namespace storage {
 template <typename Data_t, typename Idx_t = uint32_t> struct DeviceMatrix2D {
   Idx_t max_rows;
@@ -59,4 +59,4 @@ template <typename Data_t, typename Idx_t = uint32_t> struct DeviceMatrix2D {
                    rmm::cuda_stream_view stream = rmm::cuda_stream_default);
 };
 } // namespace storage
-} // namespace gpumap
+} // namespace proumap

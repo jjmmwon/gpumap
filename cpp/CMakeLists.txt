@@ -8,7 +8,7 @@ find_package(cuvs CONFIG REQUIRED)
 
 pybind11_add_module(_core MODULE
   ${CMAKE_CURRENT_SOURCE_DIR}/bindings/binding.cu
-  ${CMAKE_CURRENT_SOURCE_DIR}/src/gpumap_impl.cu
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/proumap_impl.cu
 )
 
 target_include_directories(_core PRIVATE
@@ -39,7 +39,7 @@ set_target_properties(_core PROPERTIES
 
 
 install(TARGETS _core
-  LIBRARY DESTINATION gpumap
-  RUNTIME DESTINATION gpumap
-  ARCHIVE DESTINATION gpumap
+  LIBRARY DESTINATION proumap
+  RUNTIME DESTINATION proumap
+  ARCHIVE DESTINATION proumap
 )

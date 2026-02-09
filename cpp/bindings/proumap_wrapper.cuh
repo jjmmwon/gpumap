@@ -4,22 +4,22 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
-#include "gpumap/gpumap.cuh"
+#include "proumap/proumap.cuh"
 #include "utils/cai_wrapper.cuh"
 #include "utils/numpy_utils.cuh"
 
 namespace py = pybind11;
 
-// ---------- GPUMAP wrapper for numpy input ----------
-class GPUMAPWrapper {
+// ---------- ProUMAP wrapper for numpy input ----------
+class ProUMAPWrapper {
 public:
   using Data_t = float;
   using Idx_t = uint32_t;
 
-  gpumap::GPUMAPConfig config;
-  gpumap::GPUMAP model;
+  proumap::ProUMAPConfig config;
+  proumap::ProUMAP model;
 
-  explicit GPUMAPWrapper(const gpumap::GPUMAPConfig &config)
+  explicit ProUMAPWrapper(const proumap::ProUMAPConfig &config)
       : config(config), model(config) {}
 
   void append_data(py::array x) {

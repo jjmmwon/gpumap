@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.24)
 
-project(gpumap LANGUAGES CXX CUDA)
+project(proumap LANGUAGES CXX CUDA)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)

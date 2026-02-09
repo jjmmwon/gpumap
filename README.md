@@ -1,9 +1,9 @@
-# GPUMAP
+# ProUMAP
 
 주요 구성
 - Docker 기반 개발 환경: `rapidsai/base:25.12-cuda12-py3.11` 위에 conda 환경을 생성
 - CMake + CUDA C++: `cpp/`에 CUDA 소스, `python/`에 PyBind11 모듈 빌드
-- Python 패키지: `python/gpumap` 패키지와 `_backend` CUDA 확장
+- Python 패키지: `python/proumap` 패키지와 `_backend` CUDA 확장
 
 디렉토리 구조
 - `Dockerfile`: CUDA + conda 환경 포함 컨테이너 설정
@@ -21,17 +21,17 @@
 빠른 시작
 1) Docker 이미지 빌드
 ```
-docker build -t gpumap:dev .
+docker build -t proumap:dev .
 ```
 
 2) 컨테이너 실행
 ```
-docker run --rm -it --gpus all -v "$PWD":/workspace -w /workspace gpumap:dev /bin/bash
+docker run --rm -it --gpus all -v "$PWD":/workspace -w /workspace proumap:dev /bin/bash
 ```
 
 3) (필요 시) conda 환경 활성화
 ```
-conda activate gpumap
+conda activate proumap
 ```
 
 CUDA C++ / Python 확장 빌드
@@ -52,6 +52,6 @@ python -m pip install -e . -v
 
 
 주의 사항
-- `python/gpumap/api.py`는 CuPy를 사용합니다. conda 환경에 CuPy가 없다면 설치가 필요합니다.
+- `python/proumap/api.py`는 CuPy를 사용합니다. conda 환경에 CuPy가 없다면 설치가 필요합니다.
 - `env.yml`의 `cuda-version`은 user-space 라이브러리만 포함합니다. 실제 드라이버는 host에 설치되어 있어야 합니다.
 - clangd 사용 시 `scripts/patch_compile_commands.py`로 `build/compile_commands.json`을 패치할 수 있습니다.
