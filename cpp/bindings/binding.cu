@@ -10,29 +10,35 @@ namespace py = pybind11;
 PYBIND11_MODULE(_core, m) {
   m.doc() = "gpumap CUDA extension module";
 
-  py::class_<gpumap::UMAPParams>(m, "UMAPConfig")
+
+  py::class_<gpumap::GPUMAPParams>(m, "GPUMAPParams")
       .def(py::init<>())
-      .def_readwrite("n_neighbors", &gpumap::UMAPParams::n_neighbors)
-      .def_readwrite("n_components", &gpumap::UMAPParams::n_components)
-      .def_readwrite("min_dist", &gpumap::UMAPParams::min_dist)
-      .def_readwrite("n_epochs", &gpumap::UMAPParams::n_epochs)
+      .def_readwrite("n_neighbors", &gpumap::GPUMAPParams::n_neighbors)
+      .def_readwrite("n_components", &gpumap::GPUMAPParams::n_components)
+      .def_readwrite("min_dist", &gpumap::GPUMAPParams::min_dist)
+      .def_readwrite("n_epochs", &gpumap::GPUMAPParams::n_epochs)
       .def_readwrite("negative_sample_rate",
-                     &gpumap::UMAPParams::negative_sample_rate)
-      .def_readwrite("verbose", &gpumap::UMAPParams::verbose);
+                     &gpumap::GPUMAPParams::negative_sample_rate)
+      .def_readwrite("verbose", &gpumap::GPUMAPParams::verbose)
+      .def_readwrite("n_instances", &gpumap::GPUMAPParams::n_instances)
+      .def_readwrite("n_features", &gpumap::GPUMAPParams::n_features);
 
-  py::class_<gpumap::GPUMAPConfig, gpumap::UMAPConfig>(m, \"GPUMAPConfig\")
-      .def(py::init<>())
-      .def_readwrite(\"n_instances\", &gpumap::GPUMAPConfig::n_instances)
-      .def_readwrite(\"n_features\",
-                     &gpumap::GPUMAPConfig::n_features);
+  py::class_<gpumap::GPUMAPResult>(m, "GPUMAPResult")
+      .def_readonly("n_insertion_ops", &gpumap::GPUMAPResult::n_insertion_ops)
+      .def_readonly("n_update_ops", &gpumap::GPUMAPResult::n_update_ops)
+      .def_readonly("n_embedding_ops", &gpumap::GPUMAPResult::n_embedding_ops)
+      .def_readonly("insertion_time", &gpumap::GPUMAPResult::insertion_time)
+      .def_readonly("update_time", &gpumap::GPUMAPResult::update_time)
+      .def_readonly("embedding_time", &gpumap::GPUMAPResult::embedding_time)
+      .def_readonly("insertion_completed",
+                    &gpumap::GPUMAPResult::insertion_completed);
 
-
-  py::class_<GPUMAPWrapper>(m, \"GPUMAP\")
-      .def(py::init<const gpumap::GPUMAPConfig &>(), py::arg(\"config\"))
+  py::class_<GPUMAPWrapper>(m, "GPUMAP")
+      .def(py::init<const gpumap::GPUMAPParams &>(), py::arg("config"))
+      .def("initialize", &GPUMAPWrapper::initialize, py::arg("n_instances"), py::arg("n_features"))
       .def("append_data", &GPUMAPWrapper::append_data, py::arg("x"))
-      .def("run_nng_build", &GPUMAPWrapper::run_nng_build)
-      .def("run_embedding_optimization",
-           &GPUMAPWrapper::run_embedding_optimization)
-      .def("get_data_view", &GPUMAPWrapper::get_data_view)
+      .def("run", &GPUMAPWrapper::run, py::arg("n_jobs_insertion"),
+           py::arg("n_jobs_update"), py::arg("n_jobs_embedding"))
+      .def("close", &GPUMAPWrapper::close)
       .def("get_embedding_view", &GPUMAPWrapper::get_embedding_view);
 };

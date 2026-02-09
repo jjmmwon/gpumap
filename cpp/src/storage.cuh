@@ -1,6 +1,7 @@
 #pragma once
 
 #include "storage/matrix2D.cuh"
+#include "storage/matrix_utils.cuh"
 
 namespace gpumap {
 template <typename Data_t, typename Idx_t = size_t> struct Storage {

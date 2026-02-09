@@ -12,12 +12,14 @@
 
 namespace gpumap {
 template <typename Data_t, typename Idx_t = uint32_t> struct DeviceMatrix2D {
-  Idx_t max_rows;
-  Idx_t max_cols;
+  Idx_t max_rows = 0;
+  Idx_t max_cols = 0;
 
   Idx_t n_rows = 0;
 
   rmm::device_uvector<Data_t> buf;
+
+  DeviceMatrix2D() : buf(0, rmm::cuda_stream_default) {}
 
   DeviceMatrix2D(Idx_t max_rows_, Idx_t max_cols_,
                  rmm::cuda_stream_view stream_)
@@ -67,13 +69,13 @@ template <typename Data_t, typename Idx_t = uint32_t> struct DeviceMatrix2D {
         ptr, n_sub_rows, max_cols);
   }
 
-  __device__ __host__ void
+  void
   append_device(const Data_t *src_device, Idx_t n_new_rows,
                 rmm::cuda_stream_view stream = rmm::cuda_stream_default);
-  __device__ __host__ void
+  void
   append_host(const Data_t *src_host, Idx_t n_new_rows,
               rmm::cuda_stream_view stream = rmm::cuda_stream_default);
-  __device__ __host__ void
+  void
   overwrite_device(const Data_t *src_device, Idx_t row_start,
                    Idx_t n_overwrite_rows,
                    rmm::cuda_stream_view stream = rmm::cuda_stream_default);

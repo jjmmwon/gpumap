@@ -1,19 +1,18 @@
 from __future__ import annotations
 
 import numpy as np
-import cupy as cp
 
 from gpumap.validators import validate_data_chunk
 from gpumap.utils import _as_f32_c_contig_2d
 
-from ..proumap import _core
-from scheduler import Scheduler, DefaultScheduler
-from estimator import Estimator, DefaultLinearEstimator
-from data_loader import DataLoader
+from . import _core
+from .scheduler import Scheduler, DefaultScheduler
+from .estimator import Estimator, DefaultLinearEstimator
+from .data_loader import DataLoader
 
 class GPUMAP:
     def __init__(self, data_loader: DataLoader,
-                 config: _core.GPUMAPConfig, scheduler: Scheduler = DefaultScheduler(),
+                 config: _core.GPUMAPParams, scheduler: Scheduler = DefaultScheduler(),
                  insertion_estimator: Estimator = DefaultLinearEstimator(),
                  update_estimator: Estimator = DefaultLinearEstimator(),
                  embedding_estimator: Estimator = DefaultLinearEstimator(),
@@ -35,7 +34,7 @@ class GPUMAP:
         self._impl.initialize(self.data_loader.n_instances, self.data_loader.n_features)
 
     @property
-    def config(self) -> _core.GPUMAPConfig:
+    def config(self) -> _core.GPUMAPParams:
         return self._config
 
     def close(self):
@@ -79,10 +78,10 @@ class GPUMAP:
         if res.insertion_completed:
             self.scheduler.set_insertion_weight(0)
         else:
-            self.insertion_estimator.add_sample(res.insertion_ops, res.insertrion_time)
+            self.insertion_estimator.add_sample(res.n_insertion_ops, res.insertion_time)
 
-        self.update_estimator.add_sample(res.update_ops, res.update_time)
-        self.embedding_estimator.add_sample(res.embedding_ops, res.embedding_time)
+        self.update_estimator.add_sample(res.n_update_ops, res.update_time)
+        self.embedding_estimator.add_sample(res.n_embedding_ops, res.embedding_time)
 
         return res
 

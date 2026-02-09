@@ -9,27 +9,32 @@ GPUMAP &GPUMAP::operator=(GPUMAP &&) noexcept = default;
 
 GPUMAP::~GPUMAP() = default;
 
-void GPUMAP::append_data(const float *ptr, Idx_t rows, Idx_t cols) {
-  //
-  impl_->append_data(ptr, rows, cols);
+void GPUMAP::initialize(size_t n_instances, size_t n_features) {
+  // Initialization logic if needed
+  // For now, initialization happens in constructor
 }
 
-void GPUMAP::run(const size_t n_jobs_insertion, const size_t n_jobs_update,
-                 const size_t n_jobs_embedding) {
-  //
-  impl_->insert(n_jobs_insertion);
-  impl_->update(n_jobs_update);
-  impl_->embed(n_jobs_embedding);
+void GPUMAP::append_data(const float *ptr, size_t n_new_instances) {
+  impl_->append_data(ptr, n_new_instances);
 }
 
-GPUMAP::DataView GPUMAP::get_data_view() const {
-  return impl_->get_data_view();
+GPUMAPResult GPUMAP::run(size_t n_insertion_ops, size_t n_update_ops,
+                         size_t n_embedding_ops) {
+  return impl_->run(n_insertion_ops, n_update_ops, n_embedding_ops);
 }
 
-GPUMAP::EmbedView GPUMAP::get_embedding_view() const {
-  return impl_->get_embedding_view();
+void GPUMAP::close() {
+  impl_->close();
 }
 
-const GPUMAPParams &GPUMAP::get_config() const { return impl_->params; }
+// GPUMAP::DataView GPUMAP::get_data_view() const {
+//   return impl_->get_data_view();
+// }
+
+GPUMAP::EmbedView GPUMAP::get_embedding() const {
+  return impl_->get_embedding();
+}
+
+// const GPUMAPParams &GPUMAP::get_config() const { return impl_->params; }
 
 } // namespace gpumap

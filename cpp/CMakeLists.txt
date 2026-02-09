@@ -1,5 +1,8 @@
 cmake_minimum_required(VERSION 3.24)
 
+# Use system GCC instead of conda GCC for CUDA compatibility
+set(CMAKE_CUDA_HOST_COMPILER "/usr/bin/g++-9")
+
 find_package(CUDAToolkit REQUIRED)
 
 find_package(rmm CONFIG REQUIRED)
@@ -8,7 +11,7 @@ find_package(cuvs CONFIG REQUIRED)
 
 pybind11_add_module(_core MODULE
   ${CMAKE_CURRENT_SOURCE_DIR}/bindings/binding.cu
-  ${CMAKE_CURRENT_SOURCE_DIR}/src/gpumap_impl.cu
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/impl.cu
 )
 
 target_include_directories(_core PRIVATE

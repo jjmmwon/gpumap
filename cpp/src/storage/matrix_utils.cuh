@@ -7,7 +7,7 @@ namespace gpumap {
 
 // Append device data to matrix
 template <typename T, typename Idx_t>
-__device__ __host__ void
+void
 DeviceMatrix2D<T, Idx_t>::append_device(T const *src_device, Idx_t n_new_rows,
                                         rmm::cuda_stream_view stream) {
   if (this->n_rows + n_new_rows > this->max_rows)
@@ -28,7 +28,7 @@ DeviceMatrix2D<T, Idx_t>::append_device(T const *src_device, Idx_t n_new_rows,
 
 // Append host data to matrix
 template <typename T, typename Idx_t>
-__device__ __host__ void
+void
 DeviceMatrix2D<T, Idx_t>::append_host(T const *src_host, Idx_t n_new_rows,
                                       rmm::cuda_stream_view stream) {
   if (this->n_rows + n_new_rows > this->max_rows)
@@ -48,7 +48,7 @@ DeviceMatrix2D<T, Idx_t>::append_host(T const *src_host, Idx_t n_new_rows,
 
 // Overwrite device data in matrix
 template <typename T, typename Idx_t>
-__device__ __host__ void
+void
 DeviceMatrix2D<T, Idx_t>::overwrite_device(T const *src_device, Idx_t row_start,
                                            Idx_t n_overwrite_rows,
                                            rmm::cuda_stream_view stream) {

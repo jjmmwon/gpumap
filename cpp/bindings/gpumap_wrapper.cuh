@@ -22,6 +22,8 @@ public:
   explicit GPUMAPWrapper(const gpumap::GPUMAPParams &config)
       : config(config), model(config) {}
 
+  void initialize(size_t n_instances, size_t n_features) { model.initialize(n_instances, n_features); }
+
   void append_data(py::array x) {
     auto v = binding_utils::require_numpy_2d_f32(x);
     if (v.n_cols != config.n_features) {
@@ -32,18 +34,21 @@ public:
       return;
     }
 
-    model.append_data(v.ptr, static_cast<Idx_t>(v.n_rows),
-                      static_cast<Idx_t>(v.n_cols));
+    model.append_data(v.ptr, static_cast<Idx_t>(v.n_rows));
   }
 
-  void run_nng_build() { model.run_nng_build(); }
-  void run_embedding_optimization() { model.run_embedding_optimization(); }
-
-  py::object get_data_view() const {
-    return binding_utils::to_cai_object(model.get_data_view());
+  gpumap::GPUMAPResult run(size_t n_insertion_ops, size_t n_update_ops,
+           size_t n_embedding_ops) {
+    return model.run(n_insertion_ops, n_update_ops, n_embedding_ops);
   }
+
+  void close() { model.close(); }
+
+  // py::object get_data_view() const {
+  //   return binding_utils::to_cai_object(model.get_data_view());
+  // }
 
   py::object get_embedding_view() const {
-    return binding_utils::to_cai_object(model.get_embedding_view());
+    return binding_utils::to_cai_object(model.get_embedding());
   }
 };
