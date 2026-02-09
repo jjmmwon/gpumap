@@ -86,6 +86,7 @@ class GPUMAP:
         return res
 
     def get_embeddings_view(self) -> cp.ndarray:
+        # TODO
         embeddings_view = cp.asarray(self._impl.get_embeddings_view())
         return embeddings_view
 
