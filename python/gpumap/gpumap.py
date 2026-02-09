@@ -3,28 +3,28 @@ from __future__ import annotations
 import numpy as np
 import cupy as cp
 
-from proumap.validators import validate_data_chunk
-from proumap.utils import _as_f32_c_contig_2d
+from gpumap.validators import validate_data_chunk
+from gpumap.utils import _as_f32_c_contig_2d
 
 from . import _core
 
 
-class ProUMAP:
+class GPUMAP:
     """
     Progressive UMAP main class.
     Args:
-        config (Optional[ProUMAPConfig]): Configuration for ProUMAP. If None,
+        config (Optional[GPUMAPConfig]): Configuration for GPUMAP. If None,
             default configuration will be used.
     """
 
-    def __init__(self, config: _core.ProUMAPConfig):
+    def __init__(self, config: _core.GPUMAPConfig):
         self._config = config
-        self._impl = _core.ProUMAP(self.config)
+        self._impl = _core.GPUMAP(self.config)
 
         self._closed = False
 
     @property
-    def config(self) -> _core.ProUMAPConfig:
+    def config(self) -> _core.GPUMAPConfig:
         return self._config
 
     def close(self):
