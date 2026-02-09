@@ -16,10 +16,10 @@ public:
   using Data_t = float;
   using Idx_t = uint32_t;
 
-  gpumap::GPUMAPConfig config;
+  gpumap::GPUMAPParams config;
   gpumap::GPUMAP model;
 
-  explicit GPUMAPWrapper(const gpumap::GPUMAPConfig &config)
+  explicit GPUMAPWrapper(const gpumap::GPUMAPParams &config)
       : config(config), model(config) {}
 
   void append_data(py::array x) {

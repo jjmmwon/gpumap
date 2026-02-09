@@ -3,14 +3,13 @@
 #include "matrix2D.cuh"
 #include <stdexcept>
 
-namespace proumap {
-namespace storage {
+namespace gpumap {
 
 // Append device data to matrix
 template <typename T, typename Idx_t>
-void DeviceMatrix2D<T, Idx_t>::append_device(T const *src_device,
-                                             Idx_t n_new_rows,
-                                             rmm::cuda_stream_view stream) {
+__device__ __host__ void
+DeviceMatrix2D<T, Idx_t>::append_device(T const *src_device, Idx_t n_new_rows,
+                                        rmm::cuda_stream_view stream) {
   if (this->n_rows + n_new_rows > this->max_rows)
     throw std::runtime_error("Exceeding maximum number of rows");
 
@@ -29,8 +28,9 @@ void DeviceMatrix2D<T, Idx_t>::append_device(T const *src_device,
 
 // Append host data to matrix
 template <typename T, typename Idx_t>
-void DeviceMatrix2D<T, Idx_t>::append_host(T const *src_host, Idx_t n_new_rows,
-                                           rmm::cuda_stream_view stream) {
+__device__ __host__ void
+DeviceMatrix2D<T, Idx_t>::append_host(T const *src_host, Idx_t n_new_rows,
+                                      rmm::cuda_stream_view stream) {
   if (this->n_rows + n_new_rows > this->max_rows)
     throw std::runtime_error("Exceeding maximum number of rows");
 
@@ -48,10 +48,10 @@ void DeviceMatrix2D<T, Idx_t>::append_host(T const *src_host, Idx_t n_new_rows,
 
 // Overwrite device data in matrix
 template <typename T, typename Idx_t>
-void DeviceMatrix2D<T, Idx_t>::overwrite_device(T const *src_device,
-                                                Idx_t row_start,
-                                                Idx_t n_overwrite_rows,
-                                                rmm::cuda_stream_view stream) {
+__device__ __host__ void
+DeviceMatrix2D<T, Idx_t>::overwrite_device(T const *src_device, Idx_t row_start,
+                                           Idx_t n_overwrite_rows,
+                                           rmm::cuda_stream_view stream) {
   if (row_start + n_overwrite_rows > this->n_rows)
     throw std::runtime_error("Overwrite exceeds number of rows");
   size_t dst_off =
@@ -65,5 +65,4 @@ void DeviceMatrix2D<T, Idx_t>::overwrite_device(T const *src_device,
                                 stream.value()));
 }
 
-} // namespace storage
-} // namespace proumap
+} // namespace gpumap

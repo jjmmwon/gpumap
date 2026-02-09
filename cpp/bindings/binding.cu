@@ -10,15 +10,15 @@ namespace py = pybind11;
 PYBIND11_MODULE(_core, m) {
   m.doc() = "gpumap CUDA extension module";
 
-  py::class_<gpumap::UMAPConfig>(m, "UMAPConfig")
+  py::class_<gpumap::UMAPParams>(m, "UMAPConfig")
       .def(py::init<>())
-      .def_readwrite("n_neighbors", &gpumap::UMAPConfig::n_neighbors)
-      .def_readwrite("n_components", &gpumap::UMAPConfig::n_components)
-      .def_readwrite("min_dist", &gpumap::UMAPConfig::min_dist)
-      .def_readwrite("n_epochs", &gpumap::UMAPConfig::n_epochs)
+      .def_readwrite("n_neighbors", &gpumap::UMAPParams::n_neighbors)
+      .def_readwrite("n_components", &gpumap::UMAPParams::n_components)
+      .def_readwrite("min_dist", &gpumap::UMAPParams::min_dist)
+      .def_readwrite("n_epochs", &gpumap::UMAPParams::n_epochs)
       .def_readwrite("negative_sample_rate",
-                     &gpumap::UMAPConfig::negative_sample_rate)
-      .def_readwrite("verbose", &gpumap::UMAPConfig::verbose);
+                     &gpumap::UMAPParams::negative_sample_rate)
+      .def_readwrite("verbose", &gpumap::UMAPParams::verbose);
 
   py::class_<gpumap::GPUMAPConfig, gpumap::UMAPConfig>(m, \"GPUMAPConfig\")
       .def(py::init<>())
