@@ -21,6 +21,7 @@ class GPUMAP:
 
         self.data_loader = data_loader
         self._config = config
+        self.scheduler = scheduler
         self._impl = _core.GPUMAP(self.config)
         self._closed = False
 
@@ -44,7 +45,7 @@ class GPUMAP:
             self._closed = True
 
     def run(self, target_latency: float = 10.0) -> None:
-        time_slices = self._scheduler.schedule(target_latency)
+        time_slices = self.scheduler.schedule(target_latency)
 
         try:
             insertion_ops = self.insertion_estimator.estimate_ops(time_slices[0])
@@ -76,7 +77,7 @@ class GPUMAP:
         res = self._impl.run(insertion_ops, update_ops, embedding_ops)
 
         if res.insertion_completed:
-            self._scheduler.set_insertion_weight(0)
+            self.scheduler.set_insertion_weight(0)
         else:
             self.insertion_estimator.add_sample(res.insertion_ops, res.insertrion_time)
 
