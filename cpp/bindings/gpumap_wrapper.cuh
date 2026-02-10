@@ -22,7 +22,9 @@ public:
   explicit GPUMAPWrapper(const gpumap::GPUMAPParams &config)
       : config(config), model(config) {}
 
-  void initialize(size_t n_instances, size_t n_features) { model.initialize(n_instances, n_features); }
+  void initialize(size_t n_instances, size_t n_features) {
+    model.initialize(n_instances, n_features);
+  }
 
   void append_data(py::array x) {
     auto v = binding_utils::require_numpy_2d_f32(x);
@@ -34,11 +36,11 @@ public:
       return;
     }
 
-    model.append_data(v.ptr, static_cast<Idx_t>(v.n_rows));
+    model.append_data(v.ptr, static_cast<Idx_t>(v.n_rows), false);
   }
 
   gpumap::GPUMAPResult run(size_t n_insertion_ops, size_t n_update_ops,
-           size_t n_embedding_ops) {
+                           size_t n_embedding_ops) {
     return model.run(n_insertion_ops, n_update_ops, n_embedding_ops);
   }
 

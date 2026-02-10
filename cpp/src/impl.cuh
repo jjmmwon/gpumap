@@ -2,7 +2,9 @@
 
 #include "gpumap/gpumap.cuh"
 #include "queue.cuh"
+#include "raft/core/device_mdspan.hpp"
 #include "storage.cuh"
+#include "utils/matrix_utils.cuh"
 #include <csignal>
 
 namespace gpumap {
@@ -36,21 +38,44 @@ struct GPUMAP::Impl {
     cudaStreamCreate(&embedding_stream);
   }
 
-  void append_data(const Data_t *ptr, size_t n_new_instances) {
-    // TODO: 아래 에러남! device랑 host랑 교통정리하고 개선할것 (호스트에 데이터 추가가 필요한지?)
-    // storage.data.append_device(ptr, n_new_instances, insertion_stream);
+  void append_data(const Data_t *ptr, size_t n_new_instances,
+                   bool is_device = false) {
+    // TODO: 아래 에러남! device랑 host랑 교통정리하고 개선할것 (호스트에 데이터
+    // 추가가 필요한지?) storage.data.append_device(ptr, n_new_instances,
+    // insertion_stream);
+
+    // 현재 numpy array 입력만 처리하는 관계로 append_host로 구현해야합니다.
+    // wrapper 단에서 device로 옮겨서 넣어준다면 host는 필요없을거로 보입니다.
+    size_t max_rows = storage.capacity;
+    size_t n_rows = storage.n_data_rows;
+    if (n_rows + n_new_instances > max_rows) {
+      throw std::runtime_error("Exceeding maximum number of rows in storage");
+    }
+
+    auto data_ptr =
+        storage.data.data() + static_cast<size_t>(storage.n_data_rows) *
+                                  static_cast<size_t>(storage.n_features + 1);
+
+    if (is_device) {
+      utils::append_device(data_ptr, ptr, n_new_instances,
+                           storage.n_features + 1, insertion_stream);
+    } else {
+      utils::append_host(data_ptr, ptr, n_new_instances, storage.n_features + 1,
+                         insertion_stream);
+    }
+
+    storage.n_data_rows += n_new_instances;
   }
 
   GPUMAPResult run(size_t n_insertion_ops, size_t n_update_ops,
-           size_t n_embedding_ops) {
+                   size_t n_embedding_ops) {
     GPUMAPResult result{};
 
-    if(!insertion_queue.size()) {
+    if (!insertion_queue.size()) {
       result.insertion_completed = true;
       result.n_insertion_ops = 0;
       result.insertion_time = 0.0f;
-    }
-    else {
+    } else {
       auto start = clock::now();
       insert(n_insertion_ops);
       cudaStreamSynchronize(insertion_stream);
@@ -61,12 +86,10 @@ struct GPUMAP::Impl {
       result.insertion_time = std::chrono::duration<float>(end - start).count();
     }
 
-    if(!update_queue.size()) {
+    if (!update_queue.size()) {
       result.n_update_ops = 0;
       result.update_time = 0.0f;
-    }
-    else
-    {
+    } else {
       auto start = clock::now();
       update(n_update_ops);
       cudaStreamSynchronize(update_stream);
@@ -76,12 +99,10 @@ struct GPUMAP::Impl {
       result.update_time = std::chrono::duration<float>(end - start).count();
     }
 
-    if(!embedding_queue.size()) {
+    if (!embedding_queue.size()) {
       result.n_embedding_ops = 0;
       result.embedding_time = 0.0f;
-    }
-    else
-    {
+    } else {
       auto start = clock::now();
       embed(n_embedding_ops);
       cudaStreamSynchronize(embedding_stream);
@@ -103,10 +124,11 @@ struct GPUMAP::Impl {
     std::vector<size_t> affected_indices;
     std::vector<std::tuple<size_t, size_t, float>> new_edges;
 
-    run_init_and_update_kernel(batch_indices, &insertion_stream, &update_stream,
-                    &embedding_stream, affected_indices,
-                    new_edges); // randomly  initialize neighbors of incies
-                                // batch_indices and do descent k times
+    run_init_and_update_kernel(
+        batch_indices, &insertion_stream, &update_stream, &embedding_stream,
+        affected_indices,
+        new_edges); // randomly  initialize neighbors of incies
+                    // batch_indices and do descent k times
 
     // batch indices의 임베딩을 이웃들의 평균으로 초기화
     // affected_indices = batch_indices의 이웃을 unique
@@ -131,9 +153,10 @@ struct GPUMAP::Impl {
     std::vector<size_t> batch_indices = update_queue.pop_n(n_ops);
     std::vector<std::tuple<size_t, size_t, float>> affected_edges;
 
-    run_update_kernel(batch_indices, &update_stream, &embedding_stream,
-           affected_edges); // batch_indices의 이웃들을 다시
-                            // 업데이트하고, 그 이웃들을 affected_edges에 추가
+    run_update_kernel(
+        batch_indices, &update_stream, &embedding_stream,
+        affected_edges); // batch_indices의 이웃들을 다시
+                         // 업데이트하고, 그 이웃들을 affected_edges에 추가
     // affected_indices = batch_indices의 이웃을 unique
 
     embedding_queue.push_batch(affected_edges);
@@ -163,21 +186,16 @@ struct GPUMAP::Impl {
       const std::vector<size_t> &batch_indices, cudaStream_t *insertion_stream,
       cudaStream_t *update_stream, cudaStream_t *embedding_stream,
       std::vector<size_t> &affected_indices,
-      std::vector<std::tuple<size_t, size_t, float>> &new_edges)
-      {}
+      std::vector<std::tuple<size_t, size_t, float>> &new_edges) {}
 
   void run_update_kernel(
       const std::vector<size_t> &batch_indices, cudaStream_t *update_stream,
       cudaStream_t *embedding_stream,
-      std::vector<std::tuple<size_t, size_t, float>> &affected_edges)
-      {}
+      std::vector<std::tuple<size_t, size_t, float>> &affected_edges) {}
 
   void run_embed_kernel(
       const std::vector<std::tuple<size_t, size_t, float>> &batch_edges,
-      cudaStream_t *embedding_stream)
-      {
-
-      }
+      cudaStream_t *embedding_stream) {}
 
   void close() {
     cudaStreamDestroy(insertion_stream);
@@ -187,7 +205,12 @@ struct GPUMAP::Impl {
 
   auto get_embedding() const
       -> raft::device_matrix_view<const Data_t, Idx_t, raft::row_major> {
-    return storage.embedding.view();
+    auto embedding_ptr = storage.embedding.data();
+    Idx_t n_rows = storage.n_rows;
+    Idx_t n_cols = 2;
+
+    return raft::make_device_matrix_view<const Data_t, Idx_t, raft::row_major>(
+        embedding_ptr, n_rows, n_cols);
   }
 };
 } // namespace gpumap

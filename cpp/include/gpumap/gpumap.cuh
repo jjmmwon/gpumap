@@ -10,7 +10,7 @@
 
 namespace gpumap {
 
-struct GPUMAPParams{
+struct GPUMAPParams {
   size_t n_neighbors = 15;
   size_t n_components = 2;
   float min_dist = 0.1f;
@@ -65,8 +65,10 @@ public:
   // (If you want to accept stride/ld, add it here explicitly.)
 
   void initialize(size_t n_instances, size_t n_features);
-  void append_data(const float *ptr, size_t n_new_instances);
-  GPUMAPResult run(size_t n_insertion_ops, size_t n_update_ops, size_t embedding_ops);
+  void append_data(const float *ptr, size_t n_new_instances,
+                   bool is_device = false);
+  GPUMAPResult run(size_t n_insertion_ops, size_t n_update_ops,
+                   size_t n_embedding_ops);
   void close();
 
   EmbedView get_embedding() const;
