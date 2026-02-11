@@ -26,14 +26,9 @@ GPUMAPResult GPUMAP::run(size_t n_insertion_ops, size_t n_update_ops,
 
 void GPUMAP::close() { impl_->close(); }
 
-// GPUMAP::DataView GPUMAP::get_data_view() const {
-//   return impl_->get_data_view();
-// }
-
 GPUMAP::EmbedView GPUMAP::get_embedding() const {
   return impl_->get_embedding();
 }
 
-// const GPUMAPParams &GPUMAP::get_config() const { return impl_->params; }
 
 } // namespace gpumap

@@ -163,6 +163,17 @@ struct GPUMAP::Impl {
   }
 
   void embed(size_t n_ops) {
+    // embedding 단계에서 queue는 엣지들을 담고있다. 여기서 e = (src, dst, iter)임
+
+    // 먼저 n_ops 개수만큼 엣지를 빼자
+    std::vector<GPUMAP::Edge> batch_edges = embedding_queue.pop_n(n_ops);
+
+    // 이 엣지 중에서 src, dst가 여전히 이웃인지 확인
+
+    
+
+
+
     // 사실 embedding queue에는 엣지가 들어가야 유맵 구현과 같음
 
     // embedding_queue는 그냥 벡터임
@@ -176,8 +187,6 @@ struct GPUMAP::Impl {
     // e.start, e.end를 업데이트 + 네거티브 n회
     // current_epoch +=1, target_epoch += edge weight이 반비례하는 값
     // max_epoch으로 영원히 죽이는 것관리
-    std::vector<std::tuple<size_t, size_t, float>> batch_edges =
-        embedding_queue.pop_n(n_ops);
 
     run_embed_kernel(batch_edges, &embedding_stream);
   }

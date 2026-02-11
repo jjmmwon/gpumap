@@ -17,6 +17,7 @@ struct GPUMAPParams {
   size_t n_epochs = 200;
   size_t negative_sample_rate = 5;
   bool verbose = false;
+  
   size_t n_instances = 0;
   size_t n_features = 0;
 

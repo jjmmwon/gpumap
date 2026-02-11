@@ -56,14 +56,10 @@ struct InsertionQueue : public Queue<size_t> {
 };
 
 struct UpdateQueue : public Queue<size_t> {
-  // Inherits all functionality from Queue<size_t>
-  // No additional methods needed as all are provided by base class
 };
 
-struct EmbeddingQueue : public Queue<std::tuple<size_t, size_t, float>> {
-  using Edge = std::tuple<size_t, size_t, float>; // (src, dst, weight)
-  // Inherits all functionality from Queue<Edge>
-  // No additional methods needed as all are provided by base class
+using Edge = std::tuple<size_t, size_t, size_t>; // (src, dst, iter)
+struct EmbeddingQueue : public Queue<Edge> {  
 };
 
 } // namespace gpumap
