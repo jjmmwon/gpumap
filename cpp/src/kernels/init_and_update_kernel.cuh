@@ -1,4 +1,3 @@
-#include "details/nndescent.cuh"
 #include <vector>
 
 namespace gpumap {
