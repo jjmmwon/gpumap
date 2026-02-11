@@ -31,7 +31,7 @@ struct GPUMAP::Impl {
 
   Impl(const GPUMAPParams &params_)
       : params(params_),
-        storage(params_.n_instances, params_.n_features, params_.n_neighbors, 
+        storage(params_.n_instances, params_.n_features, params_.n_neighbors,
                 params_.n_components),
         insertion_queue(params_.n_instances) {
     initialize();
@@ -45,20 +45,13 @@ struct GPUMAP::Impl {
 
   void append_data(const Data_t *ptr, size_t n_new_instances,
                    bool is_device = false) {
-    // TODO: 아래 에러남! device랑 host랑 교통정리하고 개선할것 (호스트에 데이터
-    // 추가가 필요한지?) storage.data.append_device(ptr, n_new_instances,
-    // insertion_stream);
 
-    // 현재 numpy array 입력만 처리하는 관계로 append_host로 구현해야합니다.
-    // wrapper 단에서 device로 옮겨서 넣어준다면 host는 필요없을거로 보입니다.
-    size_t max_rows = storage.capacity;
-    size_t n_rows = storage.n_data_rows;
-    if (n_rows + n_new_instances > max_rows) {
+    if (storage.n_inserted_instances + n_new_instances > storage.n_instances) {
       throw std::runtime_error("Exceeding maximum number of rows in storage");
     }
 
     auto data_ptr =
-        storage.data.data() + static_cast<size_t>(storage.n_data_rows) *
+        storage.data.data() + static_cast<size_t>(storage.n_inserted_instances) *
                                   static_cast<size_t>(storage.n_features + 1);
 
     if (is_device) {
@@ -69,7 +62,7 @@ struct GPUMAP::Impl {
                          insertion_stream);
     }
 
-    storage.n_data_rows += n_new_instances;
+    storage.n_inserted_instances += n_new_instances;
   }
 
   GPUMAPResult run(size_t n_insertion_ops, size_t n_update_ops,
@@ -185,9 +178,9 @@ struct GPUMAP::Impl {
       h_dsts.push_back(std::get<1>(e));
       h_epochs.push_back(std::get<2>(e));
     }
-    
+
     // 커널 실행 준비를 위해 src,dst에 대한 디바이스 vector
-    rmm::device_uvector<Idx_t> d_srcs(h_srcs.size(), embedding_stream), 
+    rmm::device_uvector<Idx_t> d_srcs(h_srcs.size(), embedding_stream),
                                d_dsts(h_dsts.size(), embedding_stream);
 
     rmm::device_uvector<Idx_t> d_out_srcs(h_srcs.size(), embedding_stream),
@@ -205,7 +198,7 @@ struct GPUMAP::Impl {
     cudaMemcpyAsync(d_epochs.data(), h_epochs.data(),
             h_epochs.size() * sizeof(size_t),
             cudaMemcpyHostToDevice, embedding_stream);
-    
+
     // 이웃인 엣지들만 남긴다. (필터링 커널 실행)
     filter_edges_by_neighbors<Idx_t, size_t>(
       d_srcs.data(), d_dsts.data(), d_epochs.data(), d_out_srcs.data(),
@@ -221,11 +214,11 @@ struct GPUMAP::Impl {
     cudaStreamSynchronize(embedding_stream);
 
     if (h_out_count == 0) {
-      // 여전히 이웃인 pair가 하나도 없다면.. 
+      // 여전히 이웃인 pair가 하나도 없다면..
       // TODO 만약 진짜 하나도 없다면 몇 번 더봐야 하지 않나?
       return;
     }
-    
+
     // 실제 src, dst 호스트로 복사
     std::vector<Idx_t> h_out_srcs(h_out_count);
     std::vector<Idx_t> h_out_dsts(h_out_count);
@@ -243,7 +236,7 @@ struct GPUMAP::Impl {
 
     cudaStreamSynchronize(embedding_stream);
 
-    // 남은 엣지의 src, dst 인덱스 중에서 중복을 제거한다.    
+    // 남은 엣지의 src, dst 인덱스 중에서 중복을 제거한다.
     std::vector<Idx_t> unique_indices;
     unique_indices.reserve(h_out_count * 2);
     for (size_t i = 0; i < h_out_count; ++i) {
@@ -254,7 +247,7 @@ struct GPUMAP::Impl {
     unique_indices.erase(
         std::unique(unique_indices.begin(), unique_indices.end()),
         unique_indices.end());
-    
+
     // 남은 엣지들 중에서 dirty한 녀석들을 보고 dirty하다면 sigma_i를 업데이트해준다.
     rmm::device_uvector<Idx_t> d_unique_indices(unique_indices.size(),
                           embedding_stream);
@@ -270,7 +263,7 @@ struct GPUMAP::Impl {
 
     update_embeddings<Data_t, Idx_t>(
         d_out_srcs.data(), d_out_dsts.data(), h_out_count,
-        storage.embedding.data(), params.n_components, storage.n_data_rows,
+        storage.embedding.data(), params.n_components, storage.n_inserted_instances,
         storage.neighbor_indices.data(), storage.neighbor_indices_block_size,
         storage.neighbor_dists.data(), storage.neighbor_dists_block_size,
         storage.n_neighbors, params.a, params.b, params.alpha,
@@ -290,7 +283,7 @@ struct GPUMAP::Impl {
     }
 
 
-    
+
     // 남은것
     // 1) epoch을 보면서 임베딩 업데이트
     // 2) epoch이 max_epoch보다 크면 걔네는 죽이는거 관리 (큐에서 빼는거)
@@ -320,7 +313,7 @@ struct GPUMAP::Impl {
     auto embedding_ptr = storage.embedding.data();
 
     return raft::make_device_matrix_view<const Data_t, Idx_t, raft::row_major>(
-        embedding_ptr, storage.n_rows, storage.n_components);
+        embedding_ptr, storage.n_instances, storage.n_components);
   }
 };
 } // namespace gpumap
