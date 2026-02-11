@@ -5,10 +5,12 @@
 #include "raft/core/device_mdspan.hpp"
 #include "storage.cuh"
 #include "utils/matrix_utils.cuh"
+#include "kernels/insertion_kernel.cuh"
 #include "kernels/embedding_kernel.cuh"
 #include <algorithm>
 #include <csignal>
 #include <rmm/device_scalar.hpp>
+#include <rmm/cuda_stream_view.hpp>
 #include <tuple>
 
 namespace gpumap {
@@ -33,7 +35,7 @@ struct GPUMAP::Impl {
       : params(params_),
         storage(params_.n_instances, params_.n_features, params_.n_neighbors,
                 params_.n_components),
-        insertion_queue(params_.n_instances) {
+        insertion_queue() {
     initialize();
   }
 
@@ -44,7 +46,7 @@ struct GPUMAP::Impl {
   }
 
   void append_data(const Data_t *ptr, Idx_t n_new_instances,
-                   bool is_device = false) {
+                   bool is_device = true) {
 
     if (storage.n_inserted_instances + n_new_instances > storage.n_instances) {
       throw std::runtime_error("Exceeding maximum number of rows in storage");
@@ -56,13 +58,21 @@ struct GPUMAP::Impl {
 
     if (is_device) {
       utils::append_device(data_ptr, ptr, n_new_instances,
-                           storage.n_features + 1, insertion_stream);
+                           storage.n_features + 1, rmm::cuda_stream_view(insertion_stream));
     } else {
       utils::append_host(data_ptr, ptr, n_new_instances, storage.n_features + 1,
-                         insertion_stream);
+                         rmm::cuda_stream_view(insertion_stream));
     }
 
+    // Add newly inserted indices to the insertion queue
+    Idx_t old_count = storage.n_inserted_instances;
     storage.n_inserted_instances += n_new_instances;
+    
+    std::vector<Idx_t> new_indices;
+    for (Idx_t i = old_count; i < storage.n_inserted_instances; ++i) {
+      new_indices.push_back(i);
+    }
+    insertion_queue.push_batch(new_indices);
   }
 
   GPUMAPResult run(size_t n_insertion_ops, size_t n_update_ops,
@@ -118,9 +128,19 @@ struct GPUMAP::Impl {
       return 0;
     }
 
-    std::vector<size_t> batch_indices = insertion_queue.pop_n(n_ops);
-    std::vector<size_t> affected_indices;
+    std::vector<Idx_t> batch_indices = insertion_queue.pop_n(n_ops);
+    std::vector<Idx_t> affected_indices;
     std::vector<gpumap::Edge> new_edges;
+
+    insertion_kernel(
+        storage.data.data(), storage.neighbor_indices.data(),
+        storage.neighbor_dists.data(), storage.embedding.data(),
+        storage.neighbor_indices_block_size,
+        storage.neighbor_dists_block_size,
+        storage.n_neighbors,
+        storage.n_instances, storage.n_inserted_instances, storage.n_features,
+        batch_indices, affected_indices, new_edges, insertion_stream);
+
 
     // run_init_and_update_kernel(
     //     batch_indices, &insertion_stream, &update_stream, &embedding_stream,
@@ -130,7 +150,7 @@ struct GPUMAP::Impl {
 
     // batch indices의 임베딩을 이웃들의 평균으로 초기화
     // affected_indices = batch_indices의 이웃을 unique
-    update_queue.push_batch(affected_indices);
+    // update_queue.push_batch(affected_indices);
 
     // bath_indices의 index와 이웃 n에 대한 에지 (i, n_0), (i, n_k-1) 까지를
     // 넣어야됨 지금은 넣으면 무조건 하게되는데, 사실 그러면 안됨. 유맵은 스킵이
@@ -138,7 +158,7 @@ struct GPUMAP::Impl {
     // 스킵이되면 다시 카운트+1해서 뒤로 넣어주고, 아니면 벡터에넣어서
     // 그 벡터를 임베딩의 인자로 줘야함.
 
-    embedding_queue.push_batch(new_edges);
+    // embedding_queue.push_batch(new_edges);
 
     return batch_indices.size();
   }
@@ -148,7 +168,7 @@ struct GPUMAP::Impl {
       return;
     }
 
-    std::vector<size_t> batch_indices = update_queue.pop_n(n_ops);
+    std::vector<Idx_t> batch_indices = update_queue.pop_n(n_ops);
     std::vector<gpumap::Edge> affected_edges;
 
     // run_update_kernel(

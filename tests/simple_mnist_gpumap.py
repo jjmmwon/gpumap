@@ -36,6 +36,9 @@ if __name__ == "__main__":
         # print(result.n_insertion_ops, result.n_update_ops, result.n_embedding_ops)
         print(gpumap.get_neighbor_indices().shape)
         print(gpumap.get_neighbor_indices())
+
+        # print(gpumap.get_neighbor_indices().shape)
+        # print(gpumap.get_neighbor_indices())
         # print(f"Target latency: 10s")
         # printout the total time
         # total_time = result.insertion_time + result.update_time + result.embedding_time

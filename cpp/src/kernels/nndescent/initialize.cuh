@@ -7,13 +7,15 @@
 
 namespace gpumap::nndescent {
 
-template <typename Data_t, typename Idx_t>
+template <typename Data_t, typename Idx_t, int MAX_K = 32>
 __global__ void initialize_random_neighbors_kernel(
-    Idx_t *neighbor_indices, Data_t *neighbor_distances, size_t n_start,
-    size_t n_end, size_t n_neighbors, size_t neighbor_indices_block_size,
-    size_t total_instances, size_t seed) {
+    Idx_t *neighbor_indices, Data_t *neighbor_distances, Idx_t n_start,
+    Idx_t n_end, Idx_t n_neighbors, Idx_t neighbor_indices_block_size,
+    Idx_t neighbor_dists_block_size,
+    Idx_t n_instances,
+    Idx_t n_inserted_instances, size_t seed) {
 
-  size_t idx = blockIdx.x * blockDim.x + threadIdx.x + n_start;
+  Idx_t idx = blockIdx.x * blockDim.x + threadIdx.x + n_start;
   if (idx >= n_end)
     return;
 
@@ -21,14 +23,14 @@ __global__ void initialize_random_neighbors_kernel(
   curand_init(seed, idx, 0, &state);
 
   Idx_t *my_neighbors = neighbor_indices + idx * neighbor_indices_block_size;
-  Data_t *my_distances = neighbor_distances + idx * neighbor_indices_block_size;
+  Data_t *my_distances = neighbor_distances + idx * neighbor_dists_block_size;
 
   int filled = 0;
   while (filled < n_neighbors) {
-    Idx_t candidate = curand(&state) % total_instances;
+    Idx_t candidate = curand(&state) % n_inserted_instances;
     if (candidate == idx)
       continue;
-    if (contains_id<Idx_t>(my_neighbors, filled, candidate))
+    if (contains_id<Idx_t, MAX_K>(my_neighbors, filled, candidate))
       continue;
 
     my_neighbors[filled] = candidate;

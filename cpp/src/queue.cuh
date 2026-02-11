@@ -47,19 +47,19 @@ public:
   }
 };
 
-struct InsertionQueue : public Queue<size_t> {
-  InsertionQueue(size_t n_instances) {
-    for (size_t i = 0; i < n_instances; ++i) {
-      push(i);
-    }
-  }
+struct InsertionQueue : public Queue<uint32_t> {
+  InsertionQueue() = default;
 };
 
-struct UpdateQueue : public Queue<size_t> {
+struct UpdateQueue : public Queue<uint32_t> {
 };
 
-using Edge = std::tuple<size_t, size_t, size_t>; // (src, dst, iter)
-struct EmbeddingQueue : public Queue<Edge> {  
+template<typename Idx_t = uint32_t>
+using EdgeT = std::tuple<Idx_t, Idx_t, Idx_t>; // (src, dst, iter)
+
+using Edge = EdgeT<uint32_t>;
+
+struct EmbeddingQueue : public Queue<Edge> {
 };
 
 } // namespace gpumap

@@ -45,6 +45,17 @@ class GPUMAP:
             self._closed = True
 
     def run_with_n_ops(self, n_insertion_ops: int, n_update_ops: int, n_embedding_ops: int) -> _core.GPUMAPIterationResult:
+        if n_insertion_ops > 0:
+            data_chunk = self.data_loader.get_next_chunk(n_insertion_ops)
+            try:
+                validate_data_chunk(data_chunk, self._config.n_features)
+                data_chunk = _as_f32_c_contig_2d(data_chunk)
+            except ValueError as e:
+                print(f"Error validating data chunk: {e}")
+
+            # TODO
+            self._impl.append_data(data_chunk)
+
         res = self._impl.run(n_insertion_ops, n_update_ops, n_embedding_ops)
         return res
 
@@ -52,22 +63,22 @@ class GPUMAP:
         time_slices = self.scheduler.schedule(target_latency)
 
         try:
-            insertion_ops = self.insertion_estimator.estimate_ops(time_slices[0])
+            n_insertion_ops = self.insertion_estimator.estimate_ops(time_slices[0])
         except ValueError:
-            insertion_ops = self.default_n_ops + np.random.randint(-self.default_n_ops//10, self.default_n_ops//10)
+            n_insertion_ops = self.default_n_ops + np.random.randint(-self.default_n_ops//10, self.default_n_ops//10)
 
         try:
-            update_ops = self.update_estimator.estimate_ops(time_slices[1])
+            n_update_ops = self.update_estimator.estimate_ops(time_slices[1])
         except ValueError:
-            update_ops = self.default_n_ops + np.random.randint(-self.default_n_ops//10, self.default_n_ops//10)
+            n_update_ops = self.default_n_ops + np.random.randint(-self.default_n_ops//10, self.default_n_ops//10)
 
         try:
-            embedding_ops = self.embedding_estimator.estimate_ops(time_slices[2])
+            n_embedding_ops = self.embedding_estimator.estimate_ops(time_slices[2])
         except ValueError:
-            embedding_ops = self.default_n_ops + np.random.randint(-self.default_n_ops//10, self.default_n_ops//10)
+            n_embedding_ops = self.default_n_ops + np.random.randint(-self.default_n_ops//10, self.default_n_ops//10)
 
-        if insertion_ops > 0:
-            data_chunk = self.data_loader.get_next_chunk(insertion_ops)
+        if n_insertion_ops > 0:
+            data_chunk = self.data_loader.get_next_chunk(n_insertion_ops)
             try:
                 validate_data_chunk(data_chunk, self._config.n_features)
                 data_chunk = _as_f32_c_contig_2d(data_chunk)
@@ -78,7 +89,7 @@ class GPUMAP:
             self._impl.append_data(data_chunk)
 
         # TODO
-        res = self._impl.run(insertion_ops, update_ops, embedding_ops)
+        res = self._impl.run(n_insertion_ops, n_update_ops, n_embedding_ops)
 
         if res.insertion_completed:
             self.scheduler.set_insertion_weight(0)
