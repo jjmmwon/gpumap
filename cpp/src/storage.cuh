@@ -9,7 +9,6 @@ template <typename Data_t = float, typename Idx_t = size_t> struct Storage {
   Idx_t capacity;
   Idx_t n_features;
   Idx_t n_neighbors;
-  Idx_t n_neighbor;
 
   // current number of data rows stored in data matrix and neighbor graphs
   Idx_t n_data_rows;
@@ -39,11 +38,15 @@ template <typename Data_t = float, typename Idx_t = size_t> struct Storage {
         rmm::cuda_stream_default);
 
     neighbor_indices = rmm::device_uvector<Idx_t>(
-        static_cast<size_t>(capacity) * static_cast<size_t>(n_neighbors) * 2,
+        static_cast<size_t>(capacity) * static_cast<size_t>(n_neighbors) * 2 + 1,
         rmm::cuda_stream_default);
+    // * 2 for stroing candidates
+    // + 1 for storing whether an instance is dirty or not (for kernel size computation)
+
     neighbor_dists = rmm::device_uvector<Data_t>(
-        static_cast<size_t>(capacity) * static_cast<size_t>(n_neighbors),
+        static_cast<size_t>(capacity) * static_cast<size_t>(n_neighbors) + 1,
         rmm::cuda_stream_default);
+    // + 1 for storing UMAP kernal (sigma)
 
     embedding = rmm::device_uvector<Data_t>(static_cast<size_t>(capacity) *
                                                 static_cast<size_t>(2),
