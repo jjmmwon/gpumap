@@ -5,7 +5,11 @@
 #include "raft/core/device_mdspan.hpp"
 #include "storage.cuh"
 #include "utils/matrix_utils.cuh"
+#include "kernels/embedding_kernel.cuh"
+#include <algorithm>
 #include <csignal>
+#include <rmm/device_scalar.hpp>
+#include <tuple>
 
 namespace gpumap {
 
@@ -122,12 +126,12 @@ struct GPUMAP::Impl {
 
     std::vector<size_t> batch_indices = insertion_queue.pop_n(n_ops);
     std::vector<size_t> affected_indices;
-    std::vector<std::tuple<size_t, size_t, float>> new_edges;
+    std::vector<std::tuple<size_t, size_t, size_t>> new_edges;
 
-    run_init_and_update_kernel(
-        batch_indices, &insertion_stream, &update_stream, &embedding_stream,
-        affected_indices,
-        new_edges); // randomly  initialize neighbors of incies
+    // run_init_and_update_kernel(
+    //     batch_indices, &insertion_stream, &update_stream, &embedding_stream,
+    //     affected_indices,
+    //     new_edges); // randomly  initialize neighbors of incies
                     // batch_indices and do descent k times
 
     // batch indices의 임베딩을 이웃들의 평균으로 초기화
@@ -151,12 +155,12 @@ struct GPUMAP::Impl {
     }
 
     std::vector<size_t> batch_indices = update_queue.pop_n(n_ops);
-    std::vector<std::tuple<size_t, size_t, float>> affected_edges;
+    std::vector<std::tuple<size_t, size_t, size_t>> affected_edges;
 
-    run_update_kernel(
-        batch_indices, &update_stream, &embedding_stream,
-        affected_edges); // batch_indices의 이웃들을 다시
-                         // 업데이트하고, 그 이웃들을 affected_edges에 추가
+    // run_update_kernel(
+    //     batch_indices, &update_stream, &embedding_stream,
+    //     affected_edges); // batch_indices의 이웃들을 다시
+    //                      // 업데이트하고, 그 이웃들을 affected_edges에 추가
     // affected_indices = batch_indices의 이웃을 unique
 
     embedding_queue.push_batch(affected_edges);
@@ -166,12 +170,92 @@ struct GPUMAP::Impl {
     // embedding 단계에서 queue는 엣지들을 담고있다. 여기서 e = (src, dst, iter)임
 
     // 먼저 n_ops 개수만큼 엣지를 빼자
-    std::vector<GPUMAP::Edge> batch_edges = embedding_queue.pop_n(n_ops);
+    std::vector<gpumap::Edge> batch_edges = embedding_queue.pop_n(n_ops);
 
-    // 이 엣지 중에서 src, dst가 여전히 이웃인지 확인
+    // src들의 리스트와 dst의 리스트를 만든다. h for host
+    std::vector<Idx_t> h_srcs, h_dsts;
+    h_srcs.reserve(batch_edges.size());
+    h_dsts.reserve(batch_edges.size());
 
+    for (const auto& e : batch_edges) {
+        h_srcs.push_back(std::get<0>(e));
+        h_dsts.push_back(std::get<1>(e));        
+    }
     
+    // 커널 실행 준비를 위해 src,dst에 대한 디바이스 vector
+    rmm::device_uvector<Idx_t> d_srcs(h_srcs.size(), embedding_stream), 
+                               d_dsts(h_dsts.size(), embedding_stream);
 
+    rmm::device_uvector<Idx_t> d_out_srcs(h_srcs.size(), embedding_stream), 
+                               d_out_dsts(h_dsts.size(), embedding_stream);
+
+    rmm::device_scalar<unsigned long long> d_out_count(embedding_stream);
+
+    // 호스트 -> 디바이스 복사
+    cudaMemcpyAsync(d_srcs.data(), h_srcs.data(), h_srcs.size() * sizeof(Idx_t), cudaMemcpyHostToDevice, embedding_stream);
+
+    cudaMemcpyAsync(d_dsts.data(), h_dsts.data(), h_dsts.size() * sizeof(Idx_t), cudaMemcpyHostToDevice, embedding_stream);
+    
+    // 이웃인 엣지들만 남긴다. (필터링 커널 실행)
+    filter_edges_by_neighbors<Idx_t>(d_srcs.data(), d_dsts.data(), 
+                                d_out_srcs.data(), d_out_dsts.data(),
+                                batch_edges.size(),
+                                storage.neighbor_indices.data(),
+                                storage.neighbor_indices_block_size,
+                                storage.n_neighbors,
+                                d_out_count.data(),
+                                embedding_stream);
+
+    unsigned long long h_out_count = 0;
+    cudaMemcpyAsync(&h_out_count, d_out_count.data(),
+                    sizeof(unsigned long long), cudaMemcpyDeviceToHost,
+                    embedding_stream);
+    cudaStreamSynchronize(embedding_stream);
+
+    if (h_out_count == 0) {
+      // 여전히 이웃인 pair가 하나도 없다면.. 
+      // TODO 만약 진짜 하나도 없다면 몇 번 더봐야 하지 않나?
+      return;
+    }
+    
+    std::vector<Idx_t> h_out_srcs(h_out_count);
+    std::vector<Idx_t> h_out_dsts(h_out_count);
+
+    cudaMemcpyAsync(h_out_srcs.data(), d_out_srcs.data(),
+                    h_out_count * sizeof(Idx_t), cudaMemcpyDeviceToHost,
+                    embedding_stream);
+    cudaMemcpyAsync(h_out_dsts.data(), d_out_dsts.data(),
+                    h_out_count * sizeof(Idx_t), cudaMemcpyDeviceToHost,
+                    embedding_stream);
+
+    cudaStreamSynchronize(embedding_stream);
+
+    // 남은 엣지의 src, dst 인덱스 중에서 중복을 제거한다.
+    
+    std::vector<Idx_t> unique_indices;
+    unique_indices.reserve(h_out_count * 2);
+    for (size_t i = 0; i < h_out_count; ++i) {
+      unique_indices.push_back(h_out_srcs[i]);
+      unique_indices.push_back(h_out_dsts[i]);
+    }
+    std::sort(unique_indices.begin(), unique_indices.end());
+    unique_indices.erase(
+        std::unique(unique_indices.begin(), unique_indices.end()),
+        unique_indices.end());
+    
+    // 남은 엣지들 중에서 dirty한 녀석들을 보고 dirty하다면 sigma_i를 업데이트해준다.
+
+    rmm::device_uvector<Idx_t> d_unique_indices(unique_indices.size(),
+                          embedding_stream);
+    cudaMemcpyAsync(d_unique_indices.data(), unique_indices.data(),
+            unique_indices.size() * sizeof(Idx_t),
+            cudaMemcpyHostToDevice, embedding_stream);
+
+    update_sigma_for_dirty<Data_t, Idx_t>(
+      d_unique_indices.data(), unique_indices.size(),
+      storage.neighbor_indices.data(), storage.neighbor_indices_block_size,
+      storage.neighbor_dists.data(), storage.neighbor_dists_block_size,
+      storage.n_neighbors, embedding_stream);
 
 
     // 사실 embedding queue에는 엣지가 들어가야 유맵 구현과 같음
@@ -188,23 +272,7 @@ struct GPUMAP::Impl {
     // current_epoch +=1, target_epoch += edge weight이 반비례하는 값
     // max_epoch으로 영원히 죽이는 것관리
 
-    run_embed_kernel(batch_edges, &embedding_stream);
   }
-
-  void run_init_and_update_kernel(
-      const std::vector<size_t> &batch_indices, cudaStream_t *insertion_stream,
-      cudaStream_t *update_stream, cudaStream_t *embedding_stream,
-      std::vector<size_t> &affected_indices,
-      std::vector<std::tuple<size_t, size_t, float>> &new_edges) {}
-
-  void run_update_kernel(
-      const std::vector<size_t> &batch_indices, cudaStream_t *update_stream,
-      cudaStream_t *embedding_stream,
-      std::vector<std::tuple<size_t, size_t, float>> &affected_edges) {}
-
-  void run_embed_kernel(
-      const std::vector<std::tuple<size_t, size_t, float>> &batch_edges,
-      cudaStream_t *embedding_stream) {}
 
   void close() {
     cudaStreamDestroy(insertion_stream);
