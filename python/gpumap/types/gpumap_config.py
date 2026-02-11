@@ -50,5 +50,4 @@ class GPUMAPConfig(UMAPConfig):
     """
 
     n_instances: int
-    n_dims: int
-
+    n_features: int

@@ -1,34 +1,26 @@
 #pragma once
 
 #include "rmm/device_uvector.hpp"
+#include <cstddef>
 
 namespace gpumap {
-
-template <typename Data_t, typename Idx_t = size_t> struct Matrix {
-  Idx_t n_rows{};
-  Idx_t n_cols{};
-
-  rmm::device_uvector<Data_t> buf;
-
-  Matrix(Idx_t n_rows_, Idx_t n_cols_)
-      : n_rows(n_rows_), n_cols(n_cols_),
-        buf(static_cast<size_t>(n_rows_) * static_cast<size_t>(n_cols_),
-            rmm::cuda_stream_default) {}
-
-  Data_t *data() { return buf.data(); }
-
-  void update_n_rows(Idx_t new_n_rows) { n_rows = new_n_rows; }
-
-  ~Matrix() = default;
-};
 
 template <typename Data_t = float, typename Idx_t = size_t> struct Storage {
   Idx_t capacity;
   Idx_t n_features;
   Idx_t n_neighbors;
+  Idx_t n_neighbor;
 
+  // current number of data rows stored in data matrix and neighbor graphs
   Idx_t n_data_rows;
   Idx_t n_rows;
+
+  size_t seed;
+
+  // configs for nndescent
+  size_t max_iter_nnd;
+  size_t n_samples_nnd;
+  float termination_threshold_nnd;
 
   // Data processing buffers
   rmm::device_uvector<Data_t> data;
@@ -47,7 +39,7 @@ template <typename Data_t = float, typename Idx_t = size_t> struct Storage {
         rmm::cuda_stream_default);
 
     neighbor_indices = rmm::device_uvector<Idx_t>(
-        static_cast<size_t>(capacity) * static_cast<size_t>(n_neighbors),
+        static_cast<size_t>(capacity) * static_cast<size_t>(n_neighbors) * 2,
         rmm::cuda_stream_default);
     neighbor_dists = rmm::device_uvector<Data_t>(
         static_cast<size_t>(capacity) * static_cast<size_t>(n_neighbors),
@@ -59,9 +51,13 @@ template <typename Data_t = float, typename Idx_t = size_t> struct Storage {
   };
 
   Storage() = default;
-  Storage(Idx_t capacity_, Idx_t n_features_, Idx_t n_neighbors_)
-      : capacity(capacity_), n_features(n_features_),
-        n_neighbors(n_neighbors_) {
+  Storage(Idx_t capacity_, Idx_t n_features_, Idx_t n_neighbors_,
+          size_t seed_ = 42, size_t max_iter_nnd_ = 30,
+          size_t n_samples_nnd_ = 150,
+          float termination_threshold_nnd_ = 0.0001f)
+      : capacity(capacity_), n_features(n_features_), n_neighbors(n_neighbors_),
+        max_iter_nnd(max_iter_nnd_), n_samples_nnd(n_samples_nnd_),
+        termination_threshold_nnd(termination_threshold_nnd_) {
     allocate_matrices();
   }
 
