@@ -29,13 +29,17 @@ if __name__ == "__main__":
     )
 
     print(f"Running GPUMAP...")
-    for i in range(10):
+    for i in range(1):
         print(f"  Iteration {i+1}...")
-        result = gpumap.run(target_latency=10.0)
-        print(f"Target latency: 10s")
+        # result = gpumap.run(target_latency=10.0)
+        result = gpumap.run_with_n_ops(100, 0, 0)
+        # print(result.n_insertion_ops, result.n_update_ops, result.n_embedding_ops)
+        print(gpumap.get_neighbor_indices().shape)
+        print(gpumap.get_neighbor_indices())
+        # print(f"Target latency: 10s")
         # printout the total time
-        total_time = result.insertion_time + result.update_time + result.embedding_time
-        print(f"  Total time: {total_time:.4f}s ")
+        # total_time = result.insertion_time + result.update_time + result.embedding_time
+        # print(f"  Total time: {total_time:.4f}s ")
 
 
     gpumap.close()

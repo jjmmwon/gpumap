@@ -46,11 +46,15 @@ public:
 
   void close() { model.close(); }
 
-  // py::object get_data_view() const {
-  //   return binding_utils::to_cai_object(model.get_data_view());
-  // }
-
-  py::object get_embedding_view() const {
+  py::object get_embedding() const {
     return binding_utils::to_cai_object(model.get_embedding());
+  }
+
+  py::object get_neighbor_indices() const {
+    return binding_utils::to_cai_object(model.get_neighbor_indices());
+  }
+
+  py::object get_neighbor_dists() const {
+    return binding_utils::to_cai_object(model.get_neighbor_dists());
   }
 };

@@ -39,9 +39,7 @@ template <typename T> inline std::string get_cai_type_str() {
 template <typename Data_t, typename Idx_t, typename LayoutPolicy>
 inline pybind11::object to_cai_object(
     const raft::device_matrix_view<const Data_t, Idx_t, LayoutPolicy> &view) {
-  static_assert(std::is_same<Data_t, float>::value,
-                "Only float32 is supported for CAI export.");
-
+  // get_cai_type_str will throw at compile time if type is not supported
   const auto *ptr = view.data_handle();
   const std::size_t rows = static_cast<std::size_t>(view.extent(0));
   const std::size_t cols = static_cast<std::size_t>(view.extent(1));

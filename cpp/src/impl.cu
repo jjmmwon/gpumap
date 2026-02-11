@@ -30,5 +30,13 @@ GPUMAP::EmbedView GPUMAP::get_embedding() const {
   return impl_->get_embedding();
 }
 
+GPUMAP::NeighborIndicesView GPUMAP::get_neighbor_indices() const {
+  return impl_->get_neighbor_indices();
+}
+
+GPUMAP::NeighborDistsView GPUMAP::get_neighbor_dists() const {
+  return impl_->get_neighbor_dists();
+}
+
 
 } // namespace gpumap

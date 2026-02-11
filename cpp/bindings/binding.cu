@@ -44,5 +44,7 @@ PYBIND11_MODULE(_core, m) {
       .def("run", &GPUMAPWrapper::run, py::arg("n_jobs_insertion"),
            py::arg("n_jobs_update"), py::arg("n_jobs_embedding"))
       .def("close", &GPUMAPWrapper::close)
-      .def("get_embedding_view", &GPUMAPWrapper::get_embedding_view);
+      .def("get_embedding", &GPUMAPWrapper::get_embedding)
+      .def("get_neighbor_indices", &GPUMAPWrapper::get_neighbor_indices)
+      .def("get_neighbor_dists", &GPUMAPWrapper::get_neighbor_dists);
 };

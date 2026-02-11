@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import numpy as np
+import cupy as cp
 
 from gpumap.validators import validate_data_chunk
 from gpumap.utils import _as_f32_c_contig_2d
@@ -43,7 +44,11 @@ class GPUMAP:
             self._impl.close()
             self._closed = True
 
-    def run(self, target_latency: float = 10.0) -> None:
+    def run_with_n_ops(self, n_insertion_ops: int, n_update_ops: int, n_embedding_ops: int) -> _core.GPUMAPIterationResult:
+        res = self._impl.run(n_insertion_ops, n_update_ops, n_embedding_ops)
+        return res
+
+    def run(self, target_latency: float = 10.0) -> _core.GPUMAPIterationResult:
         time_slices = self.scheduler.schedule(target_latency)
 
         try:
@@ -85,9 +90,17 @@ class GPUMAP:
 
         return res
 
-    def get_embeddings_view(self) -> cp.ndarray:
-        # TODO
-        embeddings_view = cp.asarray(self._impl.get_embeddings_view())
-        return embeddings_view
+    def get_embedding(self) -> cp.ndarray:
+        embedding_view = cp.asarray(self._impl.get_embedding())
+        return embedding_view
+
+    def get_neighbor_indices(self) -> cp.ndarray:
+        neighbor_indices_view = cp.asarray(self._impl.get_neighbor_indices())
+        return neighbor_indices_view
+
+    def get_neighbor_dists(self) -> cp.ndarray:
+        neighbor_dists_view = cp.asarray(self._impl.get_neighbor_dists())
+        return neighbor_dists_view
+
 
 

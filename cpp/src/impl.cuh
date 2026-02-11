@@ -17,7 +17,7 @@ using clock = std::chrono::high_resolution_clock;
 
 struct GPUMAP::Impl {
   using Data_t = float;
-  using Idx_t = size_t;
+  using Idx_t = uint32_t;
 
   GPUMAPParams params;
 
@@ -43,7 +43,7 @@ struct GPUMAP::Impl {
     cudaStreamCreate(&embedding_stream);
   }
 
-  void append_data(const Data_t *ptr, size_t n_new_instances,
+  void append_data(const Data_t *ptr, Idx_t n_new_instances,
                    bool is_device = false) {
 
     if (storage.n_inserted_instances + n_new_instances > storage.n_instances) {
@@ -314,6 +314,22 @@ struct GPUMAP::Impl {
 
     return raft::make_device_matrix_view<const Data_t, Idx_t, raft::row_major>(
         embedding_ptr, storage.n_instances, storage.n_components);
+  }
+
+  auto get_neighbor_indices() const
+      -> raft::device_matrix_view<const Idx_t, Idx_t, raft::row_major> {
+    auto neighbor_indices_ptr = storage.neighbor_indices.data();
+
+    return raft::make_device_matrix_view<const Idx_t, Idx_t, raft::row_major>(
+        neighbor_indices_ptr, storage.n_instances, storage.neighbor_indices_block_size);
+  }
+
+  auto get_neighbor_dists() const
+      -> raft::device_matrix_view<const Data_t, Idx_t, raft::row_major> {
+    auto neighbor_dists_ptr = storage.neighbor_dists.data();
+
+    return raft::make_device_matrix_view<const Data_t, Idx_t, raft::row_major>(
+        neighbor_dists_ptr, storage.n_instances, storage.neighbor_dists_block_size);
   }
 };
 } // namespace gpumap

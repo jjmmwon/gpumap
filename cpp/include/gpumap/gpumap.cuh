@@ -21,7 +21,7 @@ struct GPUMAPParams {
   float b = 1.0f;
   float alpha = 1.0f;
   bool verbose = false;
-  
+
   size_t n_instances = 0;
   size_t n_features = 0;
 
@@ -50,10 +50,14 @@ struct GPUMAPResult {
 class GPUMAP {
 public:
   using Data_t = float;
-  using Idx_t = size_t;
+  using Idx_t = uint32_t;
   using DataView =
       raft::device_matrix_view<const Data_t, Idx_t, raft::row_major>;
   using EmbedView =
+      raft::device_matrix_view<const Data_t, Idx_t, raft::row_major>;
+  using NeighborIndicesView =
+      raft::device_matrix_view<const Idx_t, Idx_t, raft::row_major>;
+  using NeighborDistsView =
       raft::device_matrix_view<const Data_t, Idx_t, raft::row_major>;
 
   GPUMAP(const GPUMAPParams &params);
@@ -66,9 +70,6 @@ public:
 
   ~GPUMAP();
 
-  // Host pointer input: binding layer should guarantee contiguous layout.
-  // (If you want to accept stride/ld, add it here explicitly.)
-
   void initialize(size_t n_instances, size_t n_features);
   void append_data(const float *ptr, size_t n_new_instances,
                    bool is_device = false);
@@ -77,9 +78,8 @@ public:
   void close();
 
   EmbedView get_embedding() const;
-
-  // Get current configuration
-  // const GPUMAPParams &get_config() const;
+  NeighborIndicesView get_neighbor_indices() const;
+  NeighborDistsView get_neighbor_dists() const;
 
 private:
   struct Impl;
