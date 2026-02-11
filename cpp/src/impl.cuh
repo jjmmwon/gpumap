@@ -31,7 +31,8 @@ struct GPUMAP::Impl {
 
   Impl(const GPUMAPParams &params_)
       : params(params_),
-        storage(params_.n_instances, params_.n_features, params_.n_neighbors),
+        storage(params_.n_instances, params_.n_features, params_.n_neighbors, 
+                params_.n_components),
         insertion_queue(params_.n_instances) {
     initialize();
   }
@@ -126,7 +127,7 @@ struct GPUMAP::Impl {
 
     std::vector<size_t> batch_indices = insertion_queue.pop_n(n_ops);
     std::vector<size_t> affected_indices;
-    std::vector<std::tuple<size_t, size_t, size_t>> new_edges;
+    std::vector<gpumap::Edge> new_edges;
 
     // run_init_and_update_kernel(
     //     batch_indices, &insertion_stream, &update_stream, &embedding_stream,
@@ -155,7 +156,7 @@ struct GPUMAP::Impl {
     }
 
     std::vector<size_t> batch_indices = update_queue.pop_n(n_ops);
-    std::vector<std::tuple<size_t, size_t, size_t>> affected_edges;
+    std::vector<gpumap::Edge> affected_edges;
 
     // run_update_kernel(
     //     batch_indices, &update_stream, &embedding_stream,
@@ -172,40 +173,47 @@ struct GPUMAP::Impl {
     // 먼저 n_ops 개수만큼 엣지를 빼자
     std::vector<gpumap::Edge> batch_edges = embedding_queue.pop_n(n_ops);
 
-    // src들의 리스트와 dst의 리스트를 만든다. h for host
+    // src, dst, epoch 리스트를 만든다. h for host
     std::vector<Idx_t> h_srcs, h_dsts;
+    std::vector<size_t> h_epochs;
     h_srcs.reserve(batch_edges.size());
     h_dsts.reserve(batch_edges.size());
+    h_epochs.reserve(batch_edges.size());
 
     for (const auto& e : batch_edges) {
-        h_srcs.push_back(std::get<0>(e));
-        h_dsts.push_back(std::get<1>(e));        
+      h_srcs.push_back(std::get<0>(e));
+      h_dsts.push_back(std::get<1>(e));
+      h_epochs.push_back(std::get<2>(e));
     }
     
     // 커널 실행 준비를 위해 src,dst에 대한 디바이스 vector
     rmm::device_uvector<Idx_t> d_srcs(h_srcs.size(), embedding_stream), 
                                d_dsts(h_dsts.size(), embedding_stream);
 
-    rmm::device_uvector<Idx_t> d_out_srcs(h_srcs.size(), embedding_stream), 
-                               d_out_dsts(h_dsts.size(), embedding_stream);
+    rmm::device_uvector<Idx_t> d_out_srcs(h_srcs.size(), embedding_stream),
+      d_out_dsts(h_dsts.size(), embedding_stream);
+    rmm::device_uvector<size_t> d_epochs(h_epochs.size(), embedding_stream);
+    rmm::device_uvector<size_t> d_out_epochs(h_epochs.size(), embedding_stream);
 
     rmm::device_scalar<unsigned long long> d_out_count(embedding_stream);
 
     // 호스트 -> 디바이스 복사
     cudaMemcpyAsync(d_srcs.data(), h_srcs.data(), h_srcs.size() * sizeof(Idx_t), cudaMemcpyHostToDevice, embedding_stream);
 
-    cudaMemcpyAsync(d_dsts.data(), h_dsts.data(), h_dsts.size() * sizeof(Idx_t), cudaMemcpyHostToDevice, embedding_stream);
+    cudaMemcpyAsync(d_dsts.data(), h_dsts.data(), h_dsts.size() * sizeof(Idx_t),
+            cudaMemcpyHostToDevice, embedding_stream);
+    cudaMemcpyAsync(d_epochs.data(), h_epochs.data(),
+            h_epochs.size() * sizeof(size_t),
+            cudaMemcpyHostToDevice, embedding_stream);
     
     // 이웃인 엣지들만 남긴다. (필터링 커널 실행)
-    filter_edges_by_neighbors<Idx_t>(d_srcs.data(), d_dsts.data(), 
-                                d_out_srcs.data(), d_out_dsts.data(),
-                                batch_edges.size(),
-                                storage.neighbor_indices.data(),
-                                storage.neighbor_indices_block_size,
-                                storage.n_neighbors,
-                                d_out_count.data(),
-                                embedding_stream);
+    filter_edges_by_neighbors<Idx_t, size_t>(
+      d_srcs.data(), d_dsts.data(), d_epochs.data(), d_out_srcs.data(),
+      d_out_dsts.data(), d_out_epochs.data(), batch_edges.size(),
+      storage.neighbor_indices.data(), storage.neighbor_indices_block_size,
+      storage.n_neighbors, d_out_count.data(), embedding_stream);
 
+    // 필터링 하고 남은 개수 읽어오기 (즉 아직 src, dst가 이웃인 엣지의 수)
     unsigned long long h_out_count = 0;
     cudaMemcpyAsync(&h_out_count, d_out_count.data(),
                     sizeof(unsigned long long), cudaMemcpyDeviceToHost,
@@ -218,8 +226,10 @@ struct GPUMAP::Impl {
       return;
     }
     
+    // 실제 src, dst 호스트로 복사
     std::vector<Idx_t> h_out_srcs(h_out_count);
     std::vector<Idx_t> h_out_dsts(h_out_count);
+    std::vector<size_t> h_out_epochs(h_out_count);
 
     cudaMemcpyAsync(h_out_srcs.data(), d_out_srcs.data(),
                     h_out_count * sizeof(Idx_t), cudaMemcpyDeviceToHost,
@@ -227,11 +237,13 @@ struct GPUMAP::Impl {
     cudaMemcpyAsync(h_out_dsts.data(), d_out_dsts.data(),
                     h_out_count * sizeof(Idx_t), cudaMemcpyDeviceToHost,
                     embedding_stream);
+    cudaMemcpyAsync(h_out_epochs.data(), d_out_epochs.data(),
+            h_out_count * sizeof(size_t), cudaMemcpyDeviceToHost,
+            embedding_stream);
 
     cudaStreamSynchronize(embedding_stream);
 
-    // 남은 엣지의 src, dst 인덱스 중에서 중복을 제거한다.
-    
+    // 남은 엣지의 src, dst 인덱스 중에서 중복을 제거한다.    
     std::vector<Idx_t> unique_indices;
     unique_indices.reserve(h_out_count * 2);
     for (size_t i = 0; i < h_out_count; ++i) {
@@ -244,7 +256,6 @@ struct GPUMAP::Impl {
         unique_indices.end());
     
     // 남은 엣지들 중에서 dirty한 녀석들을 보고 dirty하다면 sigma_i를 업데이트해준다.
-
     rmm::device_uvector<Idx_t> d_unique_indices(unique_indices.size(),
                           embedding_stream);
     cudaMemcpyAsync(d_unique_indices.data(), unique_indices.data(),
@@ -257,10 +268,34 @@ struct GPUMAP::Impl {
       storage.neighbor_dists.data(), storage.neighbor_dists_block_size,
       storage.n_neighbors, embedding_stream);
 
+    update_embeddings<Data_t, Idx_t>(
+        d_out_srcs.data(), d_out_dsts.data(), h_out_count,
+        storage.embedding.data(), params.n_components, storage.n_data_rows,
+        storage.neighbor_indices.data(), storage.neighbor_indices_block_size,
+        storage.neighbor_dists.data(), storage.neighbor_dists_block_size,
+        storage.n_neighbors, params.a, params.b, params.alpha,
+        params.negative_sample_rate, embedding_stream);
 
-    // 사실 embedding queue에는 엣지가 들어가야 유맵 구현과 같음
+    std::vector<gpumap::Edge> requeue_edges;
+    requeue_edges.reserve(h_out_count);
+    for (size_t i = 0; i < h_out_count; ++i) {
+      const size_t next_epoch = h_out_epochs[i] + 1;
+      if (next_epoch <= params.max_epoch) {
+        requeue_edges.emplace_back(h_out_srcs[i], h_out_dsts[i], next_epoch);
+      }
+    }
 
-    // embedding_queue는 그냥 벡터임
+    if (!requeue_edges.empty()) {
+      embedding_queue.push_batch(requeue_edges);
+    }
+
+
+    
+    // 남은것
+    // 1) epoch을 보면서 임베딩 업데이트
+    // 2) epoch이 max_epoch보다 크면 걔네는 죽이는거 관리 (큐에서 빼는거)
+    // 3) negative sampling 처리
+
 
     // embedding_queue로부터 최대 n_ops 의 에지를 하나 씩 뺀다.
     // 이를 e라고 하면,
@@ -283,11 +318,9 @@ struct GPUMAP::Impl {
   auto get_embedding() const
       -> raft::device_matrix_view<const Data_t, Idx_t, raft::row_major> {
     auto embedding_ptr = storage.embedding.data();
-    Idx_t n_rows = storage.n_rows;
-    Idx_t n_cols = 2;
 
     return raft::make_device_matrix_view<const Data_t, Idx_t, raft::row_major>(
-        embedding_ptr, n_rows, n_cols);
+        embedding_ptr, storage.n_rows, storage.n_components);
   }
 };
 } // namespace gpumap

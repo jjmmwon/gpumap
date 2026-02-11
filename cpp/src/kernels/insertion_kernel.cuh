@@ -2,6 +2,7 @@
 #pragma once
 
 #include "nndescent/initialize.cuh"
+#include "queue.cuh"
 #include "raft/util/cuda_rt_essentials.hpp"
 #include <__clang_cuda_runtime_wrapper.h>
 #include <vector>
@@ -16,7 +17,7 @@ void insertion_kernel(Data_t *input_data, Idx_t *neighbor_indices,
 
                       const std::vector<size_t> &batch_indices,
                       std::vector<size_t> &affected_indices,
-                      std::vector<std::tuple<size_t, size_t, float>> &new_edges,
+                      std::vector<gpumap::Edge> &new_edges,
 
                       cudaStream_t *insertion_stream,
                       cudaStream_t *update_stream,

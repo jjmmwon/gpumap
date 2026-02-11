@@ -9,6 +9,7 @@ template <typename Data_t = float, typename Idx_t = size_t> struct Storage {
   Idx_t capacity;
   Idx_t n_features;
   Idx_t n_neighbors;
+  Idx_t n_components;
 
   // current number of data rows stored in data matrix and neighbor graphs
   Idx_t n_data_rows;
@@ -56,16 +57,18 @@ template <typename Data_t = float, typename Idx_t = size_t> struct Storage {
         static_cast<size_t>(capacity) * neighbor_dists_block_size * sizeof(Data_t), rmm::cuda_stream_default);
     
     embedding = rmm::device_uvector<Data_t>(static_cast<size_t>(capacity) *
-                                                static_cast<size_t>(2),
+                                                static_cast<size_t>(n_components),
                                             rmm::cuda_stream_default);
   };
 
   Storage() = delete;
   Storage(Idx_t capacity_, Idx_t n_features_, Idx_t n_neighbors_,
+          Idx_t n_components_ = 2,
           size_t seed_ = 42, size_t max_iter_nnd_ = 30,
           size_t n_samples_nnd_ = 150,
           float termination_threshold_nnd_ = 0.0001f)
       : capacity(capacity_), n_features(n_features_), n_neighbors(n_neighbors_),
+      n_components(n_components_),
       seed(seed_),
         max_iter_nnd(max_iter_nnd_), n_samples_nnd(n_samples_nnd_),
         termination_threshold_nnd(termination_threshold_nnd_),

@@ -19,6 +19,10 @@ PYBIND11_MODULE(_core, m) {
       .def_readwrite("n_epochs", &gpumap::GPUMAPParams::n_epochs)
       .def_readwrite("negative_sample_rate",
                      &gpumap::GPUMAPParams::negative_sample_rate)
+    .def_readwrite("max_epoch", &gpumap::GPUMAPParams::max_epoch)
+    .def_readwrite("a", &gpumap::GPUMAPParams::a)
+    .def_readwrite("b", &gpumap::GPUMAPParams::b)
+    .def_readwrite("alpha", &gpumap::GPUMAPParams::alpha)
       .def_readwrite("verbose", &gpumap::GPUMAPParams::verbose)
       .def_readwrite("n_instances", &gpumap::GPUMAPParams::n_instances)
       .def_readwrite("n_features", &gpumap::GPUMAPParams::n_features);
