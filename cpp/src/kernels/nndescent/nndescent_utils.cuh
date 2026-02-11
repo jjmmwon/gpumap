@@ -88,4 +88,5 @@ private:
   size_t num_sets_per_list_;
   size_t num_hashes_;
 };
+
 } // namespace gpumap
