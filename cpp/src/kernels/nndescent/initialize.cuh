@@ -3,7 +3,7 @@
 #include <curand_kernel.h>
 #include <curand_philox4x32_x.h>
 
-namespace gpumap::detail::nndescent {
+namespace gpumap::nndescent {
 
 template <typename Idx_t>
 __device__ __forceinline__ bool contains_id(const Idx_t *arr, int k, Idx_t v) {
@@ -155,4 +155,4 @@ sample_forward_candidates_kernel(const Idx_t *__restrict__ neighbor_indices,
 
 void iter_forward_nndescent() {}
 
-} // namespace gpumap::detail::nndescent
+} // namespace gpumap::nndescent
