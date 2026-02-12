@@ -8,7 +8,7 @@ namespace gpumap {
 
 template <typename Idx_t>
 __device__ __forceinline__ bool is_neighbor(const Idx_t *neighbors, size_t n_neighbors, Idx_t dst) {
-  for (int i = 0; i < n_neighbors; ++i) {
+  for (int i = 0; i < (int)n_neighbors; ++i) {
     if (neighbors[i] == dst) {
       return true;
     }
@@ -74,7 +74,7 @@ __global__ void filter_edges_by_neighbors_kernel(
     const Idx_t *__restrict__ srcs, const Idx_t *__restrict__ dsts,
     Idx_t *__restrict__ out_srcs, Idx_t *__restrict__ out_dsts,
     size_t n_edges, const Idx_t *__restrict__ neighbor_indices,
-    size_t neighbor_indices_block_size, 
+    size_t neighbor_indices_block_size,
         size_t n_neighbors,
         unsigned long long *__restrict__ out_count) {
 
@@ -101,9 +101,9 @@ void filter_edges_by_neighbors(const Idx_t *srcs, const Idx_t *dsts,
                                Idx_t *out_srcs, Idx_t *out_dsts,
                                size_t n_edges,
                                const Idx_t *neighbor_indices,
-                               size_t neighbor_indices_block_size, 
+                               size_t neighbor_indices_block_size,
                                                              size_t n_neighbors,
-                                                             unsigned long long *out_count, 
+                                                             unsigned long long *out_count,
                                cudaStream_t stream) {
 
   const int threads_per_block = 256;

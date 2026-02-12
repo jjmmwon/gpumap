@@ -55,24 +55,8 @@ struct GPUMAP::Impl {
         storage.data.data() + static_cast<size_t>(storage.n_inserted_instances) *
                                   storage.data_block_size;
 
-    // printf("in append data\n");
-
-    // size_t row_index = 99;
-    // for(int i=600;i<storage.n_features;i++)
-    //   printf("%.3f ", ptr[row_index * storage.n_features + i]);
-    // printf("\n");
-    // printf("n_new_instances: %d\n", n_new_instances);
-    // printf("data block size: %d\n", storage.data_block_size);
-
-    // if (is_device) {
-    //   utils::append_device(data_ptr, ptr, n_new_instances,
-    //                        storage.n_features,
-    //                        storage.data_block_size, rmm::cuda_stream_view(insertion_stream));
-    // } else {
-      // TODO: implement append_host properly (not needed for now)
     utils::append_host(data_ptr, ptr, n_new_instances, storage.n_features, storage.data_block_size,
                         rmm::cuda_stream_view(insertion_stream));
-    // }
 
     // Add newly inserted indices to the insertion queue
     Idx_t old_count = storage.n_inserted_instances;
