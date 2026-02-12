@@ -34,8 +34,8 @@ if __name__ == "__main__":
         # result = gpumap.run(target_latency=10.0)
         result = gpumap.run_with_n_ops(100, 0, 0)
         # print(result.n_insertion_ops, result.n_update_ops, result.n_embedding_ops)
-        print(gpumap.get_neighbor_indices().shape)
-        print(gpumap.get_neighbor_indices())
+        # print(gpumap.get_neighbor_indices().shape)
+        # print(gpumap.get_neighbor_indices())
 
         # print(gpumap.get_neighbor_indices().shape)
         # print(gpumap.get_neighbor_indices())

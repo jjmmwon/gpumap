@@ -14,9 +14,8 @@ void GPUMAP::initialize(size_t n_instances, size_t n_features) {
   // For now, initialization happens in constructor
 }
 
-void GPUMAP::append_data(const float *ptr, size_t n_new_instances,
-                         bool is_device) {
-  impl_->append_data(ptr, n_new_instances, is_device);
+void GPUMAP::append_data(const float *ptr, size_t n_new_instances) {
+  impl_->append_data(ptr, n_new_instances);
 }
 
 GPUMAPResult GPUMAP::run(size_t n_insertion_ops, size_t n_update_ops,

@@ -36,7 +36,7 @@ public:
       return;
     }
 
-    model.append_data(v.ptr, static_cast<Idx_t>(v.n_rows), true);
+    model.append_data(v.ptr, static_cast<Idx_t>(v.n_rows));
   }
 
   gpumap::GPUMAPResult run(size_t n_insertion_ops, size_t n_update_ops,

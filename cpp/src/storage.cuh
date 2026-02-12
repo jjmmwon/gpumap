@@ -38,8 +38,7 @@ template <typename Data_t = float, typename Idx_t = uint32_t> struct Storage {
 
   void allocate_matrices() {
     data_block_size = n_features + 1; // +1 for l2 norm
-    data = rmm::device_uvector<Data_t>(
-        static_cast<size_t>(n_instances) * data_block_size, // +1 for l2 norm
+    data = rmm::device_uvector<Data_t>(n_instances * data_block_size, // +1 for l2 norm
         rmm::cuda_stream_default);
 
     neighbor_indices_block_size = n_neighbors * 2 + 1;

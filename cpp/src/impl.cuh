@@ -45,8 +45,7 @@ struct GPUMAP::Impl {
     cudaStreamCreate(&embedding_stream);
   }
 
-  void append_data(const Data_t *ptr, Idx_t n_new_instances,
-                   bool is_device = true) {
+  void append_data(const Data_t *ptr, Idx_t n_new_instances) {
 
     if (storage.n_inserted_instances + n_new_instances > storage.n_instances) {
       throw std::runtime_error("Exceeding maximum number of rows in storage");
@@ -54,20 +53,31 @@ struct GPUMAP::Impl {
 
     auto data_ptr =
         storage.data.data() + static_cast<size_t>(storage.n_inserted_instances) *
-                                  static_cast<size_t>(storage.n_features + 1);
+                                  storage.data_block_size;
 
-    if (is_device) {
-      utils::append_device(data_ptr, ptr, n_new_instances,
-                           storage.n_features + 1, rmm::cuda_stream_view(insertion_stream));
-    } else {
-      utils::append_host(data_ptr, ptr, n_new_instances, storage.n_features + 1,
-                         rmm::cuda_stream_view(insertion_stream));
-    }
+    // printf("in append data\n");
+
+    // size_t row_index = 99;
+    // for(int i=600;i<storage.n_features;i++)
+    //   printf("%.3f ", ptr[row_index * storage.n_features + i]);
+    // printf("\n");
+    // printf("n_new_instances: %d\n", n_new_instances);
+    // printf("data block size: %d\n", storage.data_block_size);
+
+    // if (is_device) {
+    //   utils::append_device(data_ptr, ptr, n_new_instances,
+    //                        storage.n_features,
+    //                        storage.data_block_size, rmm::cuda_stream_view(insertion_stream));
+    // } else {
+      // TODO: implement append_host properly (not needed for now)
+    utils::append_host(data_ptr, ptr, n_new_instances, storage.n_features, storage.data_block_size,
+                        rmm::cuda_stream_view(insertion_stream));
+    // }
 
     // Add newly inserted indices to the insertion queue
     Idx_t old_count = storage.n_inserted_instances;
     storage.n_inserted_instances += n_new_instances;
-    
+
     std::vector<Idx_t> new_indices;
     for (Idx_t i = old_count; i < storage.n_inserted_instances; ++i) {
       new_indices.push_back(i);
@@ -94,7 +104,7 @@ struct GPUMAP::Impl {
       result.insertion_time = std::chrono::duration<float>(end - start).count();
     }
 
-    if (!update_queue.size()) {
+    if (n_update_ops == 0 || !update_queue.size()) {
       result.n_update_ops = 0;
       result.update_time = 0.0f;
     } else {

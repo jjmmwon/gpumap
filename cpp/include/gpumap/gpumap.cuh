@@ -71,8 +71,7 @@ public:
   ~GPUMAP();
 
   void initialize(size_t n_instances, size_t n_features);
-  void append_data(const float *ptr, size_t n_new_instances,
-                   bool is_device = false);
+  void append_data(const float *ptr, size_t n_new_instances);
   GPUMAPResult run(size_t n_insertion_ops, size_t n_update_ops,
                    size_t n_embedding_ops);
   void close();
