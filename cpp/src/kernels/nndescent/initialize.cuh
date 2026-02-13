@@ -11,8 +11,7 @@ template <typename Data_t, typename Idx_t, int MAX_K = 32>
 __global__ void initialize_random_neighbors_kernel(
     Idx_t *neighbor_indices, Data_t *neighbor_distances, Idx_t n_start,
     Idx_t n_end, Idx_t n_neighbors, Idx_t neighbor_indices_block_size,
-    Idx_t neighbor_dists_block_size,
-    Idx_t n_instances,
+    Idx_t neighbor_dists_block_size, Idx_t n_instances,
     Idx_t n_inserted_instances, size_t seed) {
 
   Idx_t idx = blockIdx.x * blockDim.x + threadIdx.x + n_start;
@@ -30,7 +29,7 @@ __global__ void initialize_random_neighbors_kernel(
     Idx_t candidate = curand(&state) % n_inserted_instances;
     if (candidate == idx)
       continue;
-    if (contains_id<Idx_t, MAX_K>(my_neighbors, filled, candidate))
+    if (utils::list_contains_id<Idx_t, MAX_K>(my_neighbors, filled, candidate))
       continue;
 
     my_neighbors[filled] = candidate;
@@ -137,10 +136,11 @@ __global__ void sample_forward_candidates_kernel(
         continue;
       if (candidate_id == gid)
         continue;
-      if (contains_id<Idx_t, MAX_K>(my_neighbors_l, n_neighbors, candidate_id))
+      if (utils::list_contains_id<Idx_t, MAX_K>(my_neighbors_l, n_neighbors,
+                                                candidate_id))
         continue;
-      if (contains_id<int, MAX_C>(my_candidates_l, candidate_count,
-                                  candidate_id))
+      if (utils::list_contains_id<int, MAX_C>(my_candidates_l, candidate_count,
+                                              candidate_id))
         continue;
 
       my_candidates_l[candidate_count++] = static_cast<int>(candidate_id);
@@ -203,13 +203,13 @@ __global__ void forward_nndescent_kernel(
     Idx_t candidate_id = static_cast<Idx_t>(candidate);
 
     // Compute distance
-    Data_t dist = compute_l2_distance<Data_t, Idx_t>(input_data, gid,
-                                                     candidate_id, n_features);
+    Data_t dist = utils::compute_l2_distance_sq<Data_t, Idx_t>(
+        input_data, gid, candidate_id, n_features);
 
     // Try to insert
-    if (insert_neighbor_sorted<Data_t, Idx_t>(neighbors_local, distances_local,
-                                              n_neighbors, candidate_id,
-                                              dist)) {
+    if (utils::insert_neighbor_sorted<Data_t, Idx_t>(
+            neighbors_local, distances_local, n_neighbors, candidate_id,
+            dist)) {
       updated = true;
     }
   }
