@@ -60,7 +60,7 @@ __device__ bool should_insert_neighbor(const Idx_t *neighbors,
 // Insert into ascending-sorted (distance, id) arrays.
 template <typename Data_t, typename Idx_t>
 __device__ __host__ bool
-insert_neighbor_sorted(Idx_t *neighbors, Data_t *distances, int n_neighbors,
+insert_neighbor_sorted(Idx_t *neighbors, Data_t *distances, size_t n_neighbors,
                        Idx_t new_id, Data_t new_dist) {
   if (!should_insert_neighbor<Data_t, Idx_t>(neighbors, distances, n_neighbors,
                                              new_id, new_dist)) {
@@ -73,6 +73,9 @@ insert_neighbor_sorted(Idx_t *neighbors, Data_t *distances, int n_neighbors,
     distances[insert_pos] = distances[insert_pos - 1];
     --insert_pos;
   }
+
+  if (new_id < 0)
+    new_id = -new_id - 1;
 
   neighbors[insert_pos] = new_id;
   distances[insert_pos] = new_dist;

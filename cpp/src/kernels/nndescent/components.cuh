@@ -1,3 +1,4 @@
+#include <cstddef>
 #include <raft/core/device_mdarray.hpp>
 #include <raft/core/host_mdarray.hpp>
 #include <raft/core/pinned_mdarray.hpp>
@@ -128,82 +129,164 @@ public:
 
 template <typename Data_t, typename Idx_t> struct NNDGraph {
   raft::resources const &res;
-  static constexpr int segment_size = 32;
-  InternalID_t *h_graph;
+  InternalID_t *h_indices;
 
   size_t n_row;
   size_t n_neighbors;
-  size_t n_inserted_instances_;
+  size_t n_inserted_instances;
   size_t n_internal_neighbors;
-  size_t num_samples;
+  size_t num_samples; // number of samples of new/old neighbors to consider
+                      // during graph update
+  size_t seed;
 
-  raft::host_matrix<Data_t, size_t, raft::row_major> h_dists;
+  raft::host_matrix<Data_t, size_t, raft::row_major>
+      h_dists; // 호스트 측 거리 저장
 
-  raft::pinned_matrix<Idx_t, size_t> h_graph_new;
-  raft::pinned_vector<int2, size_t> h_list_sizes_new;
+  raft::pinned_matrix<Idx_t, size_t>
+      h_indices_new; // 새로운 그래프 연결 정보 (pinned 메모리)
+  raft::pinned_vector<int2, size_t>
+      h_list_sizes_new; // 새 그래프의 forward/reverse edge 개수
 
-  raft::pinned_matrix<Idx_t, size_t> h_graph_old;
-  raft::pinned_vector<int2, size_t> h_list_sizes_old;
-  BloomFilter<Idx_t> bloom_filter;
+  raft::pinned_matrix<Idx_t, size_t>
+      h_indices_old; // 기존 그래프 연결 정보 (pinned 메모리)
+  raft::pinned_vector<int2, size_t>
+      h_list_sizes_old;            // 기존 그래프의 forward/reverse edge 개수
+  BloomFilter<Idx_t> bloom_filter; // 중복 에지 제거용 Bloom 필터
 
   NNDGraph(const NNDGraph &) = delete;
   NNDGraph &operator=(const NNDGraph &) = delete;
   NNDGraph(raft::resources const &res, const size_t n_row,
            const size_t n_neighbors, const size_t n_internal_neighbors,
-           const size_t n_inserted_instances, const size_t num_samples);
+           const size_t n_inserted_instances, const size_t num_samples,
+           const size_t seed);
 
+  /**
+   * @brief Samples new neighbors from the candidate list and adds them to the
+   * new graph.
+   *
+   * Filters new neighbors using a bloom filter to avoid duplicates, marks them
+   * as old, and populates the new graph list up to num_samples entries.
+   *
+   * @param new_neighbors Array of new candidate neighbors with their IDs
+   * @param width Width of the new_neighbors array (number of candidates per
+   * row)
+   */
   void sample_graph_new(InternalID_t *new_neighbors, const size_t width);
+
+  /**
+   * @brief Separates neighbors into old and new lists based on their update
+   * status.
+   *
+   * Iterates through internal neighbors and distributes them into old_graph and
+   * new_graph lists, respecting the num_samples capacity limit for each list.
+   *
+   * @param sample_new If true, also samples new neighbors; if false, only
+   * samples old neighbors
+   */
   void sample_graph(bool sample_new);
+
+  /**
+   * @brief Updates the internal graph with new neighbors and their distances.
+   *
+   * Inserts new neighbors into the sorted neighbor list if their distances are
+   * better than the current worst distance, and increments the update counter
+   * when successful. Skips self-loops and neighbors that are worse than the
+   * current worst neighbor.
+   *
+   * @param new_neighbors Array of new neighbor IDs to consider for insertion
+   * @param new_dists Array of distances corresponding to new neighbors
+   * @param width Number of new neighbors per row
+   * @param update_counter Atomic counter tracking the number of successful
+   * updates
+   */
   void update_graph(const InternalID_t *new_neighbors, const Data_t *new_dists,
                     const size_t width, std::atomic<int64_t> &update_counter);
   void clear();
   ~NNDGraph();
 };
 
-template <typename Data_t, typename Idx_t, int NUM_SAMPLES> class NNDUpdate {
+template <typename Data_t, typename Idx_t> class NNDUpdate {
 public:
-  NNDUpdate(raft::resources const &res);
+  NNDUpdate(raft::resources const &res, std::vector<size_t> batch_indices,
+            Data_t *input_data, Idx_t *neighbor_indices,
+            Data_t *neighbor_distances, Idx_t data_block_size,
+            Idx_t neighbor_indices_block_size, Idx_t neighbor_dists_block_size,
+            BloomFilter<Idx_t> &bloom_filter, size_t n_features,
+            size_t n_neighbors, size_t n_internal_neighbors,
+            size_t n_inserted_instances, size_t num_samples,
+            float termination_threshold = 0.001, size_t max_iterations = 100,
+            size_t seed = 42);
+
   NNDUpdate(const NNDUpdate &) = delete;
   NNDUpdate &operator=(const NNDUpdate &) = delete;
 
-  template <typename DistEpilogue_t = raft::identity_op>
-  void build(Data_t *data, const Idx_t nrow, Idx_t *output_graph,
-             Data_t *output_distances);
+  void build();
   ~NNDUpdate() = default;
 
   void reset(raft::resources const &res);
 
 private:
+  void initialize();
   void add_reverse_edges(Idx_t *graph_ptr, Idx_t *h_rev_graph_ptr,
                          Idx_t *d_rev_graph_ptr, int2 *list_sizes,
                          cudaStream_t stream = 0);
 
   void local_join(cudaStream_t stream = 0);
+  void update_neighbor_info();
 
-  raft::resources const &res;
-  NNDGraph<Data_t, Idx_t> *graph_;
+  raft::resources const &res_;
+  NNDGraph<Data_t, Idx_t> graph_;
   std::atomic<int64_t> update_counter_;
+  float termination_threshold_;
+  size_t max_iterations_ = 100;
 
-  size_t n_row;
-  size_t n_features;
+  std::vector<size_t> batch_indices_;
+  Data_t *d_input_data_; // a.k.a. d_data_
+  Idx_t *d_neighbor_indices_;
+  Data_t *d_neighbor_distances_;
+  Idx_t data_block_size_;
+  Idx_t neighbor_indices_block_size_;
+  Idx_t neighbor_dists_block_size_;
 
-  raft::device_matrix<Data_t, size_t, raft::row_major> d_data;
-  raft::device_matrix<InternalID_t, size_t, raft::row_major> graph_buffer_;
-  raft::device_matrix<Data_t, size_t, raft::row_major> dists_buffer_;
+  BloomFilter<Idx_t> &bloom_filter_;
 
-  raft::pinned_matrix<InternalID_t, size_t> graph_host_buffer_;
-  raft::pinned_matrix<Data_t, size_t> dists_host_buffer_;
+  size_t n_row_;
+  size_t n_features_;
+  size_t n_neighbors_;
+  size_t n_internal_neighbors_;
+  size_t n_inserted_instances_;
 
-  raft::device_vector<int, size_t> d_locks_;
+  size_t num_samples_;
 
-  raft::pinned_matrix<Idx_t, size_t> h_rev_graph_new_;
-  raft::pinned_matrix<Idx_t, size_t> h_graph_old_;
-  raft::pinned_matrix<Idx_t, size_t> h_rev_graph_old_;
+  size_t seed_;
 
-  // int2.x is the number of forward edges, int2.y is the number of reverse
-  // edges
-  raft::device_vector<int2, size_t> d_list_sizes_new_;
-  raft::device_vector<int2, size_t> d_list_sizes_old_;
+  raft::device_matrix<InternalID_t, size_t, raft::row_major>
+      indices_buffer_; // 디바이스에서 계산된 그래프 이웃 정보
+  raft::device_matrix<Data_t, size_t, raft::row_major>
+      dists_buffer_; // 디바이스에서 계산된 거리 정보
+
+  raft::pinned_matrix<InternalID_t, size_t>
+      indices_host_buffer_; // 호스트와 디바이스 간 빠른 전송을 위한 고정
+                            // 메모리의 그래프 버퍼
+  raft::pinned_matrix<Data_t, size_t>
+      dists_host_buffer_; // 호스트와 디바이스 간 빠른 전송을 위한 고정 메모리의
+                          // 거리 버퍼
+
+  raft::device_vector<int, size_t>
+      d_locks_; // 디바이스에서 동시성 제어용 락 벡터
+
+  raft::pinned_matrix<Idx_t, size_t>
+      h_rev_indices_new_; // 새 그래프의 역방향 에지 정보 (pinned 메모리)
+  raft::pinned_matrix<Idx_t, size_t>
+      h_indices_old_; // 기존 그래프의 정방향 에지 정보 (pinned 메모리)
+  raft::pinned_matrix<Idx_t, size_t>
+      h_rev_indices_old_; // 기존 그래프의 역방향 에지 정보 (pinned 메모리)
+
+  // int2.x는 정방향 에지 개수, int2.y는 역방향 에지 개수
+  raft::device_vector<int2, size_t>
+      d_list_sizes_new_; // 새 그래프의 각 노드별 에지 개수 (디바이스)
+  raft::device_vector<int2, size_t>
+      d_list_sizes_old_; // 기존 그래프의 각 노드별 에지 개수 (디바이스)
 };
 } // namespace gpumap::nndescent
 
