@@ -1,11 +1,22 @@
+#pragma once
+
+#include <atomic>
 #include <cstddef>
+#include <cstdint>
+#include <driver_types.h>
 #include <raft/core/device_mdarray.hpp>
 #include <raft/core/host_mdarray.hpp>
 #include <raft/core/pinned_mdarray.hpp>
 #include <raft/core/resources.hpp>
+#include <sys/types.h>
+#include <utility>
+#include <vector>
 #include <vector_types.h>
 
 namespace gpumap::nndescent {
+
+constexpr int MAX_NEIGHBORS = 32;
+constexpr int NUM_SAMPLES = 32;
 
 /**
  * @brief CPU-side Bloom filter used to deduplicate candidate edges per list.
@@ -16,30 +27,29 @@ namespace gpumap::nndescent {
  * optimized for low-overhead membership checks and insertions, and may return
  * false positives but never false negatives.
  *
- * @tparam Idx_t Integral key type used for node ids.
+ * @tparam Index_t Integral key type used for node ids.
  */
-
-template <typename Idx_t = size_t> class BloomFilter {
+template <typename Index_t> class BloomFilter {
 public:
-  BloomFilter(size_t n_row, size_t num_sets_per_list, size_t num_hashes)
-      : nrow_(n_row), num_sets_per_list_(num_sets_per_list),
+  BloomFilter(size_t n_instances, size_t num_sets_per_list, size_t num_hashes)
+      : n_instances_(n_instances), num_sets_per_list_(num_sets_per_list),
         num_hashes_(num_hashes),
-        bitsets_(nrow_ * num_sets_per_list_ * num_bits_per_set_) {};
+        bitsets_(n_instances_ * num_sets_per_list_ * num_bits_per_set_) {};
 
-  void set_nrow(size_t nrow) { nrow_ = nrow; }
+  void set_nrow(size_t nrow) { n_instances_ = nrow; }
 
   void clear() {
     if (is_cleared_)
       return;
 #pragma omp parallel for
-    for (size_t i = 0; i < nrow_ * num_sets_per_list_ * num_bits_per_set_;
-         ++i) {
+    for (size_t i = 0;
+         i < n_instances_ * num_sets_per_list_ * num_bits_per_set_; ++i) {
       bitsets_[i] = 0;
     }
     is_cleared_ = true;
   }
 
-  bool check(size_t list_id, Idx_t key) const {
+  bool check(size_t list_id, Index_t key) const {
     bool is_present = true;
     uint32_t hash = hash0(static_cast<uint32_t>(key));
     size_t global_set_idx = list_id * num_sets_per_list_ +
@@ -59,7 +69,7 @@ public:
     return true;
   }
 
-  void add(size_t list_id, Idx_t key) {
+  void add(size_t list_id, Index_t key) {
     if (is_cleared_)
       is_cleared_ = false;
 
@@ -99,7 +109,7 @@ private:
   bool is_cleared_ = true;
 
   std::vector<bool> bitsets_;
-  size_t nrow_;
+  size_t n_instances_;
   size_t num_sets_per_list_;
   size_t num_hashes_;
 };
@@ -127,200 +137,164 @@ public:
   }
 };
 
-template <typename Data_t, typename Idx_t> struct NNDGraph {
+template <typename Data_t, typename Index_t = int> struct UpdateBuffers {
+  UpdateBuffers() = delete;
+  UpdateBuffers(const UpdateBuffers &) = delete;
+  UpdateBuffers &operator=(const UpdateBuffers &) = delete;
+
+  UpdateBuffers(raft::resources const &res, uint32_t n_instances,
+                uint32_t n_neighbors)
+
+      : bloom_filter{n_instances, 4, 4}, res(res), n_instances(n_instances),
+        n_neighbors(n_neighbors),
+
+        // Buffers used in device kernels
+        l2_norms_{raft::make_device_vector<Data_t, size_t>(res, n_instances)},
+        graph_buffer_{
+            raft::make_device_matrix<InternalID_t, size_t, raft::row_major>(
+                res, n_instances, MAX_NEIGHBORS)},
+        dists_buffer_{raft::make_device_matrix<Data_t, size_t, raft::row_major>(
+            res, n_instances, MAX_NEIGHBORS)},
+        graph_host_buffer_{
+            raft::make_pinned_matrix<InternalID_t, size_t, raft::row_major>(
+                res, n_instances, MAX_NEIGHBORS)},
+        dists_host_buffer_{
+            raft::make_pinned_matrix<Data_t, size_t, raft::row_major>(
+                res, n_instances, MAX_NEIGHBORS)},
+
+        d_locks_{raft::make_device_vector<int, size_t>(res, n_instances)},
+
+        h_rev_graph_new_{
+            raft::make_pinned_matrix<Index_t, size_t, raft::row_major>(
+                res, n_instances, NUM_SAMPLES)},
+        h_graph_old_{raft::make_pinned_matrix<Index_t, size_t, raft::row_major>(
+            res, n_instances, NUM_SAMPLES)},
+        h_rev_graph_old_{
+            raft::make_pinned_matrix<Index_t, size_t, raft::row_major>(
+                res, n_instances, NUM_SAMPLES)},
+
+        d_list_sizes_new_{
+            raft::make_device_vector<int2, size_t>(res, n_instances)},
+        d_list_sizes_old_{
+            raft::make_device_vector<int2, size_t>(res, n_instances)},
+
+        // Buffers used in host side
+        // (sample_graph/sample_graph_new/update_graph)
+        h_graph{raft::make_host_matrix<InternalID_t, size_t, raft::row_major>(
+            n_instances, n_neighbors)},
+        h_dists{raft::make_host_matrix<Data_t, size_t, raft::row_major>(
+            n_instances, n_neighbors)},
+        h_graph_new{raft::make_pinned_matrix<Index_t, size_t, raft::row_major>(
+            res, n_instances, NUM_SAMPLES)},
+        h_list_sizes_new{
+            raft::make_pinned_vector<int2, size_t>(res, n_instances)},
+        h_graph_old{raft::make_pinned_matrix<Index_t, size_t, raft::row_major>(
+            res, n_instances, NUM_SAMPLES)},
+        h_list_sizes_old{
+            raft::make_pinned_vector<int2, size_t>(res, n_instances)} {}
+
   raft::resources const &res;
-  InternalID_t *h_indices;
+  uint32_t n_instances;
+  uint32_t n_neighbors;
+  uint32_t n_internal_neighbors;
 
-  size_t n_row;
-  size_t n_neighbors;
-  size_t n_inserted_instances;
-  size_t n_internal_neighbors;
-  size_t num_samples; // number of samples of new/old neighbors to consider
-                      // during graph update
-  size_t seed;
+  // =========================================================================
+  // Buffers used in device kernels. These are allocated once and reused across
+  // iterations to avoid repeated allocation overhead.
+  // =========================================================================
+  raft::device_vector<Data_t, size_t> l2_norms_;
+  raft::device_matrix<InternalID_t, size_t, raft::row_major> graph_buffer_;
+  raft::device_matrix<Data_t, size_t, raft::row_major> dists_buffer_;
 
-  raft::host_matrix<Data_t, size_t, raft::row_major>
-      h_dists; // 호스트 측 거리 저장
+  raft::pinned_matrix<InternalID_t, size_t> graph_host_buffer_;
+  raft::pinned_matrix<Data_t, size_t> dists_host_buffer_;
 
-  raft::pinned_matrix<Idx_t, size_t>
-      h_indices_new; // 새로운 그래프 연결 정보 (pinned 메모리)
-  raft::pinned_vector<int2, size_t>
-      h_list_sizes_new; // 새 그래프의 forward/reverse edge 개수
+  raft::device_vector<int, size_t> d_locks_;
 
-  raft::pinned_matrix<Idx_t, size_t>
-      h_indices_old; // 기존 그래프 연결 정보 (pinned 메모리)
-  raft::pinned_vector<int2, size_t>
-      h_list_sizes_old;            // 기존 그래프의 forward/reverse edge 개수
-  BloomFilter<Idx_t> bloom_filter; // 중복 에지 제거용 Bloom 필터
+  raft::pinned_matrix<Index_t, size_t> h_rev_graph_new_;
+  raft::pinned_matrix<Index_t, size_t> h_graph_old_;
+  raft::pinned_matrix<Index_t, size_t> h_rev_graph_old_;
 
-  NNDGraph(const NNDGraph &) = delete;
-  NNDGraph &operator=(const NNDGraph &) = delete;
-  NNDGraph(raft::resources const &res, const size_t n_row,
-           const size_t n_neighbors, const size_t n_internal_neighbors,
-           const size_t n_inserted_instances, const size_t num_samples,
-           const size_t seed);
+  raft::device_vector<int2, size_t> d_list_sizes_new_;
+  raft::device_vector<int2, size_t> d_list_sizes_old_;
 
-  /**
-   * @brief Samples new neighbors from the candidate list and adds them to the
-   * new graph.
-   *
-   * Filters new neighbors using a bloom filter to avoid duplicates, marks them
-   * as old, and populates the new graph list up to num_samples entries.
-   *
-   * @param new_neighbors Array of new candidate neighbors with their IDs
-   * @param width Width of the new_neighbors array (number of candidates per
-   * row)
-   */
-  void sample_graph_new(InternalID_t *new_neighbors, const size_t width);
+  // =========================================================================
+  // Buffers used in host side. These are used for CPU-side processing and
+  // DMA transfers to/from device.
+  // =========================================================================
 
-  /**
-   * @brief Separates neighbors into old and new lists based on their update
-   * status.
-   *
-   * Iterates through internal neighbors and distributes them into old_graph and
-   * new_graph lists, respecting the num_samples capacity limit for each list.
-   *
-   * @param sample_new If true, also samples new neighbors; if false, only
-   * samples old neighbors
-   */
-  void sample_graph(bool sample_new);
+  raft::host_matrix<Index_t, size_t> h_graph;
+  raft::host_matrix<Data_t, size_t> h_dists;
+  raft::pinned_matrix<Index_t, size_t> h_graph_new;
+  raft::pinned_vector<int2, size_t> h_list_sizes_new;
 
-  /**
-   * @brief Updates the internal graph with new neighbors and their distances.
-   *
-   * Inserts new neighbors into the sorted neighbor list if their distances are
-   * better than the current worst distance, and increments the update counter
-   * when successful. Skips self-loops and neighbors that are worse than the
-   * current worst neighbor.
-   *
-   * @param new_neighbors Array of new neighbor IDs to consider for insertion
-   * @param new_dists Array of distances corresponding to new neighbors
-   * @param width Number of new neighbors per row
-   * @param update_counter Atomic counter tracking the number of successful
-   * updates
-   */
-  void update_graph(const InternalID_t *new_neighbors, const Data_t *new_dists,
-                    const size_t width, std::atomic<int64_t> &update_counter);
-  void clear();
-  ~NNDGraph();
+  raft::pinned_matrix<Index_t, size_t> h_graph_old;
+  raft::pinned_vector<int2, size_t> h_list_sizes_old;
+  BloomFilter<Index_t> bloom_filter;
 };
 
-template <typename Data_t, typename Idx_t> class NNDUpdate {
+template <typename Data_t, typename Idx_t, typename Index_t = int>
+class UpdateAlgo {
 public:
-  NNDUpdate(raft::resources const &res, std::vector<size_t> batch_indices,
-            Data_t *input_data, Idx_t *neighbor_indices,
-            Data_t *neighbor_distances, Idx_t data_block_size,
-            Idx_t neighbor_indices_block_size, Idx_t neighbor_dists_block_size,
-            BloomFilter<Idx_t> &bloom_filter, size_t n_features,
-            size_t n_neighbors, size_t n_internal_neighbors,
-            size_t n_inserted_instances, size_t num_samples,
-            float termination_threshold = 0.001, size_t max_iterations = 100,
-            size_t seed = 42);
+  UpdateAlgo() = delete;
+  UpdateAlgo(const UpdateAlgo &) = delete;
+  UpdateAlgo &operator=(const UpdateAlgo &) = delete;
 
-  NNDUpdate(const NNDUpdate &) = delete;
-  NNDUpdate &operator=(const NNDUpdate &) = delete;
+  UpdateAlgo(UpdateBuffers<Data_t, Index_t> &buffers,
+             std::vector<Idx_t> batch_indices,
 
-  void build();
-  ~NNDUpdate() = default;
+             Data_t *d_input_data, Idx_t *d_neighbor_indices,
+             Data_t *d_neighbor_distances, uint32_t data_block_size,
+             uint32_t neighbor_indices_block_size,
+             uint32_t neighbor_dists_block_size, uint32_t n_instances,
+             uint32_t n_features, uint32_t n_neighbors,
+             uint32_t n_inserted_instances, uint32_t max_iter = 30,
+             float termination_threshold = 0.001f)
+      : buffers_(buffers), update_counter_{0},
+        batch_indices_(std::move(batch_indices)),
 
-  void reset(raft::resources const &res);
+        d_input_data_(d_input_data), d_neighbor_indices_(d_neighbor_indices),
+        d_neighbor_distances_(d_neighbor_distances),
+        data_block_size_(data_block_size),
+        neighbor_indices_block_size_(neighbor_indices_block_size),
+        neighbor_dists_block_size_(neighbor_dists_block_size),
+
+        n_instances_(n_instances), n_features_(n_features),
+        n_neighbors_(n_neighbors), n_inserted_instances_(n_inserted_instances),
+        max_iter_(max_iter), termination_threshold_(termination_threshold) {}
+
+  void build(cudaStream_t const stream);
+  void local_join(cudaStream_t const stream);
+  void add_reverse_edges(Index_t *graph_ptr, Index_t *h_rev_graph_ptr,
+                         Index_t *d_rev_graph_ptr, int2 *list_sizes,
+                         cudaStream_t stream);
+
+  void sample_graph_new();
+  void sample_graph(bool sample_new);
+  void update_graph(const InternalID_t *new_neighbors, const Data_t *new_dists,
+                    size_t width);
 
 private:
-  void initialize();
-  void add_reverse_edges(Idx_t *graph_ptr, Idx_t *h_rev_graph_ptr,
-                         Idx_t *d_rev_graph_ptr, int2 *list_sizes,
-                         cudaStream_t stream = 0);
-
-  void local_join(cudaStream_t stream = 0);
-  void update_neighbor_info();
-
-  raft::resources const &res_;
-  NNDGraph<Data_t, Idx_t> graph_;
+  UpdateBuffers<Data_t, int> &buffers_;
   std::atomic<int64_t> update_counter_;
-  float termination_threshold_;
-  size_t max_iterations_ = 100;
+  // Row mapping for partial update mode: local row i -> global row
+  // batch_indices_[i].
+  std::vector<Idx_t> batch_indices_;
 
-  std::vector<size_t> batch_indices_;
-  Data_t *d_input_data_; // a.k.a. d_data_
+  Data_t *d_input_data_;
   Idx_t *d_neighbor_indices_;
   Data_t *d_neighbor_distances_;
-  Idx_t data_block_size_;
-  Idx_t neighbor_indices_block_size_;
-  Idx_t neighbor_dists_block_size_;
 
-  BloomFilter<Idx_t> &bloom_filter_;
+  uint32_t data_block_size_;
+  uint32_t neighbor_indices_block_size_;
+  uint32_t neighbor_dists_block_size_;
 
-  size_t n_row_;
-  size_t n_features_;
-  size_t n_neighbors_;
-  size_t n_internal_neighbors_;
-  size_t n_inserted_instances_;
-
-  size_t num_samples_;
-
-  size_t seed_;
-
-  raft::device_matrix<InternalID_t, size_t, raft::row_major>
-      indices_buffer_; // 디바이스에서 계산된 그래프 이웃 정보
-  raft::device_matrix<Data_t, size_t, raft::row_major>
-      dists_buffer_; // 디바이스에서 계산된 거리 정보
-
-  raft::pinned_matrix<InternalID_t, size_t>
-      indices_host_buffer_; // 호스트와 디바이스 간 빠른 전송을 위한 고정
-                            // 메모리의 그래프 버퍼
-  raft::pinned_matrix<Data_t, size_t>
-      dists_host_buffer_; // 호스트와 디바이스 간 빠른 전송을 위한 고정 메모리의
-                          // 거리 버퍼
-
-  raft::device_vector<int, size_t>
-      d_locks_; // 디바이스에서 동시성 제어용 락 벡터
-
-  raft::pinned_matrix<Idx_t, size_t>
-      h_rev_indices_new_; // 새 그래프의 역방향 에지 정보 (pinned 메모리)
-  raft::pinned_matrix<Idx_t, size_t>
-      h_indices_old_; // 기존 그래프의 정방향 에지 정보 (pinned 메모리)
-  raft::pinned_matrix<Idx_t, size_t>
-      h_rev_indices_old_; // 기존 그래프의 역방향 에지 정보 (pinned 메모리)
-
-  // int2.x는 정방향 에지 개수, int2.y는 역방향 에지 개수
-  raft::device_vector<int2, size_t>
-      d_list_sizes_new_; // 새 그래프의 각 노드별 에지 개수 (디바이스)
-  raft::device_vector<int2, size_t>
-      d_list_sizes_old_; // 기존 그래프의 각 노드별 에지 개수 (디바이스)
+  uint32_t n_instances_;
+  uint32_t n_features_;
+  uint32_t n_neighbors_;
+  uint32_t n_inserted_instances_;
+  uint32_t max_iter_;
+  float termination_threshold_;
 };
+
 } // namespace gpumap::nndescent
-
-//   void update_graph(const InternalID_t *new_neighbors, const Data_t
-//   *new_dists,
-//                     std::atomic<int64_t> &update_counter) {
-//     for (size_t i = 0; i < batch_indices_.size(); ++i) {
-//       size_t global_row_idx = batch_indices_[i] *
-//       neighbor_indices_block_size_;
-
-//       auto h_graph = h_graph.data_handle() + i * n_internal_neighbors_;
-//       auto dist_list = h_dists.data_handle() + i * n_internal_neighbors_;
-
-//       Data_t worst = dist_list[n_internal_neighbors_ - 1];
-
-//       for (size_t j = 0; j < NUM_SAMPLES; ++j) {
-//         InternalID_t new_id = new_neighbors[i * NUM_SAMPLES + j];
-//         Data_t new_dist = new_dists[i * NUM_SAMPLES + j];
-
-//         if (new_dist == std::numeric_limits<Data_t>::max())
-//           break;
-//         if (static_cast<size_t>(new_id.id()) ==
-//             batch_indices_[i]) // skip self-loops
-//           continue;
-
-//         if (new_dist >= worst)
-//           break;
-
-//         if (utils::insert_neighbor_sorted<Data_t, Idx_t>(
-//                 reinterpret_cast<Idx_t *>(h_graph), dist_list,
-//                 static_cast<int>(n_internal_neighbors_),
-//                 static_cast<Idx_t>(new_id.id()), new_dist)) {
-//           worst = dist_list[n_internal_neighbors_ - 1];
-//           update_counter++;
-//         }
-//       }
-//     }

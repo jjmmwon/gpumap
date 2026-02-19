@@ -1,10 +1,9 @@
 #pragma once
 
 #include "components.cuh"
-#include "utils.cuh"
 
+#include <__clang_cuda_builtin_vars.h>
 #include <__clang_cuda_runtime_wrapper.h>
-#include <atomic>
 #include <cstddef>
 #include <cuda_runtime.h>
 #include <driver_types.h>
@@ -14,318 +13,843 @@
 #include <raft/core/pinned_mdarray.hpp>
 #include <raft/core/resource/cuda_stream.hpp>
 #include <raft/core/resources.hpp>
+#include <raft/matrix/init.cuh>
 #include <raft/util/cudart_utils.hpp>
-#include <unordered_map>
 #include <vector>
 
 namespace gpumap::nndescent {
 
-template <typename Data_t, typename Idx_t>
-NNDGraph<Data_t, Idx_t>::NNDGraph(raft::resources const &res,
-                                  const size_t n_row, const size_t n_neighbors,
-                                  const size_t n_internal_neighbors,
-                                  const size_t n_inserted_instances,
-                                  const size_t num_samples, const size_t seed)
-    : n_row(n_row), n_neighbors(n_neighbors),
-      n_inserted_instances(n_inserted_instances),
-      n_internal_neighbors(n_internal_neighbors), num_samples(num_samples),
-      seed(seed), bloom_filter(n_row, 4, 4),
+constexpr int MAX_NUM_BI_SAMPLES = 64;
+constexpr int SKEWED_MAX_NUM_BI_SAMPLES = 68;
+constexpr int BLOCK_SIZE = 512;
 
-      h_dists{raft::make_host_matrix<Data_t, size_t, raft::row_major>(
-          n_row, n_internal_neighbors)},
-      h_indices_new{raft::make_pinned_matrix<Idx_t, size_t, raft::row_major>(
-          res, n_row, num_samples)},
-      h_list_sizes_new{raft::make_pinned_vector<int2, size_t>(res, n_row)},
-      h_indices_old{raft::make_pinned_matrix<Idx_t, size_t, raft::row_major>(
-          res, n_row, num_samples)},
-      h_list_sizes_old{raft::make_pinned_vector<int2, size_t>(res, n_row)} {
-  h_indices = nullptr;
-};
+template <typename Index_t> struct ResultItem;
 
-template <typename Data_t, typename Idx_t>
-void NNDGraph<Data_t, Idx_t>::sample_graph_new(InternalID_t *new_neighbors,
-                                               const size_t width) {
-  std::fill_n(h_indices_new.data_handle(), n_row * num_samples,
-              std::numeric_limits<Idx_t>::max());
-#pragma omp parallel for
-  for (size_t i = 0; i < n_row; ++i) {
-    h_list_sizes_new.data_handle()[i].x = 0;
-    h_list_sizes_new.data_handle()[i].y = 0;
+template <> class ResultItem<int> {
+private:
+  using Index_t = int;
+  using Dist_t = float;
+  Index_t id_;
+  Dist_t dist_;
 
-    auto list_new = h_indices_new.data_handle() + i * num_samples;
+public:
+  __host__ __device__ ResultItem()
+      : id_(std::numeric_limits<Index_t>::max()),
+        dist_(std::numeric_limits<Dist_t>::max()) {};
+  __host__ __device__ ResultItem(const Index_t id_with_flag, const Dist_t dist)
+      : id_(id_with_flag), dist_(dist) {};
+  __host__ __device__ bool is_new() const { return id_ >= 0; }
+  __host__ __device__ Index_t &id_with_flag() { return id_; }
+  __host__ __device__ Index_t id() const {
+    if (is_new())
+      return id_;
+    return -id_ - 1;
+  }
+  __host__ __device__ Dist_t &dist() { return dist_; }
 
-    for (size_t j = 0; j < width; ++j) {
-      auto new_neighbor_id = new_neighbors[i * width + j].id();
-      if ((size_t)new_neighbor_id >= n_inserted_instances)
-        break;
-      if (bloom_filter.check(i, (Idx_t)new_neighbor_id))
-        continue;
-      bloom_filter.add(i, (Idx_t)new_neighbor_id);
-      new_neighbors[i * width + j].mark_old();
-      list_new[h_list_sizes_new.data_handle()[i].x++] = new_neighbor_id;
-      if (h_list_sizes_new.data_handle()[i].x == num_samples)
-        break;
-    }
-  };
-};
+  __host__ __device__ void mark_old() {
+    if (id_ >= 0)
+      id_ = -id_ - 1;
+  }
 
-template <typename Data_t, typename Idx_t>
-void NNDGraph<Data_t, Idx_t>::sample_graph(bool sample_new) {
-  std::fill_n(h_indices_old.data_handle(), n_row * num_samples,
-              std::numeric_limits<Idx_t>::max());
-  if (sample_new) {
-    std::fill_n(h_indices_new.data_handle(), n_row * num_samples,
-                std::numeric_limits<Idx_t>::max());
-  };
-#pragma omp parallel for
-  for (size_t i = 0; i < n_row; i++) {
-    h_list_sizes_old.data_handle()[i].x = 0;
-    h_list_sizes_old.data_handle()[i].y = 0;
-    h_list_sizes_new.data_handle()[i].x = 0;
-    h_list_sizes_new.data_handle()[i].y = 0;
-
-    auto list = h_indices + i * n_internal_neighbors;
-    auto list_old = h_indices_old.data_handle() + i * num_samples;
-    auto list_new = h_indices_new.data_handle() + i * num_samples;
-    for (int j = 0; j < n_internal_neighbors; j++) {
-      auto neighbor = list[j];
-      if ((size_t)neighbor.id() >= n_inserted_instances)
-        continue;
-      if (!neighbor.is_new()) {
-        if (h_list_sizes_old.data_handle()[i].x < num_samples) {
-          list_old[h_list_sizes_old.data_handle()[i].x++] = neighbor.id();
-        }
-      } else if (sample_new) {
-        if (h_list_sizes_new.data_handle()[i].x < num_samples) {
-          list[j].mark_old();
-          list_new[h_list_sizes_new.data_handle()[i].x++] = neighbor.id();
-        }
-      }
-      if (h_list_sizes_old.data_handle()[i].x == num_samples &&
-          h_list_sizes_new.data_handle()[i].x == num_samples) {
-        break;
-      }
-    }
-    if (h_list_sizes_old.data_handle()[i].x == num_samples &&
-        h_list_sizes_new.data_handle()[i].x == num_samples) {
-      break;
-    }
+  __host__ __device__ bool operator<(const ResultItem<Index_t> &other) const {
+    if (dist_ == other.dist_)
+      return id() < other.id();
+    return dist_ < other.dist_;
+  }
+  __host__ __device__ bool operator==(const ResultItem<Index_t> &other) const {
+    return id() == other.id();
+  }
+  __host__ __device__ bool operator>=(const ResultItem<Index_t> &other) const {
+    return !(*this < other);
+  }
+  __host__ __device__ bool operator<=(const ResultItem<Index_t> &other) const {
+    return (*this == other) || (*this < other);
+  }
+  __host__ __device__ bool operator>(const ResultItem<Index_t> &other) const {
+    return !(*this <= other);
+  }
+  __host__ __device__ bool operator!=(const ResultItem<Index_t> &other) const {
+    return !(*this == other);
   }
 };
 
-template <typename Data_t, typename Idx_t>
-void NNDGraph<Data_t, Idx_t>::update_graph(
-    const InternalID_t *new_neighbors, const Data_t *new_dists,
-    const size_t width, std::atomic<int64_t> &update_counter) {
+template <typename Index_t>
+__global__ void add_rev_edges_kernel(const Index_t *graph, Index_t *rev_graph,
+                                     int num_samples, int2 *list_sizes) {
+  size_t list_id = blockIdx.x;
+  int2 list_size = list_sizes[list_id];
+
+  for (int idx = threadIdx.x; idx < list_size.x; idx += blockDim.x) {
+    Index_t rev_list_id =
+        graph[list_id * num_samples +
+              idx]; // index of idx-th neighbor of list_id in the original graph
+
+    if (rev_list_id ==
+        std::numeric_limits<Index_t>::max()) // skip invalid neighbors
+      continue;
+
+    int idx_in_rev_list = atomicAdd(&list_sizes[rev_list_id].y, 1);
+
+    // If the reverse list is already full, we skip adding this edge.
+    if (idx_in_rev_list >= num_samples) {
+      atomicExch(&list_sizes[rev_list_id].y, num_samples);
+    }
+    // Otherwise, we add the reverse edge to the reverse graph.
+    else {
+      // write the reverse edge (rev_list_id -> list_id) to the reverse graph
+      rev_graph[rev_list_id * num_samples + idx_in_rev_list] = list_id;
+    }
+  }
+}
+
+template <typename Data_t>
+__device__ __forceinline__ void
+load_vec(Data_t *vec_buffer, const Data_t *d_vec, const int load_dims,
+         const int padding_dims, const int lane_id) {
+  constexpr int num_load_elems_per_warp = raft::warp_size();
+  for (int step = 0;
+       step < raft::ceildiv(padding_dims, num_load_elems_per_warp); step++) {
+    int idx = step * num_load_elems_per_warp + lane_id;
+    if (idx < load_dims) {
+      vec_buffer[idx] = d_vec[idx];
+    } else if (idx < padding_dims) {
+      vec_buffer[idx] = 0.0f; // zero padding for out-of-bounds threads
+    }
+  }
+}
+
+// Extract a single bit at position pos from lane_id using PTX bfe.u32
+// instruction.
+__device__ __forceinline__ uint bfe(uint lane_id, uint pos) {
+  uint res;
+  asm("bfe.u32 %0,%1,%2,%3;" : "=r"(res) : "r"(lane_id), "r"(pos), "r"(1));
+  return res;
+}
+
+// Fetch the value from the lane at (lane_id XOR mask) via __shfl_xor_sync,
+// then return the larger value if dir == 1, or the smaller value if dir == 0.
+template <typename T>
+__device__ __forceinline__ T xor_swap(T x, int mask, int dir) {
+  T y = __shfl_xor_sync(raft::warp_full_mask(), x, mask, raft::warp_size());
+  return x < y == dir ? y : x;
+}
+
+// Sort 32 elements across a warp in ascending order using a bitonic sort
+// network. Each lane holds one element; after this call lane 0 holds the
+// minimum.
+template <typename T>
+__device__ __forceinline__ void warp_bitonic_sort(T *element_ptr,
+                                                  const int lane_id) {
+  static_assert(raft::warp_size() == 32);
+  auto &element = *element_ptr;
+  element = xor_swap(element, 0x01, bfe(lane_id, 1) ^ bfe(lane_id, 0));
+  element = xor_swap(element, 0x02, bfe(lane_id, 2) ^ bfe(lane_id, 1));
+  element = xor_swap(element, 0x01, bfe(lane_id, 2) ^ bfe(lane_id, 0));
+  element = xor_swap(element, 0x04, bfe(lane_id, 3) ^ bfe(lane_id, 2));
+  element = xor_swap(element, 0x02, bfe(lane_id, 3) ^ bfe(lane_id, 1));
+  element = xor_swap(element, 0x01, bfe(lane_id, 3) ^ bfe(lane_id, 0));
+  element = xor_swap(element, 0x08, bfe(lane_id, 4) ^ bfe(lane_id, 3));
+  element = xor_swap(element, 0x04, bfe(lane_id, 4) ^ bfe(lane_id, 2));
+  element = xor_swap(element, 0x02, bfe(lane_id, 4) ^ bfe(lane_id, 1));
+  element = xor_swap(element, 0x01, bfe(lane_id, 4) ^ bfe(lane_id, 0));
+  element = xor_swap(element, 0x10, bfe(lane_id, 4));
+  element = xor_swap(element, 0x08, bfe(lane_id, 3));
+  element = xor_swap(element, 0x04, bfe(lane_id, 2));
+  element = xor_swap(element, 0x02, bfe(lane_id, 1));
+  element = xor_swap(element, 0x01, bfe(lane_id, 0));
+}
+
+// Append elements from list_b that do not already exist in list_a.
+// Only the warp identified by execute_warp_id participates; each lane handles
+// one element. Steps:
+//   1. Sort list_a in ascending order via warp_bitonic_sort (prerequisite for
+//   binary search).
+//   2. Each lane binary-searches its list_b element in the sorted list_a.
+//   3. If not found, claim a slot with atomicAdd and write to list_a[size_a +
+//   idx].
+template <typename Index_t>
+__device__ __forceinline__ void
+remove_duplicates(Index_t *list_a, int size_a, Index_t *list_b, int size_b,
+                  int &unique_counter, int execute_warp_id) {
+  static_assert(raft::warp_size() == 32);
+  if (!(threadIdx.x >= execute_warp_id * raft::warp_size() &&
+        threadIdx.x <
+            execute_warp_id * raft::warp_size() + raft::warp_size())) {
+    return;
+  }
+  int lane_id = threadIdx.x % raft::warp_size();
+  Index_t elem = std::numeric_limits<Index_t>::max();
+  if (lane_id < size_a) {
+    elem = list_a[lane_id];
+  }
+  warp_bitonic_sort(&elem, lane_id);
+
+  if (elem != std::numeric_limits<Index_t>::max()) {
+    list_a[lane_id] = elem;
+  }
+
+  Index_t elem_b = std::numeric_limits<Index_t>::max();
+  if (lane_id < size_b) {
+    elem_b = list_b[lane_id];
+  }
+  __syncwarp();
+
+  int idx_l = 0;
+  int idx_r = size_a;
+  bool existed = false;
+  while (idx_l < idx_r) {
+    int idx = (idx_l + idx_r) / 2;
+    Index_t val_a = list_a[idx];
+    if (val_a == elem_b) {
+      existed = true;
+      break;
+    }
+    if (elem_b > val_a) {
+      idx_l = idx + 1;
+    } else {
+      idx_r = idx;
+    }
+  }
+  if (!existed && elem_b != std::numeric_limits<Index_t>::max()) {
+    int idx = atomicAdd(&unique_counter, 1);
+    list_a[size_a + idx] = elem_b;
+  }
+}
+
+template <typename Index_t>
+__device__ ResultItem<Index_t>
+get_min_item(const Index_t id, const int idx_in_list, const Index_t *neighbs,
+             const float *distances, const bool find_in_row = true) {
+  int lane_id = threadIdx.x % raft::warp_size();
+
+  static_assert(MAX_NUM_BI_SAMPLES == 64);
+
+  int idx[MAX_NUM_BI_SAMPLES / raft::warp_size()];
+  float dist[MAX_NUM_BI_SAMPLES / raft::warp_size()] = {
+      std::numeric_limits<float>::max(), std::numeric_limits<float>::max()};
+
+  idx[0] = lane_id;
+  idx[1] = raft::warp_size() + lane_id;
+
+  if (neighbs[idx[0]] != id) {
+    dist[0] =
+        find_in_row
+            ? distances[idx_in_list * SKEWED_MAX_NUM_BI_SAMPLES + lane_id]
+            : distances[idx_in_list + lane_id * SKEWED_MAX_NUM_BI_SAMPLES];
+  }
+
+  if (neighbs[idx[1]] != id) {
+    dist[1] = find_in_row
+                  ? distances[idx_in_list * SKEWED_MAX_NUM_BI_SAMPLES +
+                              raft::warp_size() + lane_id]
+                  : distances[idx_in_list + (raft::warp_size() + lane_id) *
+                                                SKEWED_MAX_NUM_BI_SAMPLES];
+  }
+
+  if (dist[1] < dist[0]) {
+    dist[0] = dist[1];
+    idx[0] = idx[1];
+  }
+
+  __syncwarp();
+
+  for (int offset = raft::warp_size() >> 1; offset >= 1; offset >>= 1) {
+    int other_idx = __shfl_down_sync(raft::warp_full_mask(), idx[0], offset);
+    float other_dist =
+        __shfl_down_sync(raft::warp_full_mask(), dist[0], offset);
+    if (other_dist < dist[0]) {
+      dist[0] = other_dist;
+      idx[0] = other_idx;
+    }
+  }
+
+  ResultItem<Index_t> result;
+
+  result.dist() = __shfl_sync(raft::warp_full_mask(), dist[0], 0);
+  result.id_with_flag() =
+      neighbs[__shfl_sync(raft::warp_full_mask(), idx[0], 0)];
+
+  return result;
+}
+
+template <typename Index_t, typename Dist_t, typename ID_t = InternalID_t>
+__device__ void insert_to_global_graph(ResultItem<Index_t> elem, size_t list_id,
+                                       ID_t *graph, Dist_t *dists,
+                                       int n_neighbors, int *locks) {
+  const int lane_id = threadIdx.x % raft::warp_size();
+  const size_t global_idx_base = list_id * static_cast<size_t>(n_neighbors);
+
+  if (elem.id() == static_cast<Index_t>(list_id)) {
+    return;
+  }
+
+  int lock_acquired = 0;
+  do {
+    if (lane_id == 0) {
+      lock_acquired = (atomicCAS(&locks[list_id], 0, 1) == 0);
+    }
+    lock_acquired = __shfl_sync(raft::warp_full_mask(), lock_acquired, 0);
+  } while (!lock_acquired);
+
+  int local_insert_pos = n_neighbors;
+  bool local_duplicate = false;
+
+  for (int local_idx = lane_id; local_idx < n_neighbors;
+       local_idx += raft::warp_size()) {
+    ResultItem<Index_t> graph_elem;
+    graph_elem.id_with_flag() =
+        graph[global_idx_base + local_idx].id_with_flag();
+    graph_elem.dist() = static_cast<float>(dists[global_idx_base + local_idx]);
+
+    if (elem == graph_elem) {
+      local_duplicate = true;
+    }
+    if (elem < graph_elem && local_insert_pos == n_neighbors) {
+      local_insert_pos = local_idx;
+    }
+  }
+
+  int insert_pos = local_insert_pos;
+  for (int offset = raft::warp_size() / 2; offset > 0; offset >>= 1) {
+    int other_pos =
+        __shfl_down_sync(raft::warp_full_mask(), insert_pos, offset);
+    insert_pos = min(insert_pos, other_pos);
+  }
+  insert_pos = __shfl_sync(raft::warp_full_mask(), insert_pos, 0);
+
+  bool duplicated = __any_sync(raft::warp_full_mask(), local_duplicate);
+  if (!duplicated && insert_pos < n_neighbors && lane_id == 0) {
+    for (int i = n_neighbors - 1; i > insert_pos; --i) {
+      graph[global_idx_base + i].id_with_flag() =
+          graph[global_idx_base + (i - 1)].id_with_flag();
+      dists[global_idx_base + i] = dists[global_idx_base + (i - 1)];
+    }
+    graph[global_idx_base + insert_pos].id_with_flag() = elem.id_with_flag();
+    dists[global_idx_base + insert_pos] = static_cast<Dist_t>(elem.dist());
+  }
+
+  __threadfence();
+  if (lane_id == 0) {
+    atomicExch(&locks[list_id], 0);
+  }
+}
+
+template <typename Data_t, typename Index_t>
+__global__ void
+local_join_kernel(const Index_t *graph_new, Index_t *rev_graph_new,
+                  const int2 *sizes_new, const Index_t *graph_old,
+                  const Index_t *rev_graph_old, const int2 *sizes_old,
+                  const int width, const Data_t *data, const int n_features,
+                  const int data_block_size, InternalID_t *graph, Data_t *dists,
+                  int graph_width, int *locks) {
+
+  __shared__ int s_list[MAX_NUM_BI_SAMPLES * 2];
+
+  constexpr int APAD = 4;
+  constexpr int BPAD = 4;
+  constexpr int TILE_COL_WIDTH = 32;
+
+  // Shared memory for the neighbor lists and distances of the current
+  // tile Add padding to avoid shared memory bank conflicts
+  __shared__ float s_nv[MAX_NUM_BI_SAMPLES][TILE_COL_WIDTH + APAD];
+  __shared__ float s_ov[MAX_NUM_BI_SAMPLES][TILE_COL_WIDTH + BPAD];
+  __shared__ float s_distances[MAX_NUM_BI_SAMPLES * SKEWED_MAX_NUM_BI_SAMPLES];
+
+  int *s_unique_counter =
+      (int *)&s_ov[0][0]; // Reuse shared memory for the unique counter
+
+  if (threadIdx.x == 0) {
+    s_unique_counter[0] = 0; // Initialize unique counter
+    s_unique_counter[1] = 0; // Initialize unique counter for reverse neighbors
+  }
+
+  Index_t *new_neighbors = s_list;
+  Index_t *old_neighbors = s_list + MAX_NUM_BI_SAMPLES;
+
+  size_t list_id = blockIdx.x;
+  int2 list_new_size2 = sizes_new[list_id];
+  int list_new_size = list_new_size2.x + list_new_size2.y;
+  int2 list_old_size2 = sizes_old[list_id];
+  int list_old_size = list_old_size2.x + list_old_size2.y;
+
+  if (!list_new_size)
+    return;
+
+  int tx = threadIdx.x;
+
+  if (tx < list_new_size2.x) {
+    new_neighbors[tx] = graph_new[list_id * width + tx];
+  } else if (tx < list_new_size) {
+    new_neighbors[tx] =
+        rev_graph_new[list_id * width + (tx - list_new_size2.x)];
+  }
+
+  if (tx < list_old_size2.x) {
+    old_neighbors[tx] = graph_old[list_id * width + tx];
+  } else if (tx < list_old_size) {
+    old_neighbors[tx] =
+        rev_graph_old[list_id * width + (tx - list_old_size2.x)];
+  }
+
+  __syncthreads();
+
+  // Remove duplicates between new and old neighbors
+  remove_duplicates(new_neighbors, list_new_size2.x,
+                    new_neighbors + list_new_size2.x, list_new_size2.y,
+                    s_unique_counter[0], 0);
+
+  remove_duplicates(old_neighbors, list_old_size2.x,
+                    old_neighbors + list_old_size2.x, list_old_size2.y,
+                    s_unique_counter[1], 1);
+
+  __syncthreads();
+
+  list_new_size = list_new_size2.x + s_unique_counter[0];
+  list_old_size = list_old_size2.x + s_unique_counter[1];
+
+  int warp_id = threadIdx.x / raft::warp_size();
+  int lane_id = threadIdx.x % raft::warp_size();
+  constexpr int num_warps = BLOCK_SIZE / raft::warp_size();
+
+  const int n_steps = raft::ceildiv(n_features, TILE_COL_WIDTH);
+  int tid = threadIdx.x;
+
+  // Phase 1: new x new
+
+  // Initialize distances to zero
+  for (int i = tid; i < MAX_NUM_BI_SAMPLES * SKEWED_MAX_NUM_BI_SAMPLES;
+       i += blockDim.x) {
+    s_distances[i] = 0.0f;
+  }
+
+  __syncthreads();
+
+  // Compute distances between new neighbors
+  for (int step = 0; step < n_steps; ++step) {
+    const int base = step * TILE_COL_WIDTH;
+    const int num_load_elems =
+        (step == n_steps - 1) ? (n_features - base) : TILE_COL_WIDTH;
+
+#pragma unroll
+    for (int i = 0; i < MAX_NUM_BI_SAMPLES; i++) {
+      int idx = i * num_warps + warp_id;
+      if (idx < list_new_size) {
+        size_t nid = (size_t)new_neighbors[idx];
+        size_t offset = nid * (size_t)data_block_size + (size_t)base;
+
+        load_vec(s_nv[idx], data + offset, num_load_elems, TILE_COL_WIDTH,
+                 lane_id);
+      }
+    }
+    __syncthreads();
+    for (int i = threadIdx.x;
+         i < MAX_NUM_BI_SAMPLES * SKEWED_MAX_NUM_BI_SAMPLES; i += blockDim.x) {
+      int r = i / SKEWED_MAX_NUM_BI_SAMPLES;
+      int c = i % SKEWED_MAX_NUM_BI_SAMPLES;
+
+      if (r < list_new_size && c < list_new_size) {
+        float acc = 0.0f;
+#pragma unroll
+        for (int d = 0; d < TILE_COL_WIDTH; ++d) {
+          if (d < num_load_elems)
+            acc += s_nv[r][d] * s_nv[c][d];
+        }
+        s_distances[i] += acc;
+      }
+    }
+    __syncthreads();
+  }
+
+  for (int i = 0; threadIdx.x < MAX_NUM_BI_SAMPLES * SKEWED_MAX_NUM_BI_SAMPLES;
+       i += blockDim.x) {
+    int r = i / SKEWED_MAX_NUM_BI_SAMPLES;
+    int c = i % SKEWED_MAX_NUM_BI_SAMPLES;
+
+    if (r < list_new_size && c < list_new_size) {
+      Index_t a = new_neighbors[r];
+      Index_t b = new_neighbors[c];
+
+      float dot = s_distances[i];
+      float dist2 = data[a * (size_t)data_block_size + n_features] +
+                    data[b * (size_t)data_block_size + n_features] - 2.0f * dot;
+      s_distances[i] = dist2;
+    }
+  }
+  __syncthreads();
+
+  // insert new x new
+  for (int step = 0; step < raft::ceildiv(list_new_size, num_warps); step++) {
+    int idx_in_list = step * num_warps + tx / raft::warp_size();
+
+    if (idx_in_list >= list_new_size)
+      continue;
+
+    auto min_elem = get_min_item(s_list[idx_in_list], idx_in_list,
+                                 new_neighbors, s_distances);
+    if (min_elem.id() < gridDim.x) {
+      insert_to_global_graph(min_elem, s_list[idx_in_list], graph, dists,
+                             graph_width, locks);
+    }
+  }
+
+  if (!list_old_size)
+    return;
+
+  __syncthreads();
+
+  for (int i = threadIdx.x; i < MAX_NUM_BI_SAMPLES * SKEWED_MAX_NUM_BI_SAMPLES;
+       i += blockDim.x) {
+    s_distances[i] = 0.0f;
+  }
+  __syncthreads();
+
+  for (int step = 0; step < n_steps; step++) {
+    const int base = step * TILE_COL_WIDTH;
+    const int num_load_elems =
+        (step == n_steps - 1) ? (n_features - base) : TILE_COL_WIDTH;
+
+#pragma unroll
+    for (int i = 0; i < MAX_NUM_BI_SAMPLES / num_warps; i++) {
+      int idx = i * num_warps + warp_id;
+      if (idx < list_new_size) {
+        size_t nid = (size_t)new_neighbors[idx];
+        size_t offset = nid * (size_t)data_block_size + (size_t)base;
+        load_vec(s_nv[idx], data + offset, num_load_elems, TILE_COL_WIDTH,
+                 lane_id);
+      }
+    }
+
+#pragma unroll
+    for (int i = 0; i < MAX_NUM_BI_SAMPLES / num_warps; i++) {
+      int idx = i * num_warps + warp_id;
+      if (idx < list_old_size) {
+        size_t nid = (size_t)old_neighbors[idx];
+        size_t offset = nid * (size_t)data_block_size + (size_t)base;
+        load_vec(s_ov[idx], data + offset, num_load_elems, TILE_COL_WIDTH,
+                 lane_id);
+      }
+    }
+
+    __syncthreads();
+
+    for (int i = threadIdx.x;
+         i < MAX_NUM_BI_SAMPLES * SKEWED_MAX_NUM_BI_SAMPLES; i += blockDim.x) {
+      int r = i / SKEWED_MAX_NUM_BI_SAMPLES;
+      int c = i % SKEWED_MAX_NUM_BI_SAMPLES;
+      if (r < list_new_size && c < list_old_size) {
+        float acc = 0.0f;
+#pragma unroll
+        for (int d = 0; d < TILE_COL_WIDTH; ++d) {
+          if (d < num_load_elems)
+            acc += s_nv[r][d] * s_ov[c][d];
+        }
+        s_distances[i] += acc; // dot
+      }
+    }
+    __syncthreads();
+  }
+
+  // dot -> dist2
+  for (int i = threadIdx.x; i < MAX_NUM_BI_SAMPLES * SKEWED_MAX_NUM_BI_SAMPLES;
+       i += blockDim.x) {
+    int r = i / SKEWED_MAX_NUM_BI_SAMPLES;
+    int c = i % SKEWED_MAX_NUM_BI_SAMPLES;
+
+    if (r < list_new_size && c < list_old_size) {
+      Index_t a = new_neighbors[r];
+      Index_t b = old_neighbors[c];
+
+      float dot = s_distances[i];
+      float dist2 = data[a * (size_t)data_block_size + n_features] +
+                    data[b * (size_t)data_block_size + n_features] - 2.0f * dot;
+      s_distances[i] = dist2;
+    }
+  }
+  __syncthreads();
+
+  // insert new x old
+  for (int step = 0; step < raft::ceildiv(MAX_NUM_BI_SAMPLES * 2, num_warps);
+       step++) {
+    int idx_in_list = step * num_warps + tx / raft::warp_size();
+    if (idx_in_list >= list_new_size && idx_in_list < MAX_NUM_BI_SAMPLES)
+      continue;
+    if (idx_in_list >= MAX_NUM_BI_SAMPLES + list_old_size &&
+        idx_in_list < MAX_NUM_BI_SAMPLES * 2)
+      continue;
+
+    ResultItem<Index_t> min_elem{std::numeric_limits<Index_t>::max(),
+                                 std::numeric_limits<float>::max()};
+    if (idx_in_list < MAX_NUM_BI_SAMPLES) {
+      auto temp_min_item = get_min_item(s_list[idx_in_list], idx_in_list,
+                                        old_neighbors, s_distances, true);
+      if (temp_min_item.dist() < min_elem.dist()) {
+        min_elem = temp_min_item;
+      }
+    } else {
+      auto temp_min_item = get_min_item(
+          s_list[idx_in_list - MAX_NUM_BI_SAMPLES],
+          idx_in_list - MAX_NUM_BI_SAMPLES, new_neighbors, s_distances, false);
+      if (temp_min_item.dist() < min_elem.dist()) {
+        min_elem = temp_min_item;
+      }
+    }
+
+    if (min_elem.id() < gridDim.x) {
+      insert_to_global_graph(min_elem, s_list[idx_in_list % MAX_NUM_BI_SAMPLES],
+                             graph, dists, graph_width, locks);
+    }
+  }
+}
+
+template <typename Data_t, typename Idx_t, typename Index_t>
+void UpdateAlgo<Data_t, Idx_t, Index_t>::sample_graph(bool sample_new) {
+  const size_t n_rows = batch_indices_.size();
+
+  std::fill_n(buffers_.h_graph_old.data_handle(), n_instances_ * NUM_SAMPLES,
+              std::numeric_limits<Idx_t>::max());
+  if (sample_new) {
+    std::fill_n(buffers_.h_graph_new.data_handle(), n_instances_ * NUM_SAMPLES,
+                std::numeric_limits<Idx_t>::max());
+  }
 
 #pragma omp parallel for
-  for (size_t i = 0; i < n_row; ++i) {
-    for (size_t j = 0; j < width; ++j) {
-      auto new_id = new_neighbors[i * width + j];
-      auto new_dist = new_dists[i * width + j];
+  for (size_t i = 0; i < n_rows; ++i) {
+    const size_t row = static_cast<size_t>(batch_indices_[i]);
 
-      if (new_dist == std::numeric_limits<Data_t>::max())
-        break;
-      if (static_cast<size_t>(new_id.id()) == i) // skip self-loops
+    buffers_.h_list_sizes_old.data_handle()[row].x = 0;
+    buffers_.h_list_sizes_old.data_handle()[row].y = 0;
+    buffers_.h_list_sizes_new.data_handle()[row].x = 0;
+    buffers_.h_list_sizes_new.data_handle()[row].y = 0;
+
+    auto list = buffers_.graph_host_buffer.data_handle() + row * MAX_NEIGHBORS;
+    auto list_old = buffers_.h_graph_old.data_handle() + row * NUM_SAMPLES;
+    auto list_new = buffers_.h_graph_new.data_handle() + row * NUM_SAMPLES;
+
+    for (size_t j = 0; j < MAX_NEIGHBORS; ++j) {
+      auto neighbor = list[j];
+      if (static_cast<size_t>(neighbor.id()) >= n_inserted_instances_)
         continue;
 
-      auto list = h_indices + i * n_internal_neighbors;
-      auto dist_list = h_dists.data_handle() + i * n_internal_neighbors;
+      if (!neighbor.is_new()) {
+        if (buffers_.h_list_sizes_old.data_handle()[row].x < NUM_SAMPLES) {
+          list_old[buffers_.h_list_sizes_old.data_handle()[row].x++] =
+              static_cast<Index_t>(neighbor.id());
+        }
+      } else if (sample_new) {
+        if (buffers_.h_list_sizes_new.data_handle()[row].x < NUM_SAMPLES) {
+          list[j].mark_old();
+          list_new[buffers_.h_list_sizes_new.data_handle()[row].x++] =
+              static_cast<Index_t>(neighbor.id());
+        }
+      }
 
-      Data_t worst = dist_list[n_internal_neighbors - 1];
-
-      if (new_dist >= worst)
+      if (buffers_.h_list_sizes_old.data_handle()[row].x == NUM_SAMPLES &&
+          buffers_.h_list_sizes_new.data_handle()[row].x == NUM_SAMPLES) {
         break;
-
-      if (utils::insert_neighbor_sorted<Data_t, InternalID_t *>(
-              list, dist_list, n_internal_neighbors, new_id, new_dist)) {
-        worst = dist_list[n_internal_neighbors - 1];
-        update_counter++;
       }
     }
   }
 }
 
-template <typename Data_t, typename Idx_t>
-void NNDUpdate<Data_t, Idx_t>::update_neighbor_info() {
-  cudaStream_t stream = raft::resource::get_cuda_stream(res_);
+template <typename Data_t, typename Idx_t, typename Index_t>
+void UpdateAlgo<Data_t, Idx_t, Index_t>::sample_graph_new() {
+  InternalID_t *new_neighbors = buffers_.graph_host_buffer_.data_handle();
 
-  // InternalID_t -> Idx_t 변환을 위한 임시 호스트 버퍼
-  std::vector<Idx_t> h_tmp_indices(n_internal_neighbors_);
+  const size_t n_rows = batch_indices_.size();
 
-  for (size_t i = 0; i < n_row_; ++i) {
-    size_t global_row_idx_indices =
-        batch_indices_[i] * neighbor_indices_block_size_;
-    size_t global_row_idx_dist = batch_indices_[i] * neighbor_dists_block_size_;
-
-    // InternalID_t -> Idx_t 변환
-    for (size_t j = 0; j < n_internal_neighbors_; ++j) {
-      h_tmp_indices[j] = static_cast<Idx_t>(
-          graph_.h_indices.data_handle()[i * num_samples_ + j].id());
-    }
-
-    // 변환된 Idx_t 값을 디바이스의 d_neighbor_indices_에 복사
-    raft::copy(d_neighbor_indices_ + global_row_idx_indices,
-               h_tmp_indices.data(), n_internal_neighbors_, stream);
-
-    // 거리 정보를 디바이스의 d_neighbor_distances_에 복사
-    raft::copy(d_neighbor_distances_ + global_row_idx_dist,
-               graph_.h_dists.data_handle() + i * num_samples_,
-               n_internal_neighbors_, stream);
-  }
-
-  raft::resource::sync_stream(res_, stream);
-};
-
-template <typename Data_t, typename Idx_t>
-NNDUpdate<Data_t, Idx_t>::NNDUpdate(
-    raft::resources const &res, std::vector<size_t> batch_indices,
-    Data_t *input_data, Idx_t *neighbor_indices, Data_t *neighbor_distances,
-    Idx_t data_block_size, Idx_t neighbor_indices_block_size,
-    Idx_t neighbor_dists_block_size, BloomFilter<Idx_t> &bloom_filter,
-    size_t n_features, size_t n_neighbors, size_t n_internal_neighbors,
-    size_t n_inserted_instances, size_t num_samples,
-    float termination_threshold, size_t max_iterations, size_t seed)
-    : batch_indices_(batch_indices), d_input_data_(input_data),
-      d_neighbor_indices_(neighbor_indices),
-      d_neighbor_distances_(neighbor_distances),
-      data_block_size_(data_block_size),
-      neighbor_indices_block_size_(neighbor_indices_block_size),
-      neighbor_dists_block_size_(neighbor_dists_block_size),
-      bloom_filter_(bloom_filter), n_row_(batch_indices.size()),
-      n_features_(n_features), n_neighbors_(n_neighbors),
-      n_internal_neighbors_(n_internal_neighbors),
-      n_inserted_instances_(n_inserted_instances), num_samples_(num_samples),
-      termination_threshold_(termination_threshold),
-      max_iterations_(max_iterations), seed_(seed), res_(res),
-      graph_(res, n_row_, n_neighbors_, n_internal_neighbors_,
-             n_inserted_instances_, num_samples_, seed_),
-      update_counter_{0},
-
-      indices_buffer_{
-          raft::make_device_matrix<InternalID_t, size_t, raft::row_major>(
-              res, n_row_, num_samples_)},
-      dists_buffer_{raft::make_device_matrix<Data_t, size_t, raft::row_major>(
-          res, n_row_, num_samples_)},
-      indices_host_buffer_{
-          raft::make_pinned_matrix<InternalID_t, size_t, raft::row_major>(
-              res, n_row_, num_samples_)},
-      dists_host_buffer_{
-          raft::make_pinned_matrix<Data_t, size_t, raft::row_major>(
-              res, n_row_, num_samples_)},
-      d_locks_{raft::make_device_vector<int>(res, n_row_)},
-      h_rev_indices_new_{
-          raft::make_pinned_matrix<Idx_t, size_t, raft::row_major>(
-              res, n_row_, num_samples_)},
-      h_indices_old_{raft::make_pinned_matrix<Idx_t, size_t, raft::row_major>(
-          res, n_row_, num_samples_)},
-      h_rev_indices_old_{
-          raft::make_pinned_matrix<Idx_t, size_t, raft::row_major>(
-              res, n_row_, num_samples_)},
-      d_list_sizes_new_{raft::make_device_vector<int2, size_t>(res, n_row_)},
-      d_list_sizes_old_{raft::make_device_vector<int2, size_t>(res, n_row_)} {}
-
-template <typename Data_t, typename Idx_t>
-void NNDUpdate<Data_t, Idx_t>::initialize() {
-  cudaStream_t stream = raft::resource::get_cuda_stream(res_);
-
-  // Idx_t -> InternalID_t 변환을 위한 임시 호스트 버퍼
-  std::vector<Idx_t> h_tmp_indices(neighbor_indices_block_size_);
+  std::fill_n(buffers_.h_graph_new.data_handle(), n_instances_ * NUM_SAMPLES,
+              std::numeric_limits<Index_t>::max());
 
 #pragma omp parallel for
-  for (size_t i = 0; i < n_row_; ++i) {
-    size_t global_row_idx_indices =
-        batch_indices_[i] * neighbor_indices_block_size_;
-    size_t global_row_idx_dist = batch_indices_[i] * neighbor_dists_block_size_;
+  for (size_t i = 0; i < n_rows; ++i) {
+    const size_t row = static_cast<size_t>(batch_indices_[i]);
 
-    // d_neighbor_indices_ (Idx_t, device) -> 호스트 임시 버퍼로 복사
-    raft::copy(h_tmp_indices.data(),
-               d_neighbor_indices_ + global_row_idx_indices,
-               n_internal_neighbors_, stream);
-    raft::resource::sync_stream(res_, stream);
+    buffers_.h_list_sizes_new.data_handle()[row].x = 0;
+    buffers_.h_list_sizes_new.data_handle()[row].y = 0;
+    auto list_new = buffers_.h_graph_new.data_handle() + row * NUM_SAMPLES;
 
-    // Idx_t -> InternalID_t 변환 후 호스트 버퍼에 저장
-    for (size_t j = 0; j < static_cast<size_t>(n_internal_neighbors_); ++j) {
-      indices_host_buffer_.data_handle()[i * num_samples_ + j] =
-          InternalID_t(static_cast<int>(h_tmp_indices[j]));
+    for (size_t j = 0; j < MAX_NEIGHBORS; ++j) {
+      const auto new_neighbor_id = new_neighbors[i * MAX_NEIGHBORS + j].id();
+      if (static_cast<size_t>(new_neighbor_id) >= n_inserted_instances_)
+        break;
+      if (buffers_.bloom_filter.check(row,
+                                      static_cast<Index_t>(new_neighbor_id)))
+        continue;
+
+      buffers_.bloom_filter.add(row, static_cast<Index_t>(new_neighbor_id));
+      new_neighbors[i * MAX_NEIGHBORS + j].mark_old();
+      list_new[buffers_.h_list_sizes_new.data_handle()[row].x++] =
+          static_cast<Index_t>(new_neighbor_id);
+
+      if (buffers_.h_list_sizes_new.data_handle()[row].x ==
+          static_cast<int>(NUM_SAMPLES)) {
+        break;
+      }
     }
+  }
+}
 
-    // 호스트 -> 디바이스 복사 (InternalID_t -> InternalID_t, 타입 일치)
-    raft::copy(indices_buffer_.data_handle() + i * num_samples_,
-               indices_host_buffer_.data_handle() + i * num_samples_,
-               n_internal_neighbors_, stream);
+template <typename Data_t, typename Idx_t, typename Index_t>
+void UpdateAlgo<Data_t, Idx_t, Index_t>::update_graph(
+    const InternalID_t *new_neighbors, const Data_t *new_dists, size_t width) {
+  const size_t n_rows = batch_indices_.size();
+  InternalID_t *graph = buffers_.graph_host_buffer_.data_handle();
+  Data_t *dists = buffers_.dists_host_buffer_.data_handle();
 
-    // 거리 버퍼는 타입 일치 (Data_t -> Data_t)
-    raft::copy(dists_buffer_.data_handle() + i * num_samples_,
-               d_neighbor_distances_ + global_row_idx_dist,
-               n_internal_neighbors_, stream);
-    raft::copy(dists_host_buffer_.data_handle() + i * num_samples_,
-               d_neighbor_distances_ + global_row_idx_dist,
-               n_internal_neighbors_, stream);
-  };
-};
+#pragma omp parallel for schedule(dynamic, 32)
+  for (size_t i = 0; i < n_rows; ++i) {
+    const size_t row = static_cast<size_t>(batch_indices_[i]);
 
-template <typename Data_t, typename Idx_t>
-void NNDUpdate<Data_t, Idx_t>::build() {
-  cudaStream_t stream = raft::resource::get_cuda_stream(res_);
+    InternalID_t *row_graph = graph + row * MAX_NEIGHBORS;
+    Data_t *row_dists = dists + row * MAX_NEIGHBORS;
+
+    for (size_t j = 0; j < width; ++j) {
+      const int cand_id = new_neighbors[i * width + j].id();
+
+      // Skip invalid or out-of-range candidates.
+      if (static_cast<size_t>(cand_id) >= n_inserted_instances_)
+        continue;
+
+      const Data_t cand_dist = new_dists[i * width + j];
+
+      // Prune early: candidate must beat the current worst neighbor.
+      if (cand_dist >= row_dists[n_neighbors_ - 1])
+        continue;
+
+      // Check for duplicates by scanning the current k-NN list.
+      bool duplicate = false;
+      for (size_t k = 0; k < n_neighbors_; ++k) {
+        if (row_graph[k].id() == cand_id) {
+          duplicate = true;
+          break;
+        }
+      }
+      if (duplicate)
+        continue;
+
+      // Shift-insert to keep the list sorted in ascending distance order.
+      // The last entry (worst neighbor) is evicted.
+      int pos = static_cast<int>(n_neighbors_) - 1;
+      while (pos > 0 && cand_dist < row_dists[pos - 1]) {
+        row_graph[pos] = row_graph[pos - 1];
+        row_dists[pos] = row_dists[pos - 1];
+        --pos;
+      }
+
+      // Mark the inserted neighbor as "new" (positive id_with_flag) so it
+      // is included in the next iteration's local join.
+      row_graph[pos].id_with_flag() = cand_id;
+      row_dists[pos] = cand_dist;
+    }
+  }
+}
+
+template <typename Data_t, typename Idx_t, typename Index_t>
+void UpdateAlgo<Data_t, Idx_t, Index_t>::local_join(cudaStream_t const stream) {
+  local_join_kernel<<<n_instances_, BLOCK_SIZE, 0, stream>>>(
+      buffers_.h_graph_new.data_handle(),
+      buffers_.h_rev_graph_new_.data_handle(),
+      buffers_.d_list_sizes_new_.data_handle(),
+      buffers_.h_graph_old.data_handle(),
+      buffers_.h_rev_graph_old_.data_handle(),
+      buffers_.d_list_sizes_old_.data_handle(), NUM_SAMPLES, d_input_data_,
+      n_features_, buffers_.data_block_size_,
+      buffers_.graph_buffer_.data_handle(),
+      buffers_.dists_buffer_.data_handle(), n_neighbors_,
+      buffers_.d_locks_.data_handle());
+}
+
+template <typename Data_t, typename Idx_t, typename Index_t>
+void UpdateAlgo<Data_t, Idx_t, Index_t>::add_reverse_edges(
+    Index_t *graph_ptr, Index_t *h_rev_graph_ptr, Index_t *d_rev_graph_ptr,
+    int2 *list_sizes, cudaStream_t const stream) {
+  raft::resources res_;
+  raft::resource::set_cuda_stream(res_, stream);
+
+  raft::matrix::fill(res_,
+                     raft::make_device_matrix_view(d_rev_graph_ptr,
+                                                   n_instances_, MAX_NEIGHBORS),
+                     std::numeric_limits<Index_t>::max());
+
+  add_rev_edges_kernel<<<n_instances_, 256, 0, stream>>>(
+      graph_ptr, d_rev_graph_ptr, NUM_SAMPLES, list_sizes);
+
+  raft::copy(h_rev_graph_ptr, d_rev_graph_ptr, n_instances_ * NUM_SAMPLES,
+             stream);
+}
+
+template <typename Data_t, typename Idx_t, typename Index_t>
+void UpdateAlgo<Data_t, Idx_t, Index_t>::build(cudaStream_t stream) {
+  const raft::resources res_;
+  raft::resource::set_cuda_stream(res_, stream);
+
   update_counter_ = 0;
-  graph_.h_indices = indices_host_buffer_;
 
-  graph_.sample_graph(true);
+  sample_graph(true);
 
-  auto update_and_sample = [&](bool update_graph) {
-    if (update_graph) {
+  auto update_and_sample = [&](bool update_graph_flag) {
+    if (update_graph_flag) {
       update_counter_ = 0;
-      graph_.update_graph(indices_host_buffer_.data_handle(),
-                          dists_host_buffer_.data_handle(), num_samples_,
-                          update_counter_);
+      update_graph();
+
+      if (update_counter_ <
+          termination_threshold_ * n_inserted_instances_ * NUM_SAMPLES) {
+        update_counter_ = -1;
+      }
     }
-    graph_.sample_graph(false);
-    if (update_counter_ <
-        static_cast<int64_t>(termination_threshold_ * n_row_ * num_samples_)) {
-      update_counter_ = -1; // signal for termination
-    }
-    graph_.sample_graph(false);
+    sample_graph(false);
   };
 
-  for (size_t it = 0; it < max_iterations_; ++it) {
-    raft::copy(d_list_sizes_new_.data_handle(),
-               graph_.h_list_sizes_new.data_handle(), n_row_, stream);
+  for (size_t iter = 0; iter < max_iter_; ++iter) {
+    raft::copy(buffers_.d_list_sizes_new_.data_handle(),
+               buffers_.h_list_sizes_new.data_handle(), n_inserted_instances_,
+               stream);
+    raft::copy(buffers_.h_graph_old_.data_handle(),
+               buffers_.h_graph_old.data_handle(),
+               n_inserted_instances_ * NUM_SAMPLES, stream);
+    raft::copy(buffers_.d_list_sizes_old_.data_handle(),
+               buffers_.h_list_sizes_old.data_handle(), n_inserted_instances_,
+               stream);
 
-    raft::copy(h_indices_old_.data_handle(), graph_.h_indices_old.data_handle(),
-               n_row_ * num_samples_, stream);
-    raft::copy(d_list_sizes_old_.data_handle(),
-               graph_.h_list_sizes_old.data_handle(), n_row_, stream);
-    raft::resource::sync_stream(res_, stream);
+    raft::resource::sync_stream(res_);
 
-    std::thread update_and_sample_thread(update_and_sample, it);
+    std::thread update_and_sample_thread(update_and_sample, iter);
 
-    // add_reverse_edge()
-    // add_reverse_edge()
-    // local_join()
+    RAFT_LOG_DEBUG("# GNND iteraton: %lu / %lu", iter + 1, max_iter_);
+
+    add_reverse_edges(buffers_.h_graph_new.data_handle(),
+                      buffers_.h_rev_graph_new_.data_handle(),
+                      (Index_t *)buffers_.dists_buffer_.data_handle(),
+                      buffers_.d_list_sizes_new_.data_handle(), stream);
+    add_reverse_edges(buffers_.h_graph_old_.data_handle(),
+                      buffers_.h_rev_graph_old_.data_handle(),
+                      (Index_t *)buffers_.dists_buffer_.data_handle(),
+                      buffers_.d_list_sizes_old_.data_handle(), stream);
+
+    local_join(stream);
 
     update_and_sample_thread.join();
 
-    if (update_counter_ == -1)
+    if (update_counter_ == -1) {
       break;
+    }
+    raft::copy(buffers_.graph_host_buffer_.data_handle(),
+               buffers_.graph_buffer_.data_handle(),
+               n_instances_ * MAX_NEIGHBORS, stream);
+    raft::copy(buffers_.dists_host_buffer_.data_handle(),
+               buffers_.dists_buffer_.data_handle(),
+               n_instances_ * MAX_NEIGHBORS, stream);
+    raft::resource::sync_stream(res_);
 
-    raft::copy(indices_host_buffer_.data_handle(),
-               graph_.h_indices.data_handle(), n_row_ * n_internal_neighbors_,
-               stream);
-    raft::copy(dists_host_buffer_.data_handle(), graph_.h_dists.data_handle(),
-               n_row_ * n_internal_neighbors_, stream);
-    raft::resource::sync_stream(res_, stream);
-
-    graph_.sample_graph_new(indices_host_buffer_.data_handle(), num_samples_);
+    sample_graph_new();
   }
 
-  graph_.update_graph(indices_host_buffer_.data_handle(),
-                      dists_host_buffer_.data_handle(), num_samples_,
-                      update_counter_);
+  update_graph();
 
-  raft::resource::sync_stream(res_, stream);
+  // sort_lists();
 
-  update_neighbor_info();
+  // Copy the final graph and distances to output buffers.
 }
 
 } // namespace gpumap::nndescent
