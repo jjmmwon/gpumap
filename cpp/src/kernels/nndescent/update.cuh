@@ -1,10 +1,15 @@
 #pragma once
 
+// TODO: update buffer의 graph와 distance를 insert kernel에서도 초기화 할 수
+// 있게 리팩토링
+
 #include "components.cuh"
 
 #include <__clang_cuda_builtin_vars.h>
 #include <__clang_cuda_runtime_wrapper.h>
+#include <algorithm>
 #include <cstddef>
+#include <cstring>
 #include <cuda_runtime.h>
 #include <driver_types.h>
 #include <limits>
@@ -22,6 +27,9 @@ namespace gpumap::nndescent {
 constexpr int MAX_NUM_BI_SAMPLES = 64;
 constexpr int SKEWED_MAX_NUM_BI_SAMPLES = 68;
 constexpr int BLOCK_SIZE = 512;
+constexpr int DIRTY_NONE = 0;
+constexpr int DIRTY_LIST_CHANGED = 1;
+constexpr int DIRTY_NEIGHBOR_CHANGED = 2;
 
 template <typename Index_t> struct ResultItem;
 
@@ -73,6 +81,42 @@ public:
     return !(*this == other);
   }
 };
+
+template <typename Data_t>
+uint32_t insert_to_ordered_list(InternalID_t *list, Data_t *dist_list,
+                                const uint32_t width,
+                                const InternalID_t neighb_id,
+                                const Data_t dist) {
+
+  if (dist > dist_list[width - 1]) {
+    return width;
+  }
+
+  uint32_t idx_insert = width;
+
+  bool position_found = false;
+  for (int i = 0; i < width; i++) {
+    if (list[i].id() == neighb_id.id()) {
+      return width;
+    }
+    if (!position_found && dist_list[i] > dist) {
+      idx_insert = i;
+      position_found = true;
+    }
+  }
+  if (idx_insert == width) {
+    return idx_insert;
+  }
+
+  memmove(list + idx_insert + 1, list + idx_insert,
+          sizeof(*list) * (width - idx_insert - 1));
+  memmove(dist_list + idx_insert + 1, dist_list + idx_insert,
+          sizeof(*dist_list) * (width - idx_insert - 1));
+
+  list[idx_insert] = neighb_id;
+  dist_list[idx_insert] = dist;
+  return idx_insert;
+}
 
 template <typename Index_t>
 __global__ void add_rev_edges_kernel(const Index_t *graph, Index_t *rev_graph,
@@ -276,9 +320,11 @@ get_min_item(const Index_t id, const int idx_in_list, const Index_t *neighbs,
 template <typename Index_t, typename Dist_t, typename ID_t = InternalID_t>
 __device__ void insert_to_global_graph(ResultItem<Index_t> elem, size_t list_id,
                                        ID_t *graph, Dist_t *dists,
-                                       int n_neighbors, int *locks) {
+                                       int n_internal_neighbors, int *locks,
+                                       int *dirty_flags, int n_neighbors) {
   const int lane_id = threadIdx.x % raft::warp_size();
-  const size_t global_idx_base = list_id * static_cast<size_t>(n_neighbors);
+  const size_t global_idx_base =
+      list_id * static_cast<size_t>(n_internal_neighbors);
 
   if (elem.id() == static_cast<Index_t>(list_id)) {
     return;
@@ -292,10 +338,10 @@ __device__ void insert_to_global_graph(ResultItem<Index_t> elem, size_t list_id,
     lock_acquired = __shfl_sync(raft::warp_full_mask(), lock_acquired, 0);
   } while (!lock_acquired);
 
-  int local_insert_pos = n_neighbors;
+  int local_insert_pos = n_internal_neighbors;
   bool local_duplicate = false;
 
-  for (int local_idx = lane_id; local_idx < n_neighbors;
+  for (int local_idx = lane_id; local_idx < n_internal_neighbors;
        local_idx += raft::warp_size()) {
     ResultItem<Index_t> graph_elem;
     graph_elem.id_with_flag() =
@@ -305,7 +351,7 @@ __device__ void insert_to_global_graph(ResultItem<Index_t> elem, size_t list_id,
     if (elem == graph_elem) {
       local_duplicate = true;
     }
-    if (elem < graph_elem && local_insert_pos == n_neighbors) {
+    if (elem < graph_elem && local_insert_pos == n_internal_neighbors) {
       local_insert_pos = local_idx;
     }
   }
@@ -319,14 +365,17 @@ __device__ void insert_to_global_graph(ResultItem<Index_t> elem, size_t list_id,
   insert_pos = __shfl_sync(raft::warp_full_mask(), insert_pos, 0);
 
   bool duplicated = __any_sync(raft::warp_full_mask(), local_duplicate);
-  if (!duplicated && insert_pos < n_neighbors && lane_id == 0) {
-    for (int i = n_neighbors - 1; i > insert_pos; --i) {
+  if (!duplicated && insert_pos < n_internal_neighbors && lane_id == 0) {
+    for (int i = n_internal_neighbors - 1; i > insert_pos; --i) {
       graph[global_idx_base + i].id_with_flag() =
           graph[global_idx_base + (i - 1)].id_with_flag();
       dists[global_idx_base + i] = dists[global_idx_base + (i - 1)];
     }
     graph[global_idx_base + insert_pos].id_with_flag() = elem.id_with_flag();
     dists[global_idx_base + insert_pos] = static_cast<Dist_t>(elem.dist());
+    const int dirty_state = (insert_pos < n_neighbors) ? DIRTY_NEIGHBOR_CHANGED
+                                                       : DIRTY_LIST_CHANGED;
+    atomicMax(&dirty_flags[list_id], dirty_state);
   }
 
   __threadfence();
@@ -342,7 +391,8 @@ local_join_kernel(const Index_t *graph_new, Index_t *rev_graph_new,
                   const Index_t *rev_graph_old, const int2 *sizes_old,
                   const int width, const Data_t *data, const int n_features,
                   const int data_block_size, InternalID_t *graph, Data_t *dists,
-                  int graph_width, int *locks) {
+                  int graph_width, int *locks, int *dirty_flags,
+                  int n_output_neighbors) {
 
   __shared__ int s_list[MAX_NUM_BI_SAMPLES * 2];
 
@@ -489,7 +539,8 @@ local_join_kernel(const Index_t *graph_new, Index_t *rev_graph_new,
                                  new_neighbors, s_distances);
     if (min_elem.id() < gridDim.x) {
       insert_to_global_graph(min_elem, s_list[idx_in_list], graph, dists,
-                             graph_width, locks);
+                             graph_width, locks, dirty_flags,
+                             n_output_neighbors);
     }
   }
 
@@ -597,7 +648,8 @@ local_join_kernel(const Index_t *graph_new, Index_t *rev_graph_new,
 
     if (min_elem.id() < gridDim.x) {
       insert_to_global_graph(min_elem, s_list[idx_in_list % MAX_NUM_BI_SAMPLES],
-                             graph, dists, graph_width, locks);
+                             graph, dists, graph_width, locks, dirty_flags,
+                             n_output_neighbors);
     }
   }
 }
@@ -692,56 +744,74 @@ void UpdateAlgo<Data_t, Idx_t, Index_t>::sample_graph_new() {
 
 template <typename Data_t, typename Idx_t, typename Index_t>
 void UpdateAlgo<Data_t, Idx_t, Index_t>::update_graph(
-    const InternalID_t *new_neighbors, const Data_t *new_dists, size_t width) {
-  const size_t n_rows = batch_indices_.size();
-  InternalID_t *graph = buffers_.graph_host_buffer_.data_handle();
-  Data_t *dists = buffers_.dists_host_buffer_.data_handle();
+    std::atomic<int64_t> &update_counter) {
+  const InternalID_t *new_neighbors = buffers_.graph_host_buffer_.data_handle();
+  const Data_t *new_dists = buffers_.dists_host_buffer_.data_handle();
+  constexpr uint32_t k_internal_degree = MAX_NEIGHBORS;
+  int64_t local_updates = 0;
 
-#pragma omp parallel for schedule(dynamic, 32)
-  for (size_t i = 0; i < n_rows; ++i) {
-    const size_t row = static_cast<size_t>(batch_indices_[i]);
+#pragma omp parallel for reduction(+ : local_updates)
+  for (size_t i = 0; i < n_inserted_instances_; i++) {
+    for (size_t j = 0; j < MAX_NEIGHBORS; j++) {
+      auto neighbor = new_neighbors[i * MAX_NEIGHBORS + j];
+      auto new_dist = new_dists[i * MAX_NEIGHBORS + j];
 
-    InternalID_t *row_graph = graph + row * MAX_NEIGHBORS;
-    Data_t *row_dists = dists + row * MAX_NEIGHBORS;
-
-    for (size_t j = 0; j < width; ++j) {
-      const int cand_id = new_neighbors[i * width + j].id();
-
-      // Skip invalid or out-of-range candidates.
-      if (static_cast<size_t>(cand_id) >= n_inserted_instances_)
+      if (new_dist == std::numeric_limits<Data_t>::max()) {
+        break;
+      }
+      if (neighbor.id() >= n_inserted_instances_ || (size_t)neighbor.id() == i)
         continue;
 
-      const Data_t cand_dist = new_dists[i * width + j];
+      auto list = buffers_.graph_host_buffer_.data_handle() + i * MAX_NEIGHBORS;
+      auto dist_list =
+          buffers_.dists_host_buffer_.data_handle() + i * MAX_NEIGHBORS;
+      uint32_t insert_pos = insert_to_ordered_list(
+          list, dist_list, k_internal_degree, neighbor, new_dist);
 
-      // Prune early: candidate must beat the current worst neighbor.
-      if (cand_dist >= row_dists[n_neighbors_ - 1])
-        continue;
-
-      // Check for duplicates by scanning the current k-NN list.
-      bool duplicate = false;
-      for (size_t k = 0; k < n_neighbors_; ++k) {
-        if (row_graph[k].id() == cand_id) {
-          duplicate = true;
-          break;
+      if (insert_pos != k_internal_degree) {
+        local_updates++;
+        const int dirty_state = (insert_pos < n_neighbors_)
+                                    ? DIRTY_NEIGHBOR_CHANGED
+                                    : DIRTY_LIST_CHANGED;
+        if (buffers_.h_dirty_flags_.data_handle()[i] < dirty_state) {
+          buffers_.h_dirty_flags_.data_handle()[i] = dirty_state;
         }
       }
-      if (duplicate)
-        continue;
-
-      // Shift-insert to keep the list sorted in ascending distance order.
-      // The last entry (worst neighbor) is evicted.
-      int pos = static_cast<int>(n_neighbors_) - 1;
-      while (pos > 0 && cand_dist < row_dists[pos - 1]) {
-        row_graph[pos] = row_graph[pos - 1];
-        row_dists[pos] = row_dists[pos - 1];
-        --pos;
-      }
-
-      // Mark the inserted neighbor as "new" (positive id_with_flag) so it
-      // is included in the next iteration's local join.
-      row_graph[pos].id_with_flag() = cand_id;
-      row_dists[pos] = cand_dist;
     }
+  }
+  if (local_updates > 0) {
+    update_counter.fetch_add(local_updates, std::memory_order_relaxed);
+  }
+}
+
+template <typename Data_t, typename Idx_t, typename Index_t>
+void UpdateAlgo<Data_t, Idx_t, Index_t>::sort_lists() {
+  constexpr size_t k_internal_degree = MAX_NEIGHBORS;
+#pragma omp parallel for
+  for (size_t i = 0; i < n_inserted_instances_; i++) {
+    if (!buffers_.h_dirty_flags_.data_handle()[i]) {
+      continue;
+    }
+    std::vector<std::pair<Data_t, Index_t>> sorted_list;
+    sorted_list.reserve(k_internal_degree);
+
+    for (size_t j = 0; j < k_internal_degree; j++) {
+      sorted_list.emplace_back(
+          buffers_.dists_host_buffer_.data_handle()[i * MAX_NEIGHBORS + j],
+          static_cast<Index_t>(
+              buffers_.graph_host_buffer_.data_handle()[i * MAX_NEIGHBORS + j]
+                  .id()));
+    }
+
+    std::sort(sorted_list.begin(), sorted_list.end());
+
+    for (size_t j = 0; j < k_internal_degree; j++) {
+      buffers_.graph_host_buffer_.data_handle()[i * MAX_NEIGHBORS + j]
+          .id_with_flag() = static_cast<int>(sorted_list[j].second);
+      buffers_.dists_host_buffer_.data_handle()[i * MAX_NEIGHBORS + j] =
+          sorted_list[j].first;
+    }
+    buffers_.h_dirty_flags_.data_handle()[i] = DIRTY_NONE;
   }
 }
 
@@ -756,8 +826,9 @@ void UpdateAlgo<Data_t, Idx_t, Index_t>::local_join(cudaStream_t const stream) {
       buffers_.d_list_sizes_old_.data_handle(), NUM_SAMPLES, d_input_data_,
       n_features_, buffers_.data_block_size_,
       buffers_.graph_buffer_.data_handle(),
-      buffers_.dists_buffer_.data_handle(), n_neighbors_,
-      buffers_.d_locks_.data_handle());
+      buffers_.dists_buffer_.data_handle(), MAX_NEIGHBORS,
+      buffers_.d_locks_.data_handle(), buffers_.d_dirty_flags_.data_handle(),
+      n_neighbors_);
 }
 
 template <typename Data_t, typename Idx_t, typename Index_t>
@@ -780,18 +851,25 @@ void UpdateAlgo<Data_t, Idx_t, Index_t>::add_reverse_edges(
 }
 
 template <typename Data_t, typename Idx_t, typename Index_t>
-void UpdateAlgo<Data_t, Idx_t, Index_t>::build(cudaStream_t stream) {
+std::vector<Idx_t>
+UpdateAlgo<Data_t, Idx_t, Index_t>::build(cudaStream_t stream) {
   const raft::resources res_;
   raft::resource::set_cuda_stream(res_, stream);
+  std::vector<int> d_dirty_flags_host(n_instances_, 0);
+  std::vector<Idx_t> neighbor_changed_indices;
 
   update_counter_ = 0;
+  std::fill_n(buffers_.h_dirty_flags_.data_handle(), n_instances_, DIRTY_NONE);
+  raft::copy(buffers_.d_dirty_flags_.data_handle(),
+             buffers_.h_dirty_flags_.data_handle(), n_instances_, stream);
+  raft::resource::sync_stream(res_);
 
   sample_graph(true);
 
   auto update_and_sample = [&](bool update_graph_flag) {
     if (update_graph_flag) {
       update_counter_ = 0;
-      update_graph();
+      update_graph(update_counter_);
 
       if (update_counter_ <
           termination_threshold_ * n_inserted_instances_ * NUM_SAMPLES) {
@@ -845,11 +923,49 @@ void UpdateAlgo<Data_t, Idx_t, Index_t>::build(cudaStream_t stream) {
     sample_graph_new();
   }
 
-  update_graph();
+  update_graph(update_counter_);
+  raft::resource::sync_stream(res_);
+  raft::copy(d_dirty_flags_host.data(), buffers_.d_dirty_flags_.data_handle(),
+             n_instances_, stream);
+  raft::resource::sync_stream(res_);
 
-  // sort_lists();
+  for (size_t i = 0; i < n_inserted_instances_; ++i) {
+    if (d_dirty_flags_host[i] > buffers_.h_dirty_flags_.data_handle()[i]) {
+      buffers_.h_dirty_flags_.data_handle()[i] = d_dirty_flags_host[i];
+    }
+    if (buffers_.h_dirty_flags_.data_handle()[i] == DIRTY_NEIGHBOR_CHANGED) {
+      neighbor_changed_indices.push_back(static_cast<Idx_t>(i));
+    }
+  }
 
-  // Copy the final graph and distances to output buffers.
+  sort_lists();
+
+  if (d_neighbor_indices_ != nullptr && d_neighbor_distances_ != nullptr) {
+    std::vector<Idx_t> h_neighbor_row(n_neighbors_);
+    for (auto row_id : neighbor_changed_indices) {
+      const size_t row = static_cast<size_t>(row_id);
+      auto row_graph =
+          buffers_.graph_host_buffer_.data_handle() + row * MAX_NEIGHBORS;
+      auto row_dists =
+          buffers_.dists_host_buffer_.data_handle() + row * MAX_NEIGHBORS;
+
+      for (size_t j = 0; j < n_neighbors_; ++j) {
+        const int id = row_graph[j].id();
+        h_neighbor_row[j] =
+            (id >= 0 && static_cast<size_t>(id) < n_inserted_instances_)
+                ? static_cast<Idx_t>(id)
+                : std::numeric_limits<Idx_t>::max();
+      }
+
+      raft::copy(d_neighbor_indices_ + row * neighbor_indices_block_size_,
+                 h_neighbor_row.data(), n_neighbors_, stream);
+      raft::copy(d_neighbor_distances_ + row * neighbor_dists_block_size_,
+                 row_dists, n_neighbors_, stream);
+    }
+    raft::resource::sync_stream(res_);
+  }
+
+  return neighbor_changed_indices;
 }
 
 } // namespace gpumap::nndescent

@@ -163,6 +163,8 @@ template <typename Data_t, typename Index_t = int> struct UpdateBuffers {
                 res, n_instances, MAX_NEIGHBORS)},
 
         d_locks_{raft::make_device_vector<int, size_t>(res, n_instances)},
+        d_dirty_flags_{raft::make_device_vector<int, size_t>(res, n_instances)},
+        h_dirty_flags_{raft::make_pinned_vector<int, size_t>(res, n_instances)},
 
         h_rev_graph_new_{
             raft::make_pinned_matrix<Index_t, size_t, raft::row_major>(
@@ -210,6 +212,8 @@ template <typename Data_t, typename Index_t = int> struct UpdateBuffers {
   raft::pinned_matrix<Data_t, size_t> dists_host_buffer_;
 
   raft::device_vector<int, size_t> d_locks_;
+  raft::device_vector<int, size_t> d_dirty_flags_;
+  raft::pinned_vector<int, size_t> h_dirty_flags_;
 
   raft::pinned_matrix<Index_t, size_t> h_rev_graph_new_;
   raft::pinned_matrix<Index_t, size_t> h_graph_old_;
@@ -263,7 +267,7 @@ public:
         n_neighbors_(n_neighbors), n_inserted_instances_(n_inserted_instances),
         max_iter_(max_iter), termination_threshold_(termination_threshold) {}
 
-  void build(cudaStream_t const stream);
+  std::vector<Idx_t> build(cudaStream_t const stream);
   void local_join(cudaStream_t const stream);
   void add_reverse_edges(Index_t *graph_ptr, Index_t *h_rev_graph_ptr,
                          Index_t *d_rev_graph_ptr, int2 *list_sizes,
@@ -271,8 +275,8 @@ public:
 
   void sample_graph_new();
   void sample_graph(bool sample_new);
-  void update_graph(const InternalID_t *new_neighbors, const Data_t *new_dists,
-                    size_t width);
+  void update_graph(std::atomic<int64_t> &update_counter);
+  void sort_lists();
 
 private:
   UpdateBuffers<Data_t, int> &buffers_;
