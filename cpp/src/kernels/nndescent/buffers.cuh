@@ -1,15 +1,14 @@
 #pragma once
 
-#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <driver_types.h>
+#include <limits>
 #include <raft/core/device_mdarray.hpp>
 #include <raft/core/host_mdarray.hpp>
 #include <raft/core/pinned_mdarray.hpp>
 #include <raft/core/resources.hpp>
 #include <sys/types.h>
-#include <utility>
 #include <vector>
 #include <vector_types.h>
 
@@ -17,6 +16,9 @@ namespace gpumap::nndescent {
 
 constexpr int MAX_NEIGHBORS = 32;
 constexpr int NUM_SAMPLES = 32;
+constexpr int MAX_NUM_BI_SAMPLES = 64;
+constexpr int SKEWED_MAX_NUM_BI_SAMPLES = 68;
+constexpr int BLOCK_SIZE = 512;
 
 /**
  * @brief CPU-side Bloom filter used to deduplicate candidate edges per list.
@@ -137,24 +139,29 @@ public:
   }
 };
 
-template <typename Data_t, typename Index_t = int> struct UpdateBuffers {
-  UpdateBuffers() = delete;
-  UpdateBuffers(const UpdateBuffers &) = delete;
-  UpdateBuffers &operator=(const UpdateBuffers &) = delete;
+template <typename Data_t, typename Index_t = int> struct NNDBuffers {
+  NNDBuffers() = delete;
+  NNDBuffers(const NNDBuffers &) = delete;
+  NNDBuffers &operator=(const NNDBuffers &) = delete;
 
-  UpdateBuffers(raft::resources const &res, uint32_t n_instances,
-                uint32_t n_neighbors)
+  NNDBuffers(raft::resources const &res, uint32_t n_instances,
+             uint32_t n_neighbors)
 
       : bloom_filter{n_instances, 4, 4}, res(res), n_instances(n_instances),
         n_neighbors(n_neighbors),
 
-        // Buffers used in device kernels
         l2_norms_{raft::make_device_vector<Data_t, size_t>(res, n_instances)},
         graph_buffer_{
             raft::make_device_matrix<InternalID_t, size_t, raft::row_major>(
                 res, n_instances, MAX_NEIGHBORS)},
         dists_buffer_{raft::make_device_matrix<Data_t, size_t, raft::row_major>(
             res, n_instances, MAX_NEIGHBORS)},
+
+        /// buffers used for storing candidates during insertion.
+        candidate_buffer_{
+            raft::make_device_matrix<int, size_t, raft::row_major>(
+                res, n_instances, MAX_NEIGHBORS)},
+
         graph_host_buffer_{
             raft::make_pinned_matrix<InternalID_t, size_t, raft::row_major>(
                 res, n_instances, MAX_NEIGHBORS)},
@@ -180,8 +187,6 @@ template <typename Data_t, typename Index_t = int> struct UpdateBuffers {
         d_list_sizes_old_{
             raft::make_device_vector<int2, size_t>(res, n_instances)},
 
-        // Buffers used in host side
-        // (sample_graph/sample_graph_new/update_graph)
         h_graph{raft::make_host_matrix<InternalID_t, size_t, raft::row_major>(
             n_instances, n_neighbors)},
         h_dists{raft::make_host_matrix<Data_t, size_t, raft::row_major>(
@@ -198,15 +203,11 @@ template <typename Data_t, typename Index_t = int> struct UpdateBuffers {
   raft::resources const &res;
   uint32_t n_instances;
   uint32_t n_neighbors;
-  uint32_t n_internal_neighbors;
 
-  // =========================================================================
-  // Buffers used in device kernels. These are allocated once and reused across
-  // iterations to avoid repeated allocation overhead.
-  // =========================================================================
   raft::device_vector<Data_t, size_t> l2_norms_;
   raft::device_matrix<InternalID_t, size_t, raft::row_major> graph_buffer_;
   raft::device_matrix<Data_t, size_t, raft::row_major> dists_buffer_;
+  raft::device_matrix<int, size_t, raft::row_major> candidate_buffer_;
 
   raft::pinned_matrix<InternalID_t, size_t> graph_host_buffer_;
   raft::pinned_matrix<Data_t, size_t> dists_host_buffer_;
@@ -222,12 +223,7 @@ template <typename Data_t, typename Index_t = int> struct UpdateBuffers {
   raft::device_vector<int2, size_t> d_list_sizes_new_;
   raft::device_vector<int2, size_t> d_list_sizes_old_;
 
-  // =========================================================================
-  // Buffers used in host side. These are used for CPU-side processing and
-  // DMA transfers to/from device.
-  // =========================================================================
-
-  raft::host_matrix<Index_t, size_t> h_graph;
+  raft::host_matrix<InternalID_t, size_t> h_graph;
   raft::host_matrix<Data_t, size_t> h_dists;
   raft::pinned_matrix<Index_t, size_t> h_graph_new;
   raft::pinned_vector<int2, size_t> h_list_sizes_new;
@@ -235,70 +231,6 @@ template <typename Data_t, typename Index_t = int> struct UpdateBuffers {
   raft::pinned_matrix<Index_t, size_t> h_graph_old;
   raft::pinned_vector<int2, size_t> h_list_sizes_old;
   BloomFilter<Index_t> bloom_filter;
-};
-
-template <typename Data_t, typename Idx_t, typename Index_t = int>
-class UpdateAlgo {
-public:
-  UpdateAlgo() = delete;
-  UpdateAlgo(const UpdateAlgo &) = delete;
-  UpdateAlgo &operator=(const UpdateAlgo &) = delete;
-
-  UpdateAlgo(UpdateBuffers<Data_t, Index_t> &buffers,
-             std::vector<Idx_t> batch_indices,
-
-             Data_t *d_input_data, Idx_t *d_neighbor_indices,
-             Data_t *d_neighbor_distances, uint32_t data_block_size,
-             uint32_t neighbor_indices_block_size,
-             uint32_t neighbor_dists_block_size, uint32_t n_instances,
-             uint32_t n_features, uint32_t n_neighbors,
-             uint32_t n_inserted_instances, uint32_t max_iter = 30,
-             float termination_threshold = 0.001f)
-      : buffers_(buffers), update_counter_{0},
-        batch_indices_(std::move(batch_indices)),
-
-        d_input_data_(d_input_data), d_neighbor_indices_(d_neighbor_indices),
-        d_neighbor_distances_(d_neighbor_distances),
-        data_block_size_(data_block_size),
-        neighbor_indices_block_size_(neighbor_indices_block_size),
-        neighbor_dists_block_size_(neighbor_dists_block_size),
-
-        n_instances_(n_instances), n_features_(n_features),
-        n_neighbors_(n_neighbors), n_inserted_instances_(n_inserted_instances),
-        max_iter_(max_iter), termination_threshold_(termination_threshold) {}
-
-  std::vector<Idx_t> build(cudaStream_t const stream);
-  void local_join(cudaStream_t const stream);
-  void add_reverse_edges(Index_t *graph_ptr, Index_t *h_rev_graph_ptr,
-                         Index_t *d_rev_graph_ptr, int2 *list_sizes,
-                         cudaStream_t stream);
-
-  void sample_graph_new();
-  void sample_graph(bool sample_new);
-  void update_graph(std::atomic<int64_t> &update_counter);
-  void sort_lists();
-
-private:
-  UpdateBuffers<Data_t, int> &buffers_;
-  std::atomic<int64_t> update_counter_;
-  // Row mapping for partial update mode: local row i -> global row
-  // batch_indices_[i].
-  std::vector<Idx_t> batch_indices_;
-
-  Data_t *d_input_data_;
-  Idx_t *d_neighbor_indices_;
-  Data_t *d_neighbor_distances_;
-
-  uint32_t data_block_size_;
-  uint32_t neighbor_indices_block_size_;
-  uint32_t neighbor_dists_block_size_;
-
-  uint32_t n_instances_;
-  uint32_t n_features_;
-  uint32_t n_neighbors_;
-  uint32_t n_inserted_instances_;
-  uint32_t max_iter_;
-  float termination_threshold_;
 };
 
 } // namespace gpumap::nndescent

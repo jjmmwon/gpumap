@@ -1,17 +1,16 @@
 #pragma once
 
 #include "gpumap/gpumap.cuh"
+#include "kernels/embedding_kernel.cuh"
+#include "kernels/insertion_kernel.cuh"
 #include "queue.cuh"
 #include "raft/core/device_mdspan.hpp"
 #include "storage.cuh"
 #include "utils/matrix_utils.cuh"
-#include "kernels/insertion_kernel.cuh"
-#include "kernels/embedding_kernel.cuh"
 #include <algorithm>
 #include <csignal>
-#include <rmm/device_scalar.hpp>
 #include <rmm/cuda_stream_view.hpp>
-#include <tuple>
+#include <rmm/device_scalar.hpp>
 
 namespace gpumap {
 
@@ -32,9 +31,8 @@ struct GPUMAP::Impl {
   EmbeddingQueue embedding_queue;
 
   Impl(const GPUMAPParams &params_)
-      : params(params_),
-        storage(params_.n_instances, params_.n_features, params_.n_neighbors,
-                params_.n_components),
+      : params(params_), storage(params_.n_instances, params_.n_features,
+                                 params_.n_neighbors, params_.n_components),
         insertion_queue() {
     initialize();
   }
@@ -51,12 +49,13 @@ struct GPUMAP::Impl {
       throw std::runtime_error("Exceeding maximum number of rows in storage");
     }
 
-    auto data_ptr =
-        storage.data.data() + static_cast<size_t>(storage.n_inserted_instances) *
-                                  storage.data_block_size;
+    auto data_ptr = storage.data.data() +
+                    static_cast<size_t>(storage.n_inserted_instances) *
+                        storage.data_block_size;
 
-    utils::append_host(data_ptr, ptr, n_new_instances, storage.n_features, storage.data_block_size,
-                        rmm::cuda_stream_view(insertion_stream));
+    utils::append_host(data_ptr, ptr, n_new_instances, storage.n_features,
+                       storage.data_block_size,
+                       rmm::cuda_stream_view(insertion_stream));
 
     // Add newly inserted indices to the insertion queue
     Idx_t old_count = storage.n_inserted_instances;
@@ -126,33 +125,21 @@ struct GPUMAP::Impl {
     std::vector<Idx_t> affected_indices;
     std::vector<gpumap::Edge> new_edges;
 
-    insertion_kernel(
+    insertion_kernel<Data_t, Idx_t>(
+        storage.nnd_buffer, batch_indices,
+
         storage.data.data(), storage.neighbor_indices.data(),
         storage.neighbor_dists.data(), storage.embedding.data(),
-        storage.neighbor_indices_block_size,
-        storage.neighbor_dists_block_size,
-        storage.n_neighbors,
-        storage.n_instances, storage.n_inserted_instances, storage.n_features,
-        batch_indices, affected_indices, new_edges, insertion_stream);
 
+        storage.data_block_size, storage.neighbor_indices_block_size,
+        storage.neighbor_dists_block_size, 2,
 
-    // run_init_and_update_kernel(
-    //     batch_indices, &insertion_stream, &update_stream, &embedding_stream,
-    //     affected_indices,
-    //     new_edges); // randomly  initialize neighbors of incies
-                    // batch_indices and do descent k times
+        storage.n_instances, storage.n_features, storage.n_neighbors,
+        storage.n_inserted_instances, affected_indices, new_edges,
+        insertion_stream);
 
-    // batch indices의 임베딩을 이웃들의 평균으로 초기화
-    // affected_indices = batch_indices의 이웃을 unique
-    // update_queue.push_batch(affected_indices);
-
-    // bath_indices의 index와 이웃 n에 대한 에지 (i, n_0), (i, n_k-1) 까지를
-    // 넣어야됨 지금은 넣으면 무조건 하게되는데, 사실 그러면 안됨. 유맵은 스킵이
-    // 있음(차례가 안되면). 우리도 CPU에서 업데이트할 녀석들을 앞에서 뽑을 때,
-    // 스킵이되면 다시 카운트+1해서 뒤로 넣어주고, 아니면 벡터에넣어서
-    // 그 벡터를 임베딩의 인자로 줘야함.
-
-    // embedding_queue.push_batch(new_edges);
+    update_queue.push_batch(affected_indices);
+    embedding_queue.push_batch(new_edges);
 
     return batch_indices.size();
   }
@@ -175,7 +162,8 @@ struct GPUMAP::Impl {
   }
 
   void embed(size_t n_ops) {
-    // embedding 단계에서 queue는 엣지들을 담고있다. 여기서 e = (src, dst, iter)임
+    // embedding 단계에서 queue는 엣지들을 담고있다. 여기서 e = (src, dst,
+    // iter)임
 
     // 먼저 n_ops 개수만큼 엣지를 빼자
     std::vector<gpumap::Edge> batch_edges = embedding_queue.pop_n(n_ops);
@@ -187,7 +175,7 @@ struct GPUMAP::Impl {
     h_dsts.reserve(batch_edges.size());
     h_epochs.reserve(batch_edges.size());
 
-    for (const auto& e : batch_edges) {
+    for (const auto &e : batch_edges) {
       h_srcs.push_back(std::get<0>(e));
       h_dsts.push_back(std::get<1>(e));
       h_epochs.push_back(std::get<2>(e));
@@ -195,30 +183,31 @@ struct GPUMAP::Impl {
 
     // 커널 실행 준비를 위해 src,dst에 대한 디바이스 vector
     rmm::device_uvector<Idx_t> d_srcs(h_srcs.size(), embedding_stream),
-                               d_dsts(h_dsts.size(), embedding_stream);
+        d_dsts(h_dsts.size(), embedding_stream);
 
     rmm::device_uvector<Idx_t> d_out_srcs(h_srcs.size(), embedding_stream),
-      d_out_dsts(h_dsts.size(), embedding_stream);
+        d_out_dsts(h_dsts.size(), embedding_stream);
     rmm::device_uvector<size_t> d_epochs(h_epochs.size(), embedding_stream);
     rmm::device_uvector<size_t> d_out_epochs(h_epochs.size(), embedding_stream);
 
     rmm::device_scalar<unsigned long long> d_out_count(embedding_stream);
 
     // 호스트 -> 디바이스 복사
-    cudaMemcpyAsync(d_srcs.data(), h_srcs.data(), h_srcs.size() * sizeof(Idx_t), cudaMemcpyHostToDevice, embedding_stream);
+    cudaMemcpyAsync(d_srcs.data(), h_srcs.data(), h_srcs.size() * sizeof(Idx_t),
+                    cudaMemcpyHostToDevice, embedding_stream);
 
     cudaMemcpyAsync(d_dsts.data(), h_dsts.data(), h_dsts.size() * sizeof(Idx_t),
-            cudaMemcpyHostToDevice, embedding_stream);
+                    cudaMemcpyHostToDevice, embedding_stream);
     cudaMemcpyAsync(d_epochs.data(), h_epochs.data(),
-            h_epochs.size() * sizeof(size_t),
-            cudaMemcpyHostToDevice, embedding_stream);
+                    h_epochs.size() * sizeof(size_t), cudaMemcpyHostToDevice,
+                    embedding_stream);
 
     // 이웃인 엣지들만 남긴다. (필터링 커널 실행)
     filter_edges_by_neighbors<Idx_t, size_t>(
-      d_srcs.data(), d_dsts.data(), d_epochs.data(), d_out_srcs.data(),
-      d_out_dsts.data(), d_out_epochs.data(), batch_edges.size(),
-      storage.neighbor_indices.data(), storage.neighbor_indices_block_size,
-      storage.n_neighbors, d_out_count.data(), embedding_stream);
+        d_srcs.data(), d_dsts.data(), d_epochs.data(), d_out_srcs.data(),
+        d_out_dsts.data(), d_out_epochs.data(), batch_edges.size(),
+        storage.neighbor_indices.data(), storage.neighbor_indices_block_size,
+        storage.n_neighbors, d_out_count.data(), embedding_stream);
 
     // 필터링 하고 남은 개수 읽어오기 (즉 아직 src, dst가 이웃인 엣지의 수)
     unsigned long long h_out_count = 0;
@@ -245,8 +234,8 @@ struct GPUMAP::Impl {
                     h_out_count * sizeof(Idx_t), cudaMemcpyDeviceToHost,
                     embedding_stream);
     cudaMemcpyAsync(h_out_epochs.data(), d_out_epochs.data(),
-            h_out_count * sizeof(size_t), cudaMemcpyDeviceToHost,
-            embedding_stream);
+                    h_out_count * sizeof(size_t), cudaMemcpyDeviceToHost,
+                    embedding_stream);
 
     cudaStreamSynchronize(embedding_stream);
 
@@ -262,26 +251,27 @@ struct GPUMAP::Impl {
         std::unique(unique_indices.begin(), unique_indices.end()),
         unique_indices.end());
 
-    // 남은 엣지들 중에서 dirty한 녀석들을 보고 dirty하다면 sigma_i를 업데이트해준다.
+    // 남은 엣지들 중에서 dirty한 녀석들을 보고 dirty하다면 sigma_i를
+    // 업데이트해준다.
     rmm::device_uvector<Idx_t> d_unique_indices(unique_indices.size(),
-                          embedding_stream);
+                                                embedding_stream);
     cudaMemcpyAsync(d_unique_indices.data(), unique_indices.data(),
-            unique_indices.size() * sizeof(Idx_t),
-            cudaMemcpyHostToDevice, embedding_stream);
+                    unique_indices.size() * sizeof(Idx_t),
+                    cudaMemcpyHostToDevice, embedding_stream);
 
     update_sigma_for_dirty<Data_t, Idx_t>(
-      d_unique_indices.data(), unique_indices.size(),
-      storage.neighbor_indices.data(), storage.neighbor_indices_block_size,
-      storage.neighbor_dists.data(), storage.neighbor_dists_block_size,
-      storage.n_neighbors, embedding_stream);
+        d_unique_indices.data(), unique_indices.size(),
+        storage.neighbor_indices.data(), storage.neighbor_indices_block_size,
+        storage.neighbor_dists.data(), storage.neighbor_dists_block_size,
+        storage.n_neighbors, embedding_stream);
 
     update_embeddings<Data_t, Idx_t>(
         d_out_srcs.data(), d_out_dsts.data(), h_out_count,
-        storage.embedding.data(), params.n_components, storage.n_inserted_instances,
-        storage.neighbor_indices.data(), storage.neighbor_indices_block_size,
-        storage.neighbor_dists.data(), storage.neighbor_dists_block_size,
-        storage.n_neighbors, params.a, params.b, params.alpha,
-        params.negative_sample_rate, embedding_stream);
+        storage.embedding.data(), params.n_components,
+        storage.n_inserted_instances, storage.neighbor_indices.data(),
+        storage.neighbor_indices_block_size, storage.neighbor_dists.data(),
+        storage.neighbor_dists_block_size, storage.n_neighbors, params.a,
+        params.b, params.alpha, params.negative_sample_rate, embedding_stream);
 
     std::vector<gpumap::Edge> requeue_edges;
     requeue_edges.reserve(h_out_count);
@@ -296,13 +286,10 @@ struct GPUMAP::Impl {
       embedding_queue.push_batch(requeue_edges);
     }
 
-
-
     // 남은것
     // 1) epoch을 보면서 임베딩 업데이트
     // 2) epoch이 max_epoch보다 크면 걔네는 죽이는거 관리 (큐에서 빼는거)
     // 3) negative sampling 처리
-
 
     // embedding_queue로부터 최대 n_ops 의 에지를 하나 씩 뺀다.
     // 이를 e라고 하면,
@@ -313,7 +300,6 @@ struct GPUMAP::Impl {
     // e.start, e.end를 업데이트 + 네거티브 n회
     // current_epoch +=1, target_epoch += edge weight이 반비례하는 값
     // max_epoch으로 영원히 죽이는 것관리
-
   }
 
   void close() {
@@ -335,7 +321,8 @@ struct GPUMAP::Impl {
     auto neighbor_indices_ptr = storage.neighbor_indices.data();
 
     return raft::make_device_matrix_view<const Idx_t, Idx_t, raft::row_major>(
-        neighbor_indices_ptr, storage.n_instances, storage.neighbor_indices_block_size);
+        neighbor_indices_ptr, storage.n_instances,
+        storage.neighbor_indices_block_size);
   }
 
   auto get_neighbor_dists() const
@@ -343,7 +330,8 @@ struct GPUMAP::Impl {
     auto neighbor_dists_ptr = storage.neighbor_dists.data();
 
     return raft::make_device_matrix_view<const Data_t, Idx_t, raft::row_major>(
-        neighbor_dists_ptr, storage.n_instances, storage.neighbor_dists_block_size);
+        neighbor_dists_ptr, storage.n_instances,
+        storage.neighbor_dists_block_size);
   }
 };
 } // namespace gpumap
