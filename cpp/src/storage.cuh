@@ -2,9 +2,29 @@
 
 #include "kernels/nndescent/buffers.cuh"
 #include "rmm/device_uvector.hpp"
+#include <cuda_runtime.h>
+#include <raft/core/resources.hpp>
 #include <rmm/cuda_stream_view.hpp>
+#include <rmm/mr/per_device_resource.hpp>
 
 namespace gpumap {
+
+// Ensures the CUDA runtime and RMM per-device resource map are initialized
+// before the first device/pinned allocation in NNDBuffers.
+// The first cudaMalloc in WSL2 can transiently fail; calling it once here
+// (ignoring the result) establishes the CUDA context so subsequent allocations
+// succeed reliably.
+struct CudaWarmup {
+  CudaWarmup() {
+    void *ptr = nullptr;
+    cudaMalloc(&ptr, 1);
+    if (ptr != nullptr)
+      cudaFree(ptr);
+    cudaGetLastError(); // clear any pending CUDA error
+    // Pre-initialize the RMM per-device resource map (CPU-only operation).
+    (void)rmm::mr::get_current_device_resource();
+  }
+};
 
 template <typename Data_t = float, typename Idx_t = uint32_t> struct Storage {
   Idx_t n_instances;
@@ -35,6 +55,14 @@ template <typename Data_t = float, typename Idx_t = uint32_t> struct Storage {
 
   // Embedding matrices
   rmm::device_uvector<Data_t> embedding;
+
+  // Declared before raft_res and nnd_buffer: initialized first, ensures CUDA
+  // runtime is ready before NNDBuffers makes its first device/pinned alloc.
+  CudaWarmup cuda_warmup;
+
+  // Owns the raft::resources for nnd_buffer's lifetime.
+  // Declared before nnd_buffer so it is constructed first and destroyed last.
+  raft::resources raft_res;
 
   // Buffers used during nndescent algorithm.
   nndescent::NNDBuffers<Data_t, int> nnd_buffer;
@@ -77,7 +105,9 @@ template <typename Data_t = float, typename Idx_t = uint32_t> struct Storage {
         neighbor_indices(0, rmm::cuda_stream_default),
         neighbor_dists(0, rmm::cuda_stream_default),
         embedding(0, rmm::cuda_stream_default),
-        nnd_buffer(raft::resources{}, n_instances_, n_neighbors_) {
+        cuda_warmup(),
+        raft_res(),
+        nnd_buffer(raft_res, n_instances_, n_neighbors_) {
     allocate_matrices();
   }
 

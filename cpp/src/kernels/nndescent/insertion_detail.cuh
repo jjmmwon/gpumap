@@ -10,15 +10,55 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cuda_runtime_api.h>
 #include <curand_kernel.h>
 #include <curand_philox4x32_x.h>
 #include <limits>
 #include <raft/core/resource/cuda_stream.hpp>
 #include <raft/util/cudart_utils.hpp>
+#include <sstream>
+#include <stdexcept>
+#include <string>
 #include <vector>
 
 namespace gpumap::nndescent {
+
+inline bool insertion_debug_enabled() {
+  static const bool enabled = []() {
+    const char *env = std::getenv("GPUMAP_DEBUG_INSERTION");
+    return env != nullptr && env[0] != '\0' && env[0] != '0';
+  }();
+  return enabled;
+}
+
+template <typename... Args>
+inline void insertion_debug_log(const char *fmt, Args... args) {
+  if (!insertion_debug_enabled()) {
+    return;
+  }
+  std::fprintf(stderr, "[gpumap][insertion] ");
+  std::fprintf(stderr, fmt, args...);
+  std::fprintf(stderr, "\n");
+}
+
+inline void sync_or_throw(cudaStream_t stream, const char *stage,
+                          long long iter = -1) {
+  const cudaError_t err = cudaStreamSynchronize(stream);
+  if (err == cudaSuccess) {
+    return;
+  }
+
+  std::ostringstream oss;
+  oss << "CUDA stream sync failed at stage='" << stage << "'";
+  if (iter >= 0) {
+    oss << " iter=" << iter;
+  }
+  oss << " code=" << static_cast<int>(err)
+      << " reason=" << cudaGetErrorString(err);
+  throw std::runtime_error(oss.str());
+}
 
 template <typename Idx_t>
 __device__ __forceinline__ bool list_contains_id(const Idx_t *arr, int k,
@@ -153,7 +193,7 @@ __global__ __forceinline__ void sample_forward_candidates_kernel(
       candidate_buffer + static_cast<size_t>(gid) * candidate_width;
 
   for (uint32_t i = 0; i < candidate_width; ++i) {
-    my_candidates[i] = std::numeric_limits<int>::max();
+    my_candidates[i] = -1;
   }
 
   Index_t my_neighbors_l[MAX_NEIGHBORS];
@@ -210,7 +250,8 @@ forward_nndescent_kernel(const Data_t *input_data, InternalID_t *graph_buffer,
                          Data_t *distance_buffer, const int *candidate_buffer,
                          uint32_t batch_size, uint32_t batch_start_offset,
                          uint32_t n_neighbors, uint32_t n_features,
-                         uint32_t data_block_size, uint32_t n_candidates) {
+                         uint32_t data_block_size, uint32_t n_candidates,
+                         uint32_t n_inserted_instances) {
   const size_t row_local =
       static_cast<size_t>(blockIdx.x * blockDim.x + threadIdx.x);
   if (row_local >= batch_size) {
@@ -243,7 +284,8 @@ forward_nndescent_kernel(const Data_t *input_data, InternalID_t *graph_buffer,
   const size_t offset1 = static_cast<size_t>(gid) * data_block_size;
   for (uint32_t i = 0; i < n_candidates; ++i) {
     const int candidate = my_candidates[i];
-    if (candidate < 0) {
+    if (candidate < 0 ||
+        static_cast<uint32_t>(candidate) >= n_inserted_instances) {
       continue;
     }
     const Index_t candidate_id = static_cast<Index_t>(candidate);
@@ -426,7 +468,8 @@ void InsertionAlgo<Data_t, Idx_t, Index_t>::forward_nndescent(
           input_data_offset, buffers_.graph_buffer_.data_handle(),
           buffers_.dists_buffer_.data_handle(),
           buffers_.candidate_buffer_.data_handle(), n_rows, row_offset,
-          n_neighbors_, n_features_, data_block_size_, n_candidates);
+          n_neighbors_, n_features_, data_block_size_, n_candidates,
+          n_inserted_instances_);
   RAFT_CUDA_TRY(cudaGetLastError());
 }
 
@@ -459,51 +502,97 @@ void InsertionAlgo<Data_t, Idx_t, Index_t>::run(
     cudaStream_t stream, std::vector<Idx_t> &affected_indices,
     std::vector<std::tuple<Idx_t, Idx_t, Idx_t>> &new_edges) {
 
-  preprocess_l2_norms(stream);
-  RAFT_CUDA_TRY(cudaStreamSynchronize(stream));
-  initialize_random_neighbors(stream, seed_);
-  RAFT_CUDA_TRY(cudaStreamSynchronize(stream));
-
-  const size_t n_rows = batch_indices_.size();
-  const size_t batch_start_offset = static_cast<size_t>(batch_indices_.front());
-
-  auto *graph_host = buffers_.graph_host_buffer_.data_handle();
-  auto *graph_dev = buffers_.graph_buffer_.data_handle();
-
-  for (size_t iter = 0; iter < max_iter_; ++iter) {
-    sample_forward_candidates(stream);
-    forward_nndescent(stream);
-    RAFT_CUDA_TRY(cudaStreamSynchronize(stream));
-  };
-
-  raft::copy(graph_host + batch_start_offset * MAX_NEIGHBORS,
-             graph_dev + batch_start_offset * MAX_NEIGHBORS,
-             n_rows * MAX_NEIGHBORS, stream);
-  RAFT_CUDA_TRY(cudaStreamSynchronize(stream));
-
-  write_new_neighbors_info(stream);
-
-  for (size_t i = 0; i < n_rows; ++i) {
-    const size_t row = static_cast<size_t>(batch_indices_[i]);
-    const InternalID_t *my_neighbors = graph_host + row * MAX_NEIGHBORS;
-
-    for (uint32_t j = 0; j < n_neighbors_; ++j) {
-      const int nid = my_neighbors[j].id();
-      if (nid < 0 || static_cast<uint32_t>(nid) >= n_inserted_instances_) {
-        continue;
-      }
-      affected_indices.push_back(static_cast<Idx_t>(nid));
-      new_edges.emplace_back(static_cast<Idx_t>(batch_indices_[i]),
-                             static_cast<Idx_t>(nid), 0);
+  try {
+    if (n_neighbors_ == 0 || n_neighbors_ > MAX_NEIGHBORS) {
+      std::ostringstream oss;
+      oss << "Invalid n_neighbors=" << n_neighbors_ << " (valid range: 1.."
+          << MAX_NEIGHBORS << ")";
+      throw std::runtime_error(oss.str());
     }
+
+    if (batch_indices_.empty()) {
+      insertion_debug_log("empty batch: skip run");
+      return;
+    }
+
+    {
+      const Idx_t start = batch_indices_.front();
+      for (size_t i = 1; i < batch_indices_.size(); ++i) {
+        if (batch_indices_[i] != static_cast<Idx_t>(start + i)) {
+          throw std::runtime_error(
+              "InsertionAlgo requires contiguous batch_indices");
+        }
+      }
+    }
+
+    const size_t n_rows = batch_indices_.size();
+    const size_t batch_start_offset =
+        static_cast<size_t>(batch_indices_.front());
+
+    insertion_debug_log(
+        "run begin: rows=%zu start=%zu inserted=%u neighbors=%u features=%u "
+        "data_block=%u max_iter=%u",
+        n_rows, batch_start_offset, n_inserted_instances_, n_neighbors_,
+        n_features_, data_block_size_, max_iter_);
+
+    preprocess_l2_norms(stream);
+    sync_or_throw(stream, "preprocess_l2_norms");
+    initialize_random_neighbors(stream, seed_);
+    sync_or_throw(stream, "initialize_random_neighbors");
+
+    auto *graph_host = buffers_.graph_host_buffer_.data_handle();
+    auto *graph_dev = buffers_.graph_buffer_.data_handle();
+
+    for (size_t iter = 0; iter < max_iter_; ++iter) {
+      insertion_debug_log("iter=%zu launch sample_forward_candidates", iter);
+      sample_forward_candidates(stream);
+      sync_or_throw(stream, "sample_forward_candidates",
+                    static_cast<long long>(iter));
+
+      insertion_debug_log("iter=%zu launch forward_nndescent", iter);
+      forward_nndescent(stream);
+      sync_or_throw(stream, "forward_nndescent", static_cast<long long>(iter));
+    };
+
+    raft::copy(graph_host + batch_start_offset * MAX_NEIGHBORS,
+               graph_dev + batch_start_offset * MAX_NEIGHBORS,
+               n_rows * MAX_NEIGHBORS, stream);
+    sync_or_throw(stream, "copy_graph_dev_to_host");
+
+    write_new_neighbors_info(stream);
+    insertion_debug_log("neighbor write-back complete");
+
+    for (size_t i = 0; i < n_rows; ++i) {
+      const size_t row = static_cast<size_t>(batch_indices_[i]);
+      const InternalID_t *my_neighbors = graph_host + row * MAX_NEIGHBORS;
+
+      for (uint32_t j = 0; j < n_neighbors_; ++j) {
+        const int nid = my_neighbors[j].id();
+        if (nid < 0 || static_cast<uint32_t>(nid) >= n_inserted_instances_) {
+          continue;
+        }
+        affected_indices.push_back(static_cast<Idx_t>(nid));
+        new_edges.emplace_back(static_cast<Idx_t>(batch_indices_[i]),
+                               static_cast<Idx_t>(nid), 0);
+      }
+    }
+
+    std::sort(affected_indices.begin(), affected_indices.end());
+    affected_indices.erase(
+        std::unique(affected_indices.begin(), affected_indices.end()),
+        affected_indices.end());
+
+    initialize_embeddings();
+    insertion_debug_log("run done: affected=%zu new_edges=%zu",
+                        affected_indices.size(), new_edges.size());
+  } catch (const std::exception &e) {
+    std::ostringstream oss;
+    oss << "InsertionAlgo::run failed: " << e.what()
+        << " | batch_size=" << batch_indices_.size()
+        << " inserted=" << n_inserted_instances_
+        << " n_neighbors=" << n_neighbors_ << " max_iter=" << max_iter_;
+    throw std::runtime_error(oss.str());
   }
-
-  std::sort(affected_indices.begin(), affected_indices.end());
-  affected_indices.erase(
-      std::unique(affected_indices.begin(), affected_indices.end()),
-      affected_indices.end());
-
-  initialize_embeddings();
 }
 
 template <typename Data_t, typename Idx_t, typename Index_t>
