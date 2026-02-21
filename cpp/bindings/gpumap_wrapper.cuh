@@ -16,11 +16,11 @@ public:
   using Data_t = float;
   using Idx_t = uint32_t;
 
-  gpumap::GPUMAPParams config;
+  gpumap::GPUMAPParams params;
   gpumap::GPUMAP model;
 
-  explicit GPUMAPWrapper(const gpumap::GPUMAPParams &config)
-      : config(config), model(config) {}
+  explicit GPUMAPWrapper(const gpumap::GPUMAPParams &params)
+      : params(params), model(params) {}
 
   void initialize(size_t n_instances, size_t n_features) {
     model.initialize(n_instances, n_features);
@@ -28,7 +28,7 @@ public:
 
   void append_data(py::array x) {
     auto v = binding_utils::require_numpy_2d_f32(x);
-    if (v.n_cols != config.n_features) {
+    if (v.n_cols != params.n_features) {
       throw std::runtime_error(
           "n_features mismatch with numpy array second dimension.");
     }

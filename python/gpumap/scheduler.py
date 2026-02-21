@@ -15,13 +15,15 @@ class Scheduler:
         raise NotImplementedError("Scheduler.set_embedding_weight() must be implemented by subclasses.")
 
 class DefaultScheduler(Scheduler):
-    def __init__(self, weights:list[float]=[1, 1, 1], reserved: float = 0.1):
+    def __init__(self, weights: list[float] | None = None, reserved: float = 0.1):
         super().__init__()
+        if weights is None:
+            weights = [1.0, 1.0, 1.0]
 
         if len(weights) != 3:
             raise ValueError("Weights must be a list of three floats.")
 
-        self.weights = weights
+        self.weights = list(weights)
         self.reserved = reserved
 
     def schedule(self, latency:float):
@@ -37,7 +39,6 @@ class DefaultScheduler(Scheduler):
 
     def set_embedding_weight(self, weight:float):
         self.weights[2] = weight
-
 
 
 

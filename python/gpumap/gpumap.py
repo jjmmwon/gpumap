@@ -11,18 +11,29 @@ from .scheduler import Scheduler, DefaultScheduler
 from .estimator import Estimator, DefaultLinearEstimator
 from .data_loader import DataLoader
 
+
 class GPUMAP:
-    def __init__(self, data_loader: DataLoader,
-                 config: _core.GPUMAPParams, scheduler: Scheduler = DefaultScheduler(),
-                 insertion_estimator: Estimator = DefaultLinearEstimator(),
-                 update_estimator: Estimator = DefaultLinearEstimator(),
-                 embedding_estimator: Estimator = DefaultLinearEstimator(),
-                 default_n_ops:int = 500):
+    def __init__(
+        self,
+        data_loader: DataLoader,
+        params: _core.GPUMAPParams,
+        scheduler: Scheduler = DefaultScheduler(),
+        insertion_estimator: Estimator = DefaultLinearEstimator(),
+        update_estimator: Estimator = DefaultLinearEstimator(),
+        embedding_estimator: Estimator = DefaultLinearEstimator(),
+        default_n_ops: int = 500,
+    ):
 
         self.data_loader = data_loader
-        self._config = config
+        self._params = params
         self.scheduler = scheduler
-        self._impl = _core.GPUMAP(self.config)
+        try:
+            self._impl = _core.GPUMAP(self.params)
+        except MemoryError:
+            # The first CUDA allocation via RAFT/RMM can transiently fail in
+            # some environments (e.g. WSL2) before the CUDA runtime is fully
+            # initialised. Retry once; it always succeeds on the second attempt.
+            self._impl = _core.GPUMAP(self.params)
         self._closed = False
 
         self.insertion_estimator = insertion_estimator
@@ -35,8 +46,8 @@ class GPUMAP:
         self._impl.initialize(self.data_loader.n_instances, self.data_loader.n_features)
 
     @property
-    def config(self) -> _core.GPUMAPParams:
-        return self._config
+    def params(self) -> _core.GPUMAPParams:
+        return self._params
 
     def close(self):
         if not self._closed:
@@ -44,11 +55,13 @@ class GPUMAP:
             self._impl.close()
             self._closed = True
 
-    def run_with_n_ops(self, n_insertion_ops: int, n_update_ops: int, n_embedding_ops: int) -> _core.GPUMAPIterationResult:
+    def run_with_n_ops(
+        self, n_insertion_ops: int, n_update_ops: int, n_embedding_ops: int
+    ) -> _core.GPUMAPIterationResult:
         if n_insertion_ops > 0:
             data_chunk = self.data_loader.get_next_chunk(n_insertion_ops)
             try:
-                validate_data_chunk(data_chunk, self._config.n_features)
+                validate_data_chunk(data_chunk, self._params.n_features)
                 data_chunk = _as_f32_c_contig_2d(data_chunk)
             except ValueError as e:
                 print(f"Error validating data chunk: {e}")
@@ -64,22 +77,28 @@ class GPUMAP:
         try:
             n_insertion_ops = self.insertion_estimator.estimate_ops(time_slices[0])
         except ValueError:
-            n_insertion_ops = self.default_n_ops + np.random.randint(-self.default_n_ops//10, self.default_n_ops//10)
+            n_insertion_ops = self.default_n_ops + np.random.randint(
+                -self.default_n_ops // 10, self.default_n_ops // 10
+            )
 
         try:
             n_update_ops = self.update_estimator.estimate_ops(time_slices[1])
         except ValueError:
-            n_update_ops = self.default_n_ops + np.random.randint(-self.default_n_ops//10, self.default_n_ops//10)
+            n_update_ops = self.default_n_ops + np.random.randint(
+                -self.default_n_ops // 10, self.default_n_ops // 10
+            )
 
         try:
             n_embedding_ops = self.embedding_estimator.estimate_ops(time_slices[2])
         except ValueError:
-            n_embedding_ops = self.default_n_ops + np.random.randint(-self.default_n_ops//10, self.default_n_ops//10)
+            n_embedding_ops = self.default_n_ops + np.random.randint(
+                -self.default_n_ops // 10, self.default_n_ops // 10
+            )
 
         if n_insertion_ops > 0:
             data_chunk = self.data_loader.get_next_chunk(n_insertion_ops)
             try:
-                validate_data_chunk(data_chunk, self._config.n_features)
+                validate_data_chunk(data_chunk, self._params.n_features)
                 data_chunk = _as_f32_c_contig_2d(data_chunk)
             except ValueError as e:
                 print(f"Error validating data chunk: {e}")
@@ -111,6 +130,3 @@ class GPUMAP:
     def get_neighbor_dists(self) -> cp.ndarray:
         neighbor_dists_view = cp.asarray(self._impl.get_neighbor_dists())
         return neighbor_dists_view
-
-
-
