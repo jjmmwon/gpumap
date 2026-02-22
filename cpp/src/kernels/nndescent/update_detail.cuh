@@ -129,8 +129,11 @@ __global__ void add_rev_edges_kernel(const Index_t *graph, Index_t *rev_graph,
         graph[list_id * num_samples +
               idx]; // index of idx-th neighbor of list_id in the original graph
 
-    if (rev_list_id ==
-        std::numeric_limits<Index_t>::max()) // skip invalid neighbors
+    const bool invalid_neighbor =
+        rev_list_id == std::numeric_limits<Index_t>::max() ||
+        static_cast<size_t>(rev_list_id) >= static_cast<size_t>(gridDim.x);
+
+    if (invalid_neighbor) // skip invalid neighbors
       continue;
 
     int idx_in_rev_list = atomicAdd(&list_sizes[rev_list_id].y, 1);
@@ -668,19 +671,22 @@ void UpdateAlgo<Data_t, Idx_t, Index_t>::sample_graph(bool sample_new) {
   }
 
 #pragma omp parallel for
+  for (size_t i = 0; i < n_inserted_instances_; ++i) {
+    buffers_.h_list_sizes_old.data_handle()[i].x = 0;
+    buffers_.h_list_sizes_old.data_handle()[i].y = 0;
+    buffers_.h_list_sizes_new.data_handle()[i].x = 0;
+    buffers_.h_list_sizes_new.data_handle()[i].y = 0;
+  }
+
+#pragma omp parallel for
   for (size_t i = 0; i < n_rows; ++i) {
     const size_t row = static_cast<size_t>(batch_indices_[i]);
 
-    buffers_.h_list_sizes_old.data_handle()[row].x = 0;
-    buffers_.h_list_sizes_old.data_handle()[row].y = 0;
-    buffers_.h_list_sizes_new.data_handle()[row].x = 0;
-    buffers_.h_list_sizes_new.data_handle()[row].y = 0;
-
-    auto list = buffers_.h_graph.data_handle() + row * MAX_NEIGHBORS;
+    auto list = buffers_.h_graph.data_handle() + row * n_neighbors_;
     auto list_old = buffers_.h_graph_old.data_handle() + row * NUM_SAMPLES;
     auto list_new = buffers_.h_graph_new.data_handle() + row * NUM_SAMPLES;
 
-    for (size_t j = 0; j < MAX_NEIGHBORS; ++j) {
+    for (size_t j = 0; j < n_neighbors_; ++j) {
       auto neighbor = list[j];
       if (static_cast<size_t>(neighbor.id()) >= n_inserted_instances_)
         continue;
@@ -725,7 +731,7 @@ void UpdateAlgo<Data_t, Idx_t, Index_t>::sample_graph_new() {
     auto list_new = buffers_.h_graph_new.data_handle() + row * NUM_SAMPLES;
 
     for (size_t j = 0; j < MAX_NEIGHBORS; ++j) {
-      const auto new_neighbor_id = new_neighbors[i * MAX_NEIGHBORS + j].id();
+      const auto new_neighbor_id = new_neighbors[row * MAX_NEIGHBORS + j].id();
       if (static_cast<size_t>(new_neighbor_id) >= n_inserted_instances_)
         break;
       if (buffers_.bloom_filter.check(row,
@@ -733,7 +739,7 @@ void UpdateAlgo<Data_t, Idx_t, Index_t>::sample_graph_new() {
         continue;
 
       buffers_.bloom_filter.add(row, static_cast<Index_t>(new_neighbor_id));
-      new_neighbors[i * MAX_NEIGHBORS + j].mark_old();
+      new_neighbors[row * MAX_NEIGHBORS + j].mark_old();
       list_new[buffers_.h_list_sizes_new.data_handle()[row].x++] =
           static_cast<Index_t>(new_neighbor_id);
 
@@ -750,7 +756,6 @@ void UpdateAlgo<Data_t, Idx_t, Index_t>::update_graph(
     std::atomic<int64_t> &update_counter) {
   const InternalID_t *new_neighbors = buffers_.graph_host_buffer_.data_handle();
   const Data_t *new_dists = buffers_.dists_host_buffer_.data_handle();
-  constexpr uint32_t k_internal_degree = MAX_NEIGHBORS;
   int64_t local_updates = 0;
 
 #pragma omp parallel for reduction(+ : local_updates)
@@ -765,23 +770,18 @@ void UpdateAlgo<Data_t, Idx_t, Index_t>::update_graph(
       if (neighbor.id() >= n_inserted_instances_ || (size_t)neighbor.id() == i)
         continue;
 
-      auto list = buffers_.graph_host_buffer_.data_handle() + i * MAX_NEIGHBORS;
-      auto dist_list =
-          buffers_.dists_host_buffer_.data_handle() + i * MAX_NEIGHBORS;
+      auto list = buffers_.h_graph.data_handle() + i * n_neighbors_;
+      auto dist_list = buffers_.h_dists.data_handle() + i * n_neighbors_;
       uint32_t insert_pos = insert_to_ordered_list(
-          list, dist_list, k_internal_degree, neighbor, new_dist);
+          list, dist_list, n_neighbors_, neighbor, new_dist);
 
-      if (insert_pos != k_internal_degree) {
+      if (insert_pos != n_neighbors_) {
         local_updates++;
-        const int dirty_state = (insert_pos < n_neighbors_)
-                                    ? DIRTY_NEIGHBOR_CHANGED
-                                    : DIRTY_LIST_CHANGED;
-        if (buffers_.h_dirty_flags_.data_handle()[i] < dirty_state) {
-          buffers_.h_dirty_flags_.data_handle()[i] = dirty_state;
-        }
+        buffers_.h_dirty_flags_.data_handle()[i] = DIRTY_NEIGHBOR_CHANGED;
       }
     }
   }
+  fprintf(stderr, "Local updates: %ld\n", local_updates);
   if (local_updates > 0) {
     update_counter.fetch_add(local_updates, std::memory_order_relaxed);
   }
@@ -789,29 +789,28 @@ void UpdateAlgo<Data_t, Idx_t, Index_t>::update_graph(
 
 template <typename Data_t, typename Idx_t, typename Index_t>
 void UpdateAlgo<Data_t, Idx_t, Index_t>::sort_lists() {
-  constexpr size_t k_internal_degree = MAX_NEIGHBORS;
+
 #pragma omp parallel for
   for (size_t i = 0; i < n_inserted_instances_; i++) {
     if (!buffers_.h_dirty_flags_.data_handle()[i]) {
       continue;
     }
     std::vector<std::pair<Data_t, Index_t>> sorted_list;
-    sorted_list.reserve(k_internal_degree);
+    sorted_list.reserve(n_neighbors_);
 
-    for (size_t j = 0; j < k_internal_degree; j++) {
+    for (size_t j = 0; j < n_neighbors_; j++) {
       sorted_list.emplace_back(
-          buffers_.dists_host_buffer_.data_handle()[i * MAX_NEIGHBORS + j],
+          buffers_.h_dists.data_handle()[i * n_neighbors_ + j],
           static_cast<Index_t>(
-              buffers_.graph_host_buffer_.data_handle()[i * MAX_NEIGHBORS + j]
-                  .id()));
+              buffers_.h_graph.data_handle()[i * n_neighbors_ + j].id()));
     }
 
     std::sort(sorted_list.begin(), sorted_list.end());
 
-    for (size_t j = 0; j < k_internal_degree; j++) {
-      buffers_.graph_host_buffer_.data_handle()[i * MAX_NEIGHBORS + j]
-          .id_with_flag() = static_cast<int>(sorted_list[j].second);
-      buffers_.dists_host_buffer_.data_handle()[i * MAX_NEIGHBORS + j] =
+    for (size_t j = 0; j < n_neighbors_; j++) {
+      buffers_.h_graph.data_handle()[i * n_neighbors_ + j].id_with_flag() =
+          static_cast<int>(sorted_list[j].second);
+      buffers_.h_dists.data_handle()[i * n_neighbors_ + j] =
           sorted_list[j].first;
     }
     buffers_.h_dirty_flags_.data_handle()[i] = DIRTY_NONE;
@@ -860,12 +859,15 @@ void UpdateAlgo<Data_t, Idx_t, Index_t>::run(
 
   const raft::resources res_;
   raft::resource::set_cuda_stream(res_, stream);
+
+  update_counter_ = 0;
+
   std::vector<int> d_dirty_flags_host(n_inserted_instances_, 0);
   std::vector<Idx_t> neighbor_changed_indices;
 
-  update_counter_ = 0;
   std::fill_n(buffers_.h_dirty_flags_.data_handle(), n_inserted_instances_,
               DIRTY_NONE);
+
   raft::copy(buffers_.d_dirty_flags_.data_handle(),
              buffers_.h_dirty_flags_.data_handle(), n_inserted_instances_,
              stream);
@@ -902,7 +904,7 @@ void UpdateAlgo<Data_t, Idx_t, Index_t>::run(
 
     raft::resource::sync_stream(res_);
 
-    std::thread update_and_sample_thread(update_and_sample, iter);
+    std::thread update_and_sample_thread(update_and_sample, iter > 0);
 
     RAFT_LOG_DEBUG("# GNND iteraton: %lu / %lu", iter + 1, max_iter_);
 
@@ -922,6 +924,9 @@ void UpdateAlgo<Data_t, Idx_t, Index_t>::run(
     local_join(stream);
 
     update_and_sample_thread.join();
+
+    fprintf(stderr, "Finish iteration %lu with update_counter = %ld\n", iter,
+            update_counter_.load());
 
     if (update_counter_ == -1) {
       break;
@@ -960,10 +965,8 @@ void UpdateAlgo<Data_t, Idx_t, Index_t>::run(
     std::vector<Idx_t> h_neighbor_row(n_neighbors_);
     for (auto row_id : neighbor_changed_indices) {
       const size_t row = static_cast<size_t>(row_id);
-      auto row_graph =
-          buffers_.graph_host_buffer_.data_handle() + row * MAX_NEIGHBORS;
-      auto row_dists =
-          buffers_.dists_host_buffer_.data_handle() + row * MAX_NEIGHBORS;
+      auto row_graph = buffers_.h_graph.data_handle() + row * n_neighbors_;
+      auto row_dists = buffers_.h_dists.data_handle() + row * n_neighbors_;
 
       for (size_t j = 0; j < n_neighbors_; ++j) {
         const int id = row_graph[j].id();

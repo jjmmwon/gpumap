@@ -228,10 +228,27 @@ template <typename Data_t, typename Index_t = int> struct NNDBuffers {
   uint32_t n_neighbors;
 
   raft::device_vector<Data_t, size_t> l2_norms_;
+
+  // Working KNN graph on the GPU used throughout NND. Each row holds up to
+  // MAX_NEIGHBORS entries stored as InternalID_t, which encodes the neighbor
+  // id and a new/old flag in the sign bit (non-negative = new, negative = old).
+  // Written by initialize_random_neighbors_kernel, forward_nndescent_kernel,
+  // and local_join_kernel; read by sample_forward_candidates_kernel and
+  // initialize_embeddings_kernel. Mirrored to graph_host_buffer_ after each
+  // NND iteration.
   raft::device_matrix<InternalID_t, size_t, raft::row_major> graph_buffer_;
+  // Distances corresponding to graph_buffer_. Always updated in lockstep with
+  // graph_buffer_.
   raft::device_matrix<Data_t, size_t, raft::row_major> dists_buffer_;
+
+  // Device buffer for candidate neighbors during insertion.
   raft::device_matrix<int, size_t, raft::row_major> candidate_buffer_;
 
+  // Pinned (page-locked) CPU mirrors of graph_buffer_ and dists_buffer_.
+  // After each NND iteration, graph_buffer_/dists_buffer_ are copied here so
+  // the CPU can run update_graph() and sort_lists() concurrently with the next
+  // GPU local_join. Also used by sample_graph_new() to sample new neighbors
+  // from the latest GPU results. Pinned allocation ensures fast DMA transfers.
   raft::pinned_matrix<InternalID_t, size_t> graph_host_buffer_;
   raft::pinned_matrix<Data_t, size_t> dists_host_buffer_;
 
@@ -239,20 +256,52 @@ template <typename Data_t, typename Index_t = int> struct NNDBuffers {
   raft::device_vector<int, size_t> d_dirty_flags_;
   raft::pinned_vector<int, size_t> h_dirty_flags_;
 
+  // Pinned buffers passed directly to local_join_kernel as kernel arguments.
+  // h_rev_graph_new_: reverse edges of the new-neighbor sample for the current
+  //   iteration. Built on GPU by add_rev_edges_kernel, then copied here so the
+  //   kernel can read them via zero-copy from device code.
+  // h_graph_old_: copy of h_graph_old (the old-neighbor sample) transferred
+  //   here each iteration so local_join_kernel can access it while the CPU
+  //   thread simultaneously refills h_graph_old for the next iteration.
+  // h_rev_graph_old_: reverse edges of the old-neighbor sample, built the same
+  //   way as h_rev_graph_new_.
   raft::pinned_matrix<Index_t, size_t> h_rev_graph_new_;
   raft::pinned_matrix<Index_t, size_t> h_graph_old_;
   raft::pinned_matrix<Index_t, size_t> h_rev_graph_old_;
 
+  // Per-node sampled list sizes for the current NND iteration, stored on GPU.
+  // int2::x = number of forward edges in the sample (filled by sample_graph).
+  // int2::y = number of reverse edges added by add_rev_edges_kernel.
+  // Copied from h_list_sizes_new / h_list_sizes_old before each local_join,
+  // then passed to add_rev_edges_kernel (which increments .y atomically) and
+  // to local_join_kernel (which reads both fields to bound loop iterations).
   raft::device_vector<int2, size_t> d_list_sizes_new_;
   raft::device_vector<int2, size_t> d_list_sizes_old_;
 
+  // CPU-only authoritative graph maintained across all NND iterations.
+  // Stores InternalID_t so the new/old flag survives across calls to
+  // sample_graph(), which reads each entry's flag to classify it as new or old
+  // and calls mark_old() on new entries in-place. Not used for GPU transfers.
   raft::host_matrix<InternalID_t, size_t> h_graph;
+  // Distances corresponding to h_graph.
   raft::host_matrix<Data_t, size_t> h_dists;
+
+  // Pinned buffer holding the "new" neighbor sample for the current iteration.
+  // Filled by sample_graph() / sample_graph_new() (up to NUM_SAMPLES entries
+  // per node). Passed directly to local_join_kernel as a kernel argument and
+  // to add_reverse_edges() to build h_rev_graph_new_. int2::x of
+  // h_list_sizes_new records the number of valid entries.
   raft::pinned_matrix<Index_t, size_t> h_graph_new;
   raft::pinned_vector<int2, size_t> h_list_sizes_new;
 
+  // Pinned buffer holding the "old" neighbor sample for the current iteration.
+  // Filled by sample_graph() from h_graph entries whose new/old flag is old.
+  // At the start of each iteration, copied into h_graph_old_ (which is passed
+  // to local_join_kernel) so the CPU thread can refill h_graph_old for the
+  // next iteration in parallel with the running GPU kernel.
   raft::pinned_matrix<Index_t, size_t> h_graph_old;
   raft::pinned_vector<int2, size_t> h_list_sizes_old;
+
   BloomFilter<Index_t> bloom_filter;
 };
 

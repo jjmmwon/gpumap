@@ -178,7 +178,7 @@ struct GPUMAP::Impl {
         storage.n_instances, storage.n_features, storage.n_neighbors,
         storage.n_inserted_instances,
 
-        /*max_iter=*/30,
+        /*max_iter=*/2,
         /*termination_threshold=*/0.001f, /*seed=*/42);
 
     embedding_queue.push_batch(affected_edges);

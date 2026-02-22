@@ -580,6 +580,8 @@ void InsertionAlgo<Data_t, Idx_t, Index_t>::run(
 
   auto *graph_host = buffers_.graph_host_buffer_.data_handle();
   auto *graph_dev = buffers_.graph_buffer_.data_handle();
+  auto *dists_host = buffers_.dists_host_buffer_.data_handle();
+  auto *dists_dev = buffers_.dists_buffer_.data_handle();
   for (size_t iter = 0; iter < max_iter_; ++iter) {
     sample_forward_candidates(stream);
     RAFT_CUDA_TRY(cudaStreamSynchronize(stream));
@@ -591,7 +593,22 @@ void InsertionAlgo<Data_t, Idx_t, Index_t>::run(
   raft::copy(graph_host + batch_start_offset * MAX_NEIGHBORS,
              graph_dev + batch_start_offset * MAX_NEIGHBORS,
              n_rows * MAX_NEIGHBORS, stream);
+  raft::copy(dists_host + batch_start_offset * MAX_NEIGHBORS,
+             dists_dev + batch_start_offset * MAX_NEIGHBORS,
+             n_rows * MAX_NEIGHBORS, stream);
   RAFT_CUDA_TRY(cudaStreamSynchronize(stream));
+
+  for (size_t i = 0; i < n_rows; ++i) {
+    const size_t row = batch_start_offset + i;
+    auto *dst_graph = buffers_.h_graph.data_handle() + row * n_neighbors_;
+    auto *dst_dists = buffers_.h_dists.data_handle() + row * n_neighbors_;
+    const auto *src_graph = graph_host + row * MAX_NEIGHBORS;
+    const auto *src_dists = dists_host + row * MAX_NEIGHBORS;
+    for (size_t j = 0; j < n_neighbors_; ++j) {
+      dst_graph[j] = src_graph[j];
+      dst_dists[j] = src_dists[j];
+    }
+  }
 
   write_new_neighbors_info(stream);
 
