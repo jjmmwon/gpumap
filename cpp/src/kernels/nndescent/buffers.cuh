@@ -52,19 +52,31 @@ public:
   }
 
   bool check(size_t list_id, Index_t key) const {
+    if (list_id >= n_instances_) {
+      return false;
+    }
     bool is_present = true;
     uint32_t hash = hash0(static_cast<uint32_t>(key));
-    size_t global_set_idx = list_id * num_sets_per_list_ +
-                            (static_cast<size_t>(key) % num_sets_per_list_);
+    const size_t global_set_idx =
+        list_id * num_bits_per_set_ * num_sets_per_list_ +
+        (static_cast<size_t>(key) % num_sets_per_list_) * num_bits_per_set_;
+    const size_t first_idx = global_set_idx + (hash % num_bits_per_set_);
+    if (first_idx >= bitsets_.size()) {
+      return false;
+    }
 
-    is_present &= bitsets_[global_set_idx + hash % num_bits_per_set_];
+    is_present &= bitsets_[first_idx];
 
     if (!is_present)
       return false;
 
     for (size_t i = 1; i < num_hashes_; ++i) {
       hash = hash + hash1(static_cast<uint32_t>(key));
-      is_present &= bitsets_[global_set_idx + hash % num_bits_per_set_];
+      const size_t idx = global_set_idx + (hash % num_bits_per_set_);
+      if (idx >= bitsets_.size()) {
+        return false;
+      }
+      is_present &= bitsets_[idx];
       if (!is_present)
         return false;
     }
@@ -72,6 +84,9 @@ public:
   }
 
   void add(size_t list_id, Index_t key) {
+    if (list_id >= n_instances_) {
+      return;
+    }
     if (is_cleared_)
       is_cleared_ = false;
 
@@ -81,15 +96,23 @@ public:
         list_id * num_bits_per_set_ * num_sets_per_list_ +
         (k % num_sets_per_list_) * num_bits_per_set_;
 
-    bitsets_[global_set_idx + (hash % num_bits_per_set_)] = 1;
+    const size_t first_idx = global_set_idx + (hash % num_bits_per_set_);
+    if (first_idx >= bitsets_.size()) {
+      return;
+    }
+    bitsets_[first_idx] = 1;
     for (size_t i = 1; i < num_hashes_; ++i) {
       hash = hash + hash1(k);
-      bitsets_[global_set_idx + (hash % num_bits_per_set_)] = 1;
+      const size_t idx = global_set_idx + (hash % num_bits_per_set_);
+      if (idx >= bitsets_.size()) {
+        return;
+      }
+      bitsets_[idx] = 1;
     }
   }
 
 private:
-  uint32_t hash0(uint32_t value) {
+  static uint32_t hash0(uint32_t value) {
     value *= 1103515245;
     value += 12345;
     value ^= value << 13;
@@ -98,7 +121,7 @@ private:
     return value;
   }
 
-  uint32_t hash1(uint32_t value) {
+  static uint32_t hash1(uint32_t value) {
     value *= 1664525;
     value += 1013904223;
     value ^= value << 13;

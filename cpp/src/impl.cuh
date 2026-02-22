@@ -1,8 +1,11 @@
 #pragma once
 
 #include "gpumap/gpumap.cuh"
+
 #include "kernels/embedding_kernel.cuh"
 #include "kernels/insertion_kernel.cuh"
+#include "kernels/update_kernel.cuh"
+
 #include "queue.cuh"
 #include "raft/core/device_mdspan.hpp"
 #include "storage.cuh"
@@ -71,15 +74,26 @@ struct GPUMAP::Impl {
   GPUMAPResult run(size_t n_insertion_ops, size_t n_update_ops,
                    size_t n_embedding_ops) {
     GPUMAPResult result{};
+    fprintf(
+        stderr,
+        "[GPUMAP] run() start: insert=%zu update=%zu embed=%zu inserted=%u\n",
+        n_insertion_ops, n_update_ops, n_embedding_ops,
+        storage.n_inserted_instances);
+    fflush(stderr);
 
     if (!insertion_queue.size()) {
       result.insertion_completed = true;
       result.n_insertion_ops = 0;
       result.insertion_time = 0.0f;
     } else {
+      fprintf(stderr, "[GPUMAP] starting insert(%zu), queue size=%zu\n",
+              n_insertion_ops, insertion_queue.size());
+      fflush(stderr);
       auto start = clock::now();
       insert(n_insertion_ops);
       cudaStreamSynchronize(insertion_stream);
+      fprintf(stderr, "[GPUMAP] insert done\n");
+      fflush(stderr);
       auto end = clock::now();
 
       result.insertion_completed = false;
@@ -94,13 +108,15 @@ struct GPUMAP::Impl {
       auto start = clock::now();
       update(n_update_ops);
       cudaStreamSynchronize(update_stream);
+      fprintf(stderr, "[GPUMAP] update done\n");
+      fflush(stderr);
       auto end = clock::now();
 
       result.n_update_ops = n_update_ops;
       result.update_time = std::chrono::duration<float>(end - start).count();
     }
 
-    if (!embedding_queue.size()) {
+    if (n_embedding_ops == 0 || !embedding_queue.size()) {
       result.n_embedding_ops = 0;
       result.embedding_time = 0.0f;
     } else {
@@ -152,11 +168,18 @@ struct GPUMAP::Impl {
     std::vector<Idx_t> batch_indices = update_queue.pop_n(n_ops);
     std::vector<gpumap::Edge> affected_edges;
 
-    // run_update_kernel(
-    //     batch_indices, &update_stream, &embedding_stream,
-    //     affected_edges); // batch_indices의 이웃들을 다시
-    //                      // 업데이트하고, 그 이웃들을 affected_edges에 추가
-    // affected_indices = batch_indices의 이웃을 unique
+    update_kernel<Data_t, Idx_t>(
+        storage.nnd_buffer, batch_indices, affected_edges, update_stream,
+
+        storage.data.data(), storage.neighbor_indices.data(),
+        storage.neighbor_dists.data(), storage.data_block_size,
+        storage.neighbor_indices_block_size, storage.neighbor_dists_block_size,
+
+        storage.n_instances, storage.n_features, storage.n_neighbors,
+        storage.n_inserted_instances,
+
+        /*max_iter=*/30,
+        /*termination_threshold=*/0.001f, /*seed=*/42);
 
     embedding_queue.push_batch(affected_edges);
   }

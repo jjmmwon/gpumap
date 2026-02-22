@@ -104,9 +104,7 @@ template <typename Data_t = float, typename Idx_t = uint32_t> struct Storage {
         data(0, rmm::cuda_stream_default),
         neighbor_indices(0, rmm::cuda_stream_default),
         neighbor_dists(0, rmm::cuda_stream_default),
-        embedding(0, rmm::cuda_stream_default),
-        cuda_warmup(),
-        raft_res(),
+        embedding(0, rmm::cuda_stream_default), cuda_warmup(), raft_res(),
         nnd_buffer(raft_res, n_instances_, n_neighbors_) {
     allocate_matrices();
   }

@@ -43,7 +43,7 @@ public:
   void sample_forward_candidates(cudaStream_t const stream);
   void forward_nndescent(cudaStream_t const stream);
   void write_new_neighbors_info(cudaStream_t const stream);
-  void initialize_embeddings();
+  void initialize_embeddings(cudaStream_t const stream);
 
 private:
   NNDBuffers<Data_t, int> &buffers_;

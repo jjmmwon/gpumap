@@ -2,6 +2,7 @@
 
 #include "buffers.cuh"
 #include "update.cuh"
+#include <cstdio>
 
 #if defined(__clang__) && defined(__CUDA__)
 #include <__clang_cuda_builtin_vars.h>
@@ -510,7 +511,7 @@ local_join_kernel(const Index_t *graph_new, Index_t *rev_graph_new,
     __syncthreads();
   }
 
-  for (int i = 0; threadIdx.x < MAX_NUM_BI_SAMPLES * SKEWED_MAX_NUM_BI_SAMPLES;
+  for (int i = threadIdx.x; i < MAX_NUM_BI_SAMPLES * SKEWED_MAX_NUM_BI_SAMPLES;
        i += blockDim.x) {
     int r = i / SKEWED_MAX_NUM_BI_SAMPLES;
     int c = i % SKEWED_MAX_NUM_BI_SAMPLES;
@@ -675,7 +676,7 @@ void UpdateAlgo<Data_t, Idx_t, Index_t>::sample_graph(bool sample_new) {
     buffers_.h_list_sizes_new.data_handle()[row].x = 0;
     buffers_.h_list_sizes_new.data_handle()[row].y = 0;
 
-    auto list = buffers_.graph_host_buffer_.data_handle() + row * MAX_NEIGHBORS;
+    auto list = buffers_.h_graph.data_handle() + row * MAX_NEIGHBORS;
     auto list_old = buffers_.h_graph_old.data_handle() + row * NUM_SAMPLES;
     auto list_new = buffers_.h_graph_new.data_handle() + row * NUM_SAMPLES;
 
@@ -823,11 +824,10 @@ void UpdateAlgo<Data_t, Idx_t, Index_t>::local_join(cudaStream_t const stream) {
       buffers_.h_graph_new.data_handle(),
       buffers_.h_rev_graph_new_.data_handle(),
       buffers_.d_list_sizes_new_.data_handle(),
-      buffers_.h_graph_old.data_handle(),
+      buffers_.h_graph_old_.data_handle(),
       buffers_.h_rev_graph_old_.data_handle(),
       buffers_.d_list_sizes_old_.data_handle(), NUM_SAMPLES, input_data,
-      n_features_, buffers_.data_block_size_,
-      buffers_.graph_buffer_.data_handle(),
+      n_features_, data_block_size_, buffers_.graph_buffer_.data_handle(),
       buffers_.dists_buffer_.data_handle(), MAX_NEIGHBORS,
       buffers_.d_locks_.data_handle(), buffers_.d_dirty_flags_.data_handle(),
       n_neighbors_);
@@ -840,10 +840,11 @@ void UpdateAlgo<Data_t, Idx_t, Index_t>::add_reverse_edges(
   raft::resources res_;
   raft::resource::set_cuda_stream(res_, stream);
 
-  raft::matrix::fill(res_,
-                     raft::make_device_matrix_view(
-                         d_rev_graph_ptr, n_inserted_instances_, MAX_NEIGHBORS),
-                     std::numeric_limits<Index_t>::max());
+  raft::matrix::fill(
+      res_,
+      raft::make_device_matrix_view(d_rev_graph_ptr, n_inserted_instances_,
+                                    static_cast<uint32_t>(MAX_NEIGHBORS)),
+      std::numeric_limits<Index_t>::max());
 
   add_rev_edges_kernel<<<n_inserted_instances_, 256, 0, stream>>>(
       graph_ptr, d_rev_graph_ptr, NUM_SAMPLES, list_sizes);
@@ -853,8 +854,10 @@ void UpdateAlgo<Data_t, Idx_t, Index_t>::add_reverse_edges(
 }
 
 template <typename Data_t, typename Idx_t, typename Index_t>
-std::vector<Idx_t>
-UpdateAlgo<Data_t, Idx_t, Index_t>::run(cudaStream_t stream) {
+void UpdateAlgo<Data_t, Idx_t, Index_t>::run(
+    cudaStream_t stream,
+    std::vector<std::tuple<Idx_t, Idx_t, Idx_t>> &affected_edges) {
+
   const raft::resources res_;
   raft::resource::set_cuda_stream(res_, stream);
   std::vector<int> d_dirty_flags_host(n_inserted_instances_, 0);
@@ -867,6 +870,9 @@ UpdateAlgo<Data_t, Idx_t, Index_t>::run(cudaStream_t stream) {
              buffers_.h_dirty_flags_.data_handle(), n_inserted_instances_,
              stream);
   raft::resource::sync_stream(res_);
+
+  fprintf(stderr, "Start sampling graph\n");
+  fflush(stderr);
 
   sample_graph(true);
 
@@ -900,6 +906,8 @@ UpdateAlgo<Data_t, Idx_t, Index_t>::run(cudaStream_t stream) {
 
     RAFT_LOG_DEBUG("# GNND iteraton: %lu / %lu", iter + 1, max_iter_);
 
+    fprintf(stderr, "Start adding reverse edges at iteration %lu\n", iter);
+    fflush(stderr);
     add_reverse_edges(buffers_.h_graph_new.data_handle(),
                       buffers_.h_rev_graph_new_.data_handle(),
                       (Index_t *)buffers_.dists_buffer_.data_handle(),
@@ -909,6 +917,8 @@ UpdateAlgo<Data_t, Idx_t, Index_t>::run(cudaStream_t stream) {
                       (Index_t *)buffers_.dists_buffer_.data_handle(),
                       buffers_.d_list_sizes_old_.data_handle(), stream);
 
+    fprintf(stderr, "Start local join at iteration %lu\n", iter);
+    fflush(stderr);
     local_join(stream);
 
     update_and_sample_thread.join();
@@ -924,6 +934,8 @@ UpdateAlgo<Data_t, Idx_t, Index_t>::run(cudaStream_t stream) {
                n_inserted_instances_ * MAX_NEIGHBORS, stream);
     raft::resource::sync_stream(res_);
 
+    fprintf(stderr, "Start sample_graph_new\n");
+    fflush(stderr);
     sample_graph_new();
   }
 
@@ -961,6 +973,13 @@ UpdateAlgo<Data_t, Idx_t, Index_t>::run(cudaStream_t stream) {
                 : std::numeric_limits<Idx_t>::max();
       }
 
+      for (size_t j = 0; j < n_neighbors_; ++j) {
+        if (h_neighbor_row[j] != std::numeric_limits<Idx_t>::max()) {
+          affected_edges.emplace_back(row_id, h_neighbor_row[j],
+                                      static_cast<Idx_t>(0));
+        }
+      }
+
       raft::copy(neighbor_indices + row * neighbor_indices_block_size_,
                  h_neighbor_row.data(), n_neighbors_, stream);
       raft::copy(neighbor_distances + row * neighbor_dists_block_size_,
@@ -968,8 +987,6 @@ UpdateAlgo<Data_t, Idx_t, Index_t>::run(cudaStream_t stream) {
     }
     raft::resource::sync_stream(res_);
   }
-
-  return neighbor_changed_indices;
 }
 
 } // namespace gpumap::nndescent

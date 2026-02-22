@@ -35,15 +35,6 @@ void insertion_kernel(nndescent::NNDBuffers<Data_t, int> &buffers,
   runner.run(insertion_stream, affected_indices, new_edges);
 
   RAFT_CUDA_TRY(cudaStreamSynchronize(insertion_stream));
-
-  // init_embedding<Data_t,
-  //                Idx_t>( // embedding을 batch_indices의 이웃의
-  //                        // 평균으로 초기화 하고 distances를 기반으로
-  //                        // simplicial set embedding 업데이트
-  //     embedding, neighbor_indices, neighbor_distances, n_start, n_end,
-  //     neighbor_indices_block_size, n_neighbors, n_inserted_instances,
-  //     n_features, batch_indices, affected_indices, new_edges,
-  //     insertion_stream);
 }
 
 } // namespace gpumap

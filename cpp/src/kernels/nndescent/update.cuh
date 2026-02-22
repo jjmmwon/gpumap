@@ -20,8 +20,9 @@ public:
              Data_t *input_data, Idx_t *neighbor_indices,
              Data_t *neighbor_distances, uint32_t data_block_size,
              uint32_t neighbor_indices_block_size,
-             uint32_t neighbor_dists_block_size, uint32_t n_instances,
-             uint32_t n_features, uint32_t n_neighbors,
+             uint32_t neighbor_dists_block_size,
+
+             uint32_t n_instances, uint32_t n_features, uint32_t n_neighbors,
              uint32_t n_inserted_instances, uint32_t max_iter = 30,
              float termination_threshold = 0.001f)
       : buffers_(buffers), update_counter_{0},
@@ -37,7 +38,8 @@ public:
         n_neighbors_(n_neighbors), n_inserted_instances_(n_inserted_instances),
         max_iter_(max_iter), termination_threshold_(termination_threshold) {}
 
-  std::vector<Idx_t> run(cudaStream_t const stream);
+  void run(cudaStream_t const stream,
+           std::vector<std::tuple<Idx_t, Idx_t, Idx_t>> &affected_edges);
   void local_join(cudaStream_t const stream);
   void add_reverse_edges(Index_t *graph_ptr, Index_t *h_rev_graph_ptr,
                          Index_t *d_rev_graph_ptr, int2 *list_sizes,
