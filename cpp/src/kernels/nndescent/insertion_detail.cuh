@@ -175,7 +175,7 @@ __global__ __forceinline__ void sample_forward_candidates_kernel(
 
     const Index_t neighbor_id = static_cast<Index_t>(neighbor_id_raw.id());
 
-    const InternalID_t *neigh2 =
+    InternalID_t *neigh2 =
         graph_buffer + static_cast<size_t>(neighbor_id) * graph_width;
 
     for (uint32_t k = 0; k < n_neighbors && candidate_count < candidate_width;
@@ -202,7 +202,7 @@ __global__ __forceinline__ void sample_forward_candidates_kernel(
         continue;
       }
       my_candidates[candidate_count++] = static_cast<int>(candidate_id);
-      candidate_id_raw.mark_old();
+      neigh2[k].mark_old();
     }
   }
 }
@@ -527,19 +527,41 @@ void InsertionAlgo<Data_t, Idx_t, Index_t>::write_new_neighbors_info(
   }
   size_t n_rows = batch_indices_.size();
   size_t batch_start_offset = batch_indices_.front();
-  auto *graph_dev = buffers_.graph_buffer_.data_handle();
-  auto *dists_dev = buffers_.dists_buffer_.data_handle();
+  const auto *graph_host = buffers_.graph_host_buffer_.data_handle();
+  const auto *dists_host = buffers_.dists_host_buffer_.data_handle();
+  std::vector<Idx_t> h_neighbor_row(n_neighbors_);
+  std::vector<Data_t> h_dist_row(n_neighbors_);
+  const Idx_t dirty_flag_one = static_cast<Idx_t>(1);
+  const Data_t sigma_init = static_cast<Data_t>(1);
 
   for (size_t i = 0; i < n_rows; ++i) {
     const size_t row = batch_start_offset + i;
+    const auto *src_graph = graph_host + row * MAX_NEIGHBORS;
+    const auto *src_dists = dists_host + row * MAX_NEIGHBORS;
+
+    for (size_t j = 0; j < n_neighbors_; ++j) {
+      const int nid = src_graph[j].id();
+      const bool valid_id =
+          (nid >= 0 && static_cast<size_t>(nid) < n_inserted_instances_) &&
+          (static_cast<size_t>(nid) != row);
+      h_neighbor_row[j] = valid_id ? static_cast<Idx_t>(nid)
+                                   : std::numeric_limits<Idx_t>::max();
+      h_dist_row[j] =
+          valid_id ? src_dists[j] : std::numeric_limits<Data_t>::max();
+    }
 
     raft::copy(neighbor_indices + row * neighbor_indices_block_size_,
-               reinterpret_cast<Idx_t *>(graph_dev + row * MAX_NEIGHBORS),
-               neighbor_indices_block_size_, stream);
+               h_neighbor_row.data(), n_neighbors_, stream);
 
     raft::copy(neighbor_distances + row * neighbor_dists_block_size_,
-               dists_dev + row * MAX_NEIGHBORS, neighbor_dists_block_size_,
-               stream);
+               h_dist_row.data(), n_neighbors_, stream);
+
+    raft::copy(neighbor_indices + row * neighbor_indices_block_size_ +
+                   (neighbor_indices_block_size_ - 1),
+               &dirty_flag_one, 1, stream);
+    raft::copy(neighbor_distances + row * neighbor_dists_block_size_ +
+                   (neighbor_dists_block_size_ - 1),
+               &sigma_init, 1, stream);
   }
 
   RAFT_CUDA_TRY(cudaStreamSynchronize(stream));

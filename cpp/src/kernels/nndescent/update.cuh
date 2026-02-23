@@ -1,6 +1,7 @@
 #pragma once
 
 #include "buffers.cuh"
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <utility>
@@ -36,7 +37,12 @@ public:
 
         n_instances_(n_instances), n_features_(n_features),
         n_neighbors_(n_neighbors), n_inserted_instances_(n_inserted_instances),
-        max_iter_(max_iter), termination_threshold_(termination_threshold) {}
+        max_iter_(max_iter), termination_threshold_(termination_threshold) {
+    std::sort(batch_indices_.begin(), batch_indices_.end());
+    batch_indices_.erase(
+        std::unique(batch_indices_.begin(), batch_indices_.end()),
+        batch_indices_.end());
+  }
 
   void run(cudaStream_t const stream,
            std::vector<std::tuple<Idx_t, Idx_t, Idx_t>> &affected_edges);

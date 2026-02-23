@@ -166,6 +166,11 @@ load_vec(Data_t *vec_buffer, const Data_t *d_vec, const int load_dims,
   }
 }
 
+template <typename Index_t>
+__device__ __forceinline__ bool is_valid_list_id(Index_t id, int n_lists) {
+  return id >= 0 && static_cast<size_t>(id) < static_cast<size_t>(n_lists);
+}
+
 // Extract a single bit at position pos from lane_id using PTX bfe.u32
 // instruction.
 __device__ __forceinline__ uint bfe(uint lane_id, uint pos) {
@@ -267,7 +272,8 @@ remove_duplicates(Index_t *list_a, int size_a, Index_t *list_b, int size_b,
 template <typename Index_t>
 __device__ ResultItem<Index_t>
 get_min_item(const Index_t id, const int idx_in_list, const Index_t *neighbs,
-             const float *distances, const bool find_in_row = true) {
+             const int neighb_count, const float *distances,
+             const bool find_in_row = true) {
   int lane_id = threadIdx.x % raft::warp_size();
 
   static_assert(MAX_NUM_BI_SAMPLES == 64);
@@ -279,14 +285,14 @@ get_min_item(const Index_t id, const int idx_in_list, const Index_t *neighbs,
   idx[0] = lane_id;
   idx[1] = raft::warp_size() + lane_id;
 
-  if (neighbs[idx[0]] != id) {
+  if (idx[0] < neighb_count && neighbs[idx[0]] != id) {
     dist[0] =
         find_in_row
             ? distances[idx_in_list * SKEWED_MAX_NUM_BI_SAMPLES + lane_id]
             : distances[idx_in_list + lane_id * SKEWED_MAX_NUM_BI_SAMPLES];
   }
 
-  if (neighbs[idx[1]] != id) {
+  if (idx[1] < neighb_count && neighbs[idx[1]] != id) {
     dist[1] = find_in_row
                   ? distances[idx_in_list * SKEWED_MAX_NUM_BI_SAMPLES +
                               raft::warp_size() + lane_id]
@@ -314,8 +320,10 @@ get_min_item(const Index_t id, const int idx_in_list, const Index_t *neighbs,
   ResultItem<Index_t> result;
 
   result.dist() = __shfl_sync(raft::warp_full_mask(), dist[0], 0);
-  result.id_with_flag() =
-      neighbs[__shfl_sync(raft::warp_full_mask(), idx[0], 0)];
+  const int winner_idx = __shfl_sync(raft::warp_full_mask(), idx[0], 0);
+  result.id_with_flag() = (winner_idx >= 0 && winner_idx < neighb_count)
+                              ? neighbs[winner_idx]
+                              : std::numeric_limits<Index_t>::max();
 
   return result;
 }
@@ -432,17 +440,29 @@ local_join_kernel(const Index_t *graph_new, Index_t *rev_graph_new,
   int tx = threadIdx.x;
 
   if (tx < list_new_size2.x) {
-    new_neighbors[tx] = graph_new[list_id * width + tx];
+    const Index_t nid = graph_new[list_id * width + tx];
+    new_neighbors[tx] = is_valid_list_id(nid, gridDim.x)
+                            ? nid
+                            : std::numeric_limits<Index_t>::max();
   } else if (tx < list_new_size) {
-    new_neighbors[tx] =
+    const Index_t nid =
         rev_graph_new[list_id * width + (tx - list_new_size2.x)];
+    new_neighbors[tx] = is_valid_list_id(nid, gridDim.x)
+                            ? nid
+                            : std::numeric_limits<Index_t>::max();
   }
 
   if (tx < list_old_size2.x) {
-    old_neighbors[tx] = graph_old[list_id * width + tx];
+    const Index_t nid = graph_old[list_id * width + tx];
+    old_neighbors[tx] = is_valid_list_id(nid, gridDim.x)
+                            ? nid
+                            : std::numeric_limits<Index_t>::max();
   } else if (tx < list_old_size) {
-    old_neighbors[tx] =
+    const Index_t nid =
         rev_graph_old[list_id * width + (tx - list_old_size2.x)];
+    old_neighbors[tx] = is_valid_list_id(nid, gridDim.x)
+                            ? nid
+                            : std::numeric_limits<Index_t>::max();
   }
 
   __syncthreads();
@@ -488,11 +508,13 @@ local_join_kernel(const Index_t *graph_new, Index_t *rev_graph_new,
     for (int i = 0; i < MAX_NUM_BI_SAMPLES; i++) {
       int idx = i * num_warps + warp_id;
       if (idx < list_new_size) {
-        size_t nid = (size_t)new_neighbors[idx];
-        size_t offset = nid * (size_t)data_block_size + (size_t)base;
-
-        load_vec(s_nv[idx], data + offset, num_load_elems, TILE_COL_WIDTH,
-                 lane_id);
+        const Index_t nid = new_neighbors[idx];
+        if (is_valid_list_id(nid, gridDim.x)) {
+          size_t offset =
+              static_cast<size_t>(nid) * (size_t)data_block_size + (size_t)base;
+          load_vec(s_nv[idx], data + offset, num_load_elems, TILE_COL_WIDTH,
+                   lane_id);
+        }
       }
     }
     __syncthreads();
@@ -501,7 +523,9 @@ local_join_kernel(const Index_t *graph_new, Index_t *rev_graph_new,
       int r = i / SKEWED_MAX_NUM_BI_SAMPLES;
       int c = i % SKEWED_MAX_NUM_BI_SAMPLES;
 
-      if (r < list_new_size && c < list_new_size) {
+      if (r < list_new_size && c < list_new_size &&
+          is_valid_list_id(new_neighbors[r], gridDim.x) &&
+          is_valid_list_id(new_neighbors[c], gridDim.x)) {
         float acc = 0.0f;
 #pragma unroll
         for (int d = 0; d < TILE_COL_WIDTH; ++d) {
@@ -519,7 +543,9 @@ local_join_kernel(const Index_t *graph_new, Index_t *rev_graph_new,
     int r = i / SKEWED_MAX_NUM_BI_SAMPLES;
     int c = i % SKEWED_MAX_NUM_BI_SAMPLES;
 
-    if (r < list_new_size && c < list_new_size) {
+    if (r < list_new_size && c < list_new_size &&
+        is_valid_list_id(new_neighbors[r], gridDim.x) &&
+        is_valid_list_id(new_neighbors[c], gridDim.x)) {
       Index_t a = new_neighbors[r];
       Index_t b = new_neighbors[c];
 
@@ -538,12 +564,16 @@ local_join_kernel(const Index_t *graph_new, Index_t *rev_graph_new,
     if (idx_in_list >= list_new_size)
       continue;
 
-    auto min_elem = get_min_item(s_list[idx_in_list], idx_in_list,
-                                 new_neighbors, s_distances);
-    if (min_elem.id() < gridDim.x) {
-      insert_to_global_graph(min_elem, s_list[idx_in_list], graph, dists,
-                             graph_width, locks, dirty_flags,
-                             n_output_neighbors);
+    const Index_t src_id = new_neighbors[idx_in_list];
+    if (!is_valid_list_id(src_id, gridDim.x)) {
+      continue;
+    }
+
+    auto min_elem = get_min_item(src_id, idx_in_list, new_neighbors,
+                                 list_new_size, s_distances);
+    if (is_valid_list_id(min_elem.id(), gridDim.x)) {
+      insert_to_global_graph(min_elem, src_id, graph, dists, graph_width, locks,
+                             dirty_flags, n_output_neighbors);
     }
   }
 
@@ -567,10 +597,13 @@ local_join_kernel(const Index_t *graph_new, Index_t *rev_graph_new,
     for (int i = 0; i < MAX_NUM_BI_SAMPLES / num_warps; i++) {
       int idx = i * num_warps + warp_id;
       if (idx < list_new_size) {
-        size_t nid = (size_t)new_neighbors[idx];
-        size_t offset = nid * (size_t)data_block_size + (size_t)base;
-        load_vec(s_nv[idx], data + offset, num_load_elems, TILE_COL_WIDTH,
-                 lane_id);
+        const Index_t nid = new_neighbors[idx];
+        if (is_valid_list_id(nid, gridDim.x)) {
+          size_t offset =
+              static_cast<size_t>(nid) * (size_t)data_block_size + (size_t)base;
+          load_vec(s_nv[idx], data + offset, num_load_elems, TILE_COL_WIDTH,
+                   lane_id);
+        }
       }
     }
 
@@ -578,10 +611,13 @@ local_join_kernel(const Index_t *graph_new, Index_t *rev_graph_new,
     for (int i = 0; i < MAX_NUM_BI_SAMPLES / num_warps; i++) {
       int idx = i * num_warps + warp_id;
       if (idx < list_old_size) {
-        size_t nid = (size_t)old_neighbors[idx];
-        size_t offset = nid * (size_t)data_block_size + (size_t)base;
-        load_vec(s_ov[idx], data + offset, num_load_elems, TILE_COL_WIDTH,
-                 lane_id);
+        const Index_t nid = old_neighbors[idx];
+        if (is_valid_list_id(nid, gridDim.x)) {
+          size_t offset =
+              static_cast<size_t>(nid) * (size_t)data_block_size + (size_t)base;
+          load_vec(s_ov[idx], data + offset, num_load_elems, TILE_COL_WIDTH,
+                   lane_id);
+        }
       }
     }
 
@@ -591,7 +627,9 @@ local_join_kernel(const Index_t *graph_new, Index_t *rev_graph_new,
          i < MAX_NUM_BI_SAMPLES * SKEWED_MAX_NUM_BI_SAMPLES; i += blockDim.x) {
       int r = i / SKEWED_MAX_NUM_BI_SAMPLES;
       int c = i % SKEWED_MAX_NUM_BI_SAMPLES;
-      if (r < list_new_size && c < list_old_size) {
+      if (r < list_new_size && c < list_old_size &&
+          is_valid_list_id(new_neighbors[r], gridDim.x) &&
+          is_valid_list_id(old_neighbors[c], gridDim.x)) {
         float acc = 0.0f;
 #pragma unroll
         for (int d = 0; d < TILE_COL_WIDTH; ++d) {
@@ -610,7 +648,9 @@ local_join_kernel(const Index_t *graph_new, Index_t *rev_graph_new,
     int r = i / SKEWED_MAX_NUM_BI_SAMPLES;
     int c = i % SKEWED_MAX_NUM_BI_SAMPLES;
 
-    if (r < list_new_size && c < list_old_size) {
+    if (r < list_new_size && c < list_old_size &&
+        is_valid_list_id(new_neighbors[r], gridDim.x) &&
+        is_valid_list_id(old_neighbors[c], gridDim.x)) {
       Index_t a = new_neighbors[r];
       Index_t b = old_neighbors[c];
 
@@ -632,27 +672,34 @@ local_join_kernel(const Index_t *graph_new, Index_t *rev_graph_new,
         idx_in_list < MAX_NUM_BI_SAMPLES * 2)
       continue;
 
+    const bool is_new_side = idx_in_list < MAX_NUM_BI_SAMPLES;
+    const int src_local_idx =
+        is_new_side ? idx_in_list : (idx_in_list - MAX_NUM_BI_SAMPLES);
+    const Index_t src_id = is_new_side ? new_neighbors[src_local_idx]
+                                       : old_neighbors[src_local_idx];
+    if (!is_valid_list_id(src_id, gridDim.x)) {
+      continue;
+    }
+
     ResultItem<Index_t> min_elem{std::numeric_limits<Index_t>::max(),
                                  std::numeric_limits<float>::max()};
-    if (idx_in_list < MAX_NUM_BI_SAMPLES) {
-      auto temp_min_item = get_min_item(s_list[idx_in_list], idx_in_list,
-                                        old_neighbors, s_distances, true);
+    if (is_new_side) {
+      auto temp_min_item = get_min_item(src_id, src_local_idx, old_neighbors,
+                                        list_old_size, s_distances, true);
       if (temp_min_item.dist() < min_elem.dist()) {
         min_elem = temp_min_item;
       }
     } else {
-      auto temp_min_item = get_min_item(
-          s_list[idx_in_list - MAX_NUM_BI_SAMPLES],
-          idx_in_list - MAX_NUM_BI_SAMPLES, new_neighbors, s_distances, false);
+      auto temp_min_item = get_min_item(src_id, src_local_idx, new_neighbors,
+                                        list_new_size, s_distances, false);
       if (temp_min_item.dist() < min_elem.dist()) {
         min_elem = temp_min_item;
       }
     }
 
-    if (min_elem.id() < gridDim.x) {
-      insert_to_global_graph(min_elem, s_list[idx_in_list % MAX_NUM_BI_SAMPLES],
-                             graph, dists, graph_width, locks, dirty_flags,
-                             n_output_neighbors);
+    if (is_valid_list_id(min_elem.id(), gridDim.x)) {
+      insert_to_global_graph(min_elem, src_id, graph, dists, graph_width, locks,
+                             dirty_flags, n_output_neighbors);
     }
   }
 }
@@ -663,11 +710,11 @@ void UpdateAlgo<Data_t, Idx_t, Index_t>::sample_graph(bool sample_new) {
 
   std::fill_n(buffers_.h_graph_old.data_handle(),
               n_inserted_instances_ * NUM_SAMPLES,
-              std::numeric_limits<Idx_t>::max());
+              std::numeric_limits<Index_t>::max());
   if (sample_new) {
     std::fill_n(buffers_.h_graph_new.data_handle(),
                 n_inserted_instances_ * NUM_SAMPLES,
-                std::numeric_limits<Idx_t>::max());
+                std::numeric_limits<Index_t>::max());
   }
 
 #pragma omp parallel for
@@ -781,7 +828,7 @@ void UpdateAlgo<Data_t, Idx_t, Index_t>::update_graph(
       }
     }
   }
-  fprintf(stderr, "Local updates: %ld\n", local_updates);
+
   if (local_updates > 0) {
     update_counter.fetch_add(local_updates, std::memory_order_relaxed);
   }
@@ -842,7 +889,7 @@ void UpdateAlgo<Data_t, Idx_t, Index_t>::add_reverse_edges(
   raft::matrix::fill(
       res_,
       raft::make_device_matrix_view(d_rev_graph_ptr, n_inserted_instances_,
-                                    static_cast<uint32_t>(MAX_NEIGHBORS)),
+                                    static_cast<uint32_t>(NUM_SAMPLES)),
       std::numeric_limits<Index_t>::max());
 
   add_rev_edges_kernel<<<n_inserted_instances_, 256, 0, stream>>>(
@@ -912,11 +959,11 @@ void UpdateAlgo<Data_t, Idx_t, Index_t>::run(
     fflush(stderr);
     add_reverse_edges(buffers_.h_graph_new.data_handle(),
                       buffers_.h_rev_graph_new_.data_handle(),
-                      (Index_t *)buffers_.dists_buffer_.data_handle(),
+                      buffers_.d_rev_graph_buffer_.data_handle(),
                       buffers_.d_list_sizes_new_.data_handle(), stream);
     add_reverse_edges(buffers_.h_graph_old_.data_handle(),
                       buffers_.h_rev_graph_old_.data_handle(),
-                      (Index_t *)buffers_.dists_buffer_.data_handle(),
+                      buffers_.d_rev_graph_buffer_.data_handle(),
                       buffers_.d_list_sizes_old_.data_handle(), stream);
 
     fprintf(stderr, "Start local join at iteration %lu\n", iter);
@@ -928,9 +975,9 @@ void UpdateAlgo<Data_t, Idx_t, Index_t>::run(
     fprintf(stderr, "Finish iteration %lu with update_counter = %ld\n", iter,
             update_counter_.load());
 
-    if (update_counter_ == -1) {
-      break;
-    }
+    // if (update_counter_ == -1) {
+    //   break;
+    // }
     raft::copy(buffers_.graph_host_buffer_.data_handle(),
                buffers_.graph_buffer_.data_handle(),
                n_inserted_instances_ * MAX_NEIGHBORS, stream);
@@ -963,6 +1010,8 @@ void UpdateAlgo<Data_t, Idx_t, Index_t>::run(
 
   if (neighbor_indices != nullptr && neighbor_distances != nullptr) {
     std::vector<Idx_t> h_neighbor_row(n_neighbors_);
+    std::vector<Data_t> h_dist_row(n_neighbors_);
+    const Idx_t dirty_flag_one = static_cast<Idx_t>(1);
     for (auto row_id : neighbor_changed_indices) {
       const size_t row = static_cast<size_t>(row_id);
       auto row_graph = buffers_.h_graph.data_handle() + row * n_neighbors_;
@@ -970,10 +1019,13 @@ void UpdateAlgo<Data_t, Idx_t, Index_t>::run(
 
       for (size_t j = 0; j < n_neighbors_; ++j) {
         const int id = row_graph[j].id();
-        h_neighbor_row[j] =
-            (id >= 0 && static_cast<size_t>(id) < n_inserted_instances_)
-                ? static_cast<Idx_t>(id)
-                : std::numeric_limits<Idx_t>::max();
+        const bool valid_id =
+            (id >= 0 && static_cast<size_t>(id) < n_inserted_instances_) &&
+            (static_cast<size_t>(id) != row);
+        h_neighbor_row[j] = valid_id ? static_cast<Idx_t>(id)
+                                     : std::numeric_limits<Idx_t>::max();
+        h_dist_row[j] =
+            valid_id ? row_dists[j] : std::numeric_limits<Data_t>::max();
       }
 
       for (size_t j = 0; j < n_neighbors_; ++j) {
@@ -986,7 +1038,10 @@ void UpdateAlgo<Data_t, Idx_t, Index_t>::run(
       raft::copy(neighbor_indices + row * neighbor_indices_block_size_,
                  h_neighbor_row.data(), n_neighbors_, stream);
       raft::copy(neighbor_distances + row * neighbor_dists_block_size_,
-                 row_dists, n_neighbors_, stream);
+                 h_dist_row.data(), n_neighbors_, stream);
+      raft::copy(neighbor_indices + row * neighbor_indices_block_size_ +
+                     (neighbor_indices_block_size_ - 1),
+                 &dirty_flag_one, 1, stream);
     }
     raft::resource::sync_stream(res_);
   }

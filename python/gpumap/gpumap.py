@@ -125,8 +125,8 @@ class GPUMAP:
 
     def get_neighbor_indices(self) -> cp.ndarray:
         neighbor_indices_view = cp.asarray(self._impl.get_neighbor_indices())
-        return neighbor_indices_view
+        return neighbor_indices_view[:, : self._params.n_neighbors]
 
     def get_neighbor_dists(self) -> cp.ndarray:
         neighbor_dists_view = cp.asarray(self._impl.get_neighbor_dists())
-        return neighbor_dists_view
+        return neighbor_dists_view[:, : self._params.n_neighbors]

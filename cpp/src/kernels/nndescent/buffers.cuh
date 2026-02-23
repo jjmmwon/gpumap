@@ -179,6 +179,9 @@ template <typename Data_t, typename Index_t = int> struct NNDBuffers {
                 res, n_instances, MAX_NEIGHBORS)},
         dists_buffer_{raft::make_device_matrix<Data_t, size_t, raft::row_major>(
             res, n_instances, MAX_NEIGHBORS)},
+        d_rev_graph_buffer_{
+            raft::make_device_matrix<Index_t, size_t, raft::row_major>(
+                res, n_instances, NUM_SAMPLES)},
 
         /// buffers used for storing candidates during insertion.
         candidate_buffer_{
@@ -240,6 +243,9 @@ template <typename Data_t, typename Index_t = int> struct NNDBuffers {
   // Distances corresponding to graph_buffer_. Always updated in lockstep with
   // graph_buffer_.
   raft::device_matrix<Data_t, size_t, raft::row_major> dists_buffer_;
+  // Scratch device buffer used by add_reverse_edges() so reverse-edge
+  // construction never aliases dists_buffer_.
+  raft::device_matrix<Index_t, size_t, raft::row_major> d_rev_graph_buffer_;
 
   // Device buffer for candidate neighbors during insertion.
   raft::device_matrix<int, size_t, raft::row_major> candidate_buffer_;

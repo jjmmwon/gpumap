@@ -2,6 +2,7 @@
 
 #include "nndescent/buffers.cuh"
 #include "nndescent/update_detail.cuh"
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <sys/types.h>
@@ -30,6 +31,14 @@ void update_kernel(
     size_t seed = 42
 
 ) {
+  if (batch_indices.empty()) {
+    return;
+  }
+
+  std::sort(batch_indices.begin(), batch_indices.end());
+  batch_indices.erase(std::unique(batch_indices.begin(), batch_indices.end()),
+                      batch_indices.end());
+
   raft::resources res;
   raft::resource::set_cuda_stream(res, update_stream);
 
@@ -39,9 +48,6 @@ void update_kernel(
       n_instances, n_features, n_neighbors, n_inserted_instances, max_iter,
       termination_threshold);
 
-  fprintf(stderr, "[GPUMAP] starting update, queue size=%zu\n",
-          batch_indices.size());
-  fflush(stderr);
   updater.run(update_stream, affected_edges);
 
   // neighbor_changed_indices를 embedding_queue에 추가
