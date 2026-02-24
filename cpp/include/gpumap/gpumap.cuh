@@ -14,9 +14,8 @@ struct GPUMAPParams {
   size_t n_neighbors = 15;
   size_t n_components = 2;
   float min_dist = 0.1f;
-  size_t n_epochs = 200;
   size_t negative_sample_rate = 5;
-  size_t max_epoch = 10;
+  size_t max_epoch = 200;
   float a = 1.0f;
   float b = 1.0f;
   float alpha = 1.0f;

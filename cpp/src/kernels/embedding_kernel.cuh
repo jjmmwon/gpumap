@@ -1,5 +1,6 @@
 #pragma once
 
+// #include <__clang_cuda_runtime_wrapper.h>
 #include <cmath>
 #include <cstddef>
 #include <cuda_runtime.h>
@@ -217,11 +218,12 @@ void update_sigma_for_dirty(const Idx_t *indices, size_t n_indices,
 template <typename Data_t, typename Idx_t>
 __global__ void update_embeddings_kernel(
     const Idx_t *__restrict__ srcs, const Idx_t *__restrict__ dsts,
-    size_t n_edges, Data_t *__restrict__ embedding, int n_components,
+    const size_t *__restrict__ epochs, size_t n_edges,
+    Data_t *__restrict__ embedding, int n_components,
     size_t n_inserted_instances, const Idx_t *__restrict__ neighbor_indices,
     size_t neighbor_indices_block_size,
     const Data_t *__restrict__ neighbor_dists, size_t neighbor_dists_block_size,
-    size_t n_neighbors, float a, float b, float alpha,
+    size_t n_neighbors, float a, float b, float alpha, size_t max_epoch,
     size_t negative_sample_rate, unsigned long long seed) {
 
   const size_t tid = static_cast<size_t>(blockIdx.x * blockDim.x + threadIdx.x);
@@ -231,6 +233,7 @@ __global__ void update_embeddings_kernel(
 
   const Idx_t src = srcs[tid];
   const Idx_t dst = dsts[tid];
+  const size_t epoch = epochs[tid];
   if (src >= n_inserted_instances || dst >= n_inserted_instances) {
     return;
   }
@@ -274,7 +277,11 @@ __global__ void update_embeddings_kernel(
   const Data_t r2b = powf(r2, b);
   const Data_t gpos =
       Data_t{2} * a * b * powf(r2, b - Data_t{1}) / (Data_t{1} + a * r2b);
-  const Data_t coeff = alpha * w_ij * gpos;
+  const Data_t decayed_alpha = (1.0f - (float)epoch / max_epoch) * alpha;
+  const Data_t coeff = max(min(w_ij * gpos, 4.0), -4.0) * decayed_alpha;
+
+  // embedding[src_offset] = 0;
+  // embedding[dst_offset] = 0;
 
   atomicAdd(&embedding[src_offset], -coeff * dx);
   atomicAdd(&embedding[src_offset + 1], -coeff * dy);
@@ -282,7 +289,7 @@ __global__ void update_embeddings_kernel(
   atomicAdd(&embedding[dst_offset + 1], coeff * dy);
 
   unsigned long long rng =
-      seed ^ (static_cast<unsigned long long>(src) * 73856093ULL) ^
+      (epoch + 1) ^ (static_cast<unsigned long long>(src) * 73856093ULL) ^
       (static_cast<unsigned long long>(dst) * 19349663ULL) ^
       (static_cast<unsigned long long>(tid) * 83492791ULL);
 
@@ -299,24 +306,24 @@ __global__ void update_embeddings_kernel(
     const Data_t nr2 = ndx * ndx + ndy * ndy + Data_t{1e-6f};
     const Data_t nr2b = powf(nr2, b);
     const Data_t gneg = (Data_t{2} * b) / ((Data_t{1} + a * nr2b) * nr2);
-    const Data_t ncoeff = alpha * gneg;
+    const Data_t ncoeff = max(min(gneg, 4.0), -4.0) * decayed_alpha;
 
     atomicAdd(&embedding[src_offset], ncoeff * ndx);
     atomicAdd(&embedding[src_offset + 1], ncoeff * ndy);
-    atomicAdd(&embedding[neg_offset], -ncoeff * ndx);
-    atomicAdd(&embedding[neg_offset + 1], -ncoeff * ndy);
+    // atomicAdd(&embedding[neg_offset], -ncoeff * ndx);
+    // atomicAdd(&embedding[neg_offset + 1], -ncoeff * ndy);
   }
 }
 
 template <typename Data_t, typename Idx_t>
-void update_embeddings(const Idx_t *srcs, const Idx_t *dsts, size_t n_edges,
-                       Data_t *embedding, int n_components,
-                       size_t n_inserted_instances,
+void update_embeddings(const Idx_t *srcs, const Idx_t *dsts,
+                       const size_t *epochs, size_t n_edges, Data_t *embedding,
+                       int n_components, size_t n_inserted_instances,
                        const Idx_t *neighbor_indices,
                        size_t neighbor_indices_block_size,
                        const Data_t *neighbor_dists,
                        size_t neighbor_dists_block_size, size_t n_neighbors,
-                       float a, float b, float alpha,
+                       float a, float b, float alpha, size_t max_epoch,
                        size_t negative_sample_rate, cudaStream_t stream) {
 
   if (n_edges == 0) {
@@ -329,10 +336,10 @@ void update_embeddings(const Idx_t *srcs, const Idx_t *dsts, size_t n_edges,
   const unsigned long long seed = 42ULL;
   update_embeddings_kernel<Data_t, Idx_t>
       <<<blocks, threads_per_block, 0, stream>>>(
-          srcs, dsts, n_edges, embedding, n_components, n_inserted_instances,
-          neighbor_indices, neighbor_indices_block_size, neighbor_dists,
-          neighbor_dists_block_size, n_neighbors, a, b, alpha,
-          negative_sample_rate, seed);
+          srcs, dsts, epochs, n_edges, embedding, n_components,
+          n_inserted_instances, neighbor_indices, neighbor_indices_block_size,
+          neighbor_dists, neighbor_dists_block_size, n_neighbors, a, b, alpha,
+          max_epoch, negative_sample_rate, seed);
 }
 
 } // namespace gpumap

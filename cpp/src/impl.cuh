@@ -12,6 +12,8 @@
 #include "utils/matrix_utils.cuh"
 #include <algorithm>
 #include <csignal>
+#include <cstdio>
+#include <random>
 #include <rmm/cuda_stream_view.hpp>
 #include <rmm/device_scalar.hpp>
 
@@ -103,7 +105,8 @@ struct GPUMAP::Impl {
       result.n_insertion_ops = n_insertion_ops;
       result.insertion_time = std::chrono::duration<float>(end - start).count();
     }
-
+    fprintf(stderr, "[GPUMAP] update queue size=%zu\n", update_queue.size());
+    fflush(stderr);
     if (n_update_ops == 0 || !update_queue.size()) {
       result.n_update_ops = 0;
       result.update_time = 0.0f;
@@ -118,6 +121,10 @@ struct GPUMAP::Impl {
       result.n_update_ops = n_update_ops;
       result.update_time = std::chrono::duration<float>(end - start).count();
     }
+
+    fprintf(stderr, "[GPUMAP] embedding queue size=%zu\n",
+            embedding_queue.size());
+    fflush(stderr);
 
     if (n_embedding_ops == 0 || !embedding_queue.size()) {
       result.n_embedding_ops = 0;
@@ -157,11 +164,12 @@ struct GPUMAP::Impl {
         storage.n_inserted_instances, affected_indices, new_edges,
         insertion_stream);
 
-    if (!first_insertion) {
-      update_queue.push_batch(affected_indices);
-    } else {
-      first_insertion = false;
-    }
+    // if (!first_insertion) {
+    //   update_queue.push_batch(affected_indices);
+    // } else {
+    //   first_insertion = false;
+    // }
+    update_queue.push_batch(affected_indices);
     embedding_queue.push_batch(new_edges);
 
     return batch_indices.size();
@@ -171,8 +179,8 @@ struct GPUMAP::Impl {
     if (!update_queue.size() || n_ops == 0) {
       return;
     }
-
     std::vector<Idx_t> batch_indices = update_queue.pop_n(n_ops);
+
     std::vector<gpumap::Edge> affected_edges;
 
     update_kernel<Data_t, Idx_t>(
@@ -197,6 +205,10 @@ struct GPUMAP::Impl {
 
     // 먼저 n_ops 개수만큼 엣지를 빼자
     std::vector<gpumap::Edge> batch_edges = embedding_queue.pop_n(n_ops);
+
+    // shufle batch_edges
+    std::shuffle(batch_edges.begin(), batch_edges.end(),
+                 std::default_random_engine(42));
 
     // src, dst, epoch 리스트를 만든다. h for host
     std::vector<Idx_t> h_srcs, h_dsts;
@@ -280,6 +292,8 @@ struct GPUMAP::Impl {
     unique_indices.erase(
         std::unique(unique_indices.begin(), unique_indices.end()),
         unique_indices.end());
+    fprintf(stderr, "[GPUMAP] unique indices count=%zu\n",
+            unique_indices.size());
 
     // 남은 엣지들 중에서 dirty한 녀석들을 보고 dirty하다면 sigma_i를
     // 업데이트해준다.
@@ -296,12 +310,13 @@ struct GPUMAP::Impl {
         storage.n_neighbors, embedding_stream);
 
     update_embeddings<Data_t, Idx_t>(
-        d_out_srcs.data(), d_out_dsts.data(), h_out_count,
+        d_out_srcs.data(), d_out_dsts.data(), d_out_epochs.data(), h_out_count,
         storage.embedding.data(), params.n_components,
         storage.n_inserted_instances, storage.neighbor_indices.data(),
         storage.neighbor_indices_block_size, storage.neighbor_dists.data(),
         storage.neighbor_dists_block_size, storage.n_neighbors, params.a,
-        params.b, params.alpha, params.negative_sample_rate, embedding_stream);
+        params.b, params.alpha, params.max_epoch, params.negative_sample_rate,
+        embedding_stream);
 
     std::vector<gpumap::Edge> requeue_edges;
     requeue_edges.reserve(h_out_count);
@@ -315,21 +330,6 @@ struct GPUMAP::Impl {
     if (!requeue_edges.empty()) {
       embedding_queue.push_batch(requeue_edges);
     }
-
-    // 남은것
-    // 1) epoch을 보면서 임베딩 업데이트
-    // 2) epoch이 max_epoch보다 크면 걔네는 죽이는거 관리 (큐에서 빼는거)
-    // 3) negative sampling 처리
-
-    // embedding_queue로부터 최대 n_ops 의 에지를 하나 씩 뺀다.
-    // 이를 e라고 하면,
-    // 무르익은 것 처리 (에폭과 넥스트에폭을 관리))
-    // e = (start, end, weight, current_epoch, target_epoch)
-    // e.start, e.end보고 이게 여전히 e.end \in nn[e.start]인지 확인 아니면 버림
-    // current_epoch < target_epoch 이면 current_epoch += 1 다시 뒤로
-    // e.start, e.end를 업데이트 + 네거티브 n회
-    // current_epoch +=1, target_epoch += edge weight이 반비례하는 값
-    // max_epoch으로 영원히 죽이는 것관리
   }
 
   void close() {

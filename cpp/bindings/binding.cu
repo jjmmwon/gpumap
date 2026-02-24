@@ -10,19 +10,17 @@ namespace py = pybind11;
 PYBIND11_MODULE(_core, m) {
   m.doc() = "gpumap CUDA extension module";
 
-
   py::class_<gpumap::GPUMAPParams>(m, "GPUMAPParams")
       .def(py::init<>())
       .def_readwrite("n_neighbors", &gpumap::GPUMAPParams::n_neighbors)
       .def_readwrite("n_components", &gpumap::GPUMAPParams::n_components)
       .def_readwrite("min_dist", &gpumap::GPUMAPParams::min_dist)
-      .def_readwrite("n_epochs", &gpumap::GPUMAPParams::n_epochs)
       .def_readwrite("negative_sample_rate",
                      &gpumap::GPUMAPParams::negative_sample_rate)
-    .def_readwrite("max_epoch", &gpumap::GPUMAPParams::max_epoch)
-    .def_readwrite("a", &gpumap::GPUMAPParams::a)
-    .def_readwrite("b", &gpumap::GPUMAPParams::b)
-    .def_readwrite("alpha", &gpumap::GPUMAPParams::alpha)
+      .def_readwrite("max_epoch", &gpumap::GPUMAPParams::max_epoch)
+      .def_readwrite("a", &gpumap::GPUMAPParams::a)
+      .def_readwrite("b", &gpumap::GPUMAPParams::b)
+      .def_readwrite("alpha", &gpumap::GPUMAPParams::alpha)
       .def_readwrite("verbose", &gpumap::GPUMAPParams::verbose)
       .def_readwrite("n_instances", &gpumap::GPUMAPParams::n_instances)
       .def_readwrite("n_features", &gpumap::GPUMAPParams::n_features);
@@ -39,7 +37,8 @@ PYBIND11_MODULE(_core, m) {
 
   py::class_<GPUMAPWrapper>(m, "GPUMAP")
       .def(py::init<const gpumap::GPUMAPParams &>(), py::arg("config"))
-      .def("initialize", &GPUMAPWrapper::initialize, py::arg("n_instances"), py::arg("n_features"))
+      .def("initialize", &GPUMAPWrapper::initialize, py::arg("n_instances"),
+           py::arg("n_features"))
       .def("append_data", &GPUMAPWrapper::append_data, py::arg("x"))
       .def("run", &GPUMAPWrapper::run, py::arg("n_jobs_insertion"),
            py::arg("n_jobs_update"), py::arg("n_jobs_embedding"))
