@@ -17,10 +17,9 @@ void insertion_kernel(nndescent::NNDBuffers<Data_t, int> &buffers,
 
                       uint32_t data_block_size,
                       uint32_t neighbor_indices_block_size,
-                      uint32_t neighbor_dists_block_size,
-                      uint32_t embedding_block_size, uint32_t n_instances,
-                      uint32_t n_features, uint32_t n_neighbors,
-                      uint32_t n_inserted_instances,
+                      uint32_t neighbor_dists_block_size, uint32_t n_components,
+                      uint32_t n_instances, uint32_t n_features,
+                      uint32_t n_neighbors, uint32_t n_inserted_instances,
                       std::vector<Idx_t> &affected_indices,
                       std::vector<std::tuple<Idx_t, Idx_t, Idx_t>> &new_edges,
                       cudaStream_t insertion_stream, size_t seed = 42) {
@@ -28,7 +27,7 @@ void insertion_kernel(nndescent::NNDBuffers<Data_t, int> &buffers,
   nndescent::InsertionAlgo<Data_t, Idx_t> runner(
       buffers, batch_indices, input_data, neighbor_indices, neighbor_distances,
       embedding, data_block_size, neighbor_indices_block_size,
-      neighbor_dists_block_size, embedding_block_size, n_instances, n_features,
+      neighbor_dists_block_size, n_components, n_instances, n_features,
       n_neighbors, n_inserted_instances, /*max_iter=*/20,
       /*termination_threshold=*/0.001f, seed);
 

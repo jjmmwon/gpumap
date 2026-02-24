@@ -20,9 +20,8 @@ public:
                 Data_t *input_data, Idx_t *neighbor_indices,
                 Data_t *neighbor_distances, Data_t *embedding,
                 uint32_t data_block_size, uint32_t neighbor_indices_block_size,
-                uint32_t neighbor_dists_block_size,
-                uint32_t embedding_block_size, uint32_t n_instances,
-                uint32_t n_features, uint32_t n_neighbors,
+                uint32_t neighbor_dists_block_size, uint32_t n_components,
+                uint32_t n_instances, uint32_t n_features, uint32_t n_neighbors,
                 uint32_t n_inserted_instances, uint32_t max_iter = 30,
                 float termination_threshold = 0.001f, size_t seed = 42)
       : buffers_(buffers), batch_indices_(std::move(batch_indices)),
@@ -31,7 +30,7 @@ public:
         data_block_size_(data_block_size),
         neighbor_indices_block_size_(neighbor_indices_block_size),
         neighbor_dists_block_size_(neighbor_dists_block_size),
-        embedding_block_size_(embedding_block_size), n_instances_(n_instances),
+        n_components_(n_components), n_instances_(n_instances),
         n_features_(n_features), n_neighbors_(n_neighbors),
         n_inserted_instances_(n_inserted_instances), max_iter_(max_iter),
         termination_threshold_(termination_threshold), seed_(seed) {}
@@ -62,7 +61,7 @@ private:
   uint32_t data_block_size_;
   uint32_t neighbor_indices_block_size_;
   uint32_t neighbor_dists_block_size_;
-  uint32_t embedding_block_size_;
+  uint32_t n_components_;
 
   uint32_t n_instances_;
   uint32_t n_features_;

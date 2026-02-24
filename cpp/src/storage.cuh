@@ -74,7 +74,6 @@ template <typename Data_t = float, typename Idx_t = uint32_t> struct Storage {
                                        rmm::cuda_stream_default);
 
     neighbor_indices_block_size = n_neighbors + 1;
-    // * 2 for storing candidates
     // + 1 for storing whether an instance is dirty or not (for kernel size
     // computation)
 
@@ -82,7 +81,6 @@ template <typename Data_t = float, typename Idx_t = uint32_t> struct Storage {
         n_instances * neighbor_indices_block_size, rmm::cuda_stream_default);
 
     neighbor_dists_block_size = n_neighbors + 1;
-    // * 2 for storing candidates
     // + 1 for storing sigma_i
 
     neighbor_dists = rmm::device_uvector<Data_t>(

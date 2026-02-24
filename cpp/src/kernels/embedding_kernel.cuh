@@ -1,13 +1,14 @@
 #pragma once
 
-#include <cuda_runtime.h>
-#include <cstddef>
 #include <cmath>
+#include <cstddef>
+#include <cuda_runtime.h>
 
 namespace gpumap {
 
 template <typename Idx_t>
-__device__ __forceinline__ bool is_neighbor(const Idx_t *neighbors, size_t n_neighbors, Idx_t dst) {
+__device__ __forceinline__ bool is_neighbor(const Idx_t *neighbors,
+                                            size_t n_neighbors, Idx_t dst) {
   for (int i = 0; i < (int)n_neighbors; ++i) {
     if (neighbors[i] == dst) {
       return true;
@@ -17,9 +18,10 @@ __device__ __forceinline__ bool is_neighbor(const Idx_t *neighbors, size_t n_nei
 }
 
 template <typename Idx_t, typename Data_t>
-__device__ __forceinline__ Data_t find_neighbor_dist(
-    const Idx_t *neighbors, const Data_t *dists, size_t n_neighbors,
-    Idx_t dst, bool *found) {
+__device__ __forceinline__ Data_t find_neighbor_dist(const Idx_t *neighbors,
+                                                     const Data_t *dists,
+                                                     size_t n_neighbors,
+                                                     Idx_t dst, bool *found) {
   for (size_t i = 0; i < n_neighbors; ++i) {
     if (neighbors[i] == dst) {
       *found = true;
@@ -31,8 +33,9 @@ __device__ __forceinline__ Data_t find_neighbor_dist(
 }
 
 template <typename Data_t>
-__device__ __forceinline__ Data_t smooth_knn_sigma(
-    const Data_t *dists, size_t n_neighbors, Data_t rho, float local_connectivity = 1.0f) {
+__device__ __forceinline__ Data_t
+smooth_knn_sigma(const Data_t *dists, size_t n_neighbors, Data_t rho,
+                 float local_connectivity = 1.0f) {
 
   const float target = log2f(static_cast<float>(n_neighbors));
   Data_t lo = 0.0f;
@@ -72,11 +75,10 @@ __device__ __forceinline__ Data_t smooth_knn_sigma(
 template <typename Idx_t>
 __global__ void filter_edges_by_neighbors_kernel(
     const Idx_t *__restrict__ srcs, const Idx_t *__restrict__ dsts,
-    Idx_t *__restrict__ out_srcs, Idx_t *__restrict__ out_dsts,
-    size_t n_edges, const Idx_t *__restrict__ neighbor_indices,
-    size_t neighbor_indices_block_size,
-        size_t n_neighbors,
-        unsigned long long *__restrict__ out_count) {
+    Idx_t *__restrict__ out_srcs, Idx_t *__restrict__ out_dsts, size_t n_edges,
+    const Idx_t *__restrict__ neighbor_indices,
+    size_t neighbor_indices_block_size, size_t n_neighbors,
+    unsigned long long *__restrict__ out_count) {
 
   const size_t tid = static_cast<size_t>(blockIdx.x * blockDim.x + threadIdx.x);
   if (tid >= n_edges) {
@@ -85,7 +87,8 @@ __global__ void filter_edges_by_neighbors_kernel(
 
   const Idx_t src = srcs[tid];
   const Idx_t dst = dsts[tid];
-  const Idx_t *my_neighbors = neighbor_indices + src * neighbor_indices_block_size;
+  const Idx_t *my_neighbors =
+      neighbor_indices + src * neighbor_indices_block_size;
 
   if (!is_neighbor(my_neighbors, n_neighbors, dst)) {
     return;
@@ -98,17 +101,16 @@ __global__ void filter_edges_by_neighbors_kernel(
 
 template <typename Idx_t>
 void filter_edges_by_neighbors(const Idx_t *srcs, const Idx_t *dsts,
-                               Idx_t *out_srcs, Idx_t *out_dsts,
-                               size_t n_edges,
+                               Idx_t *out_srcs, Idx_t *out_dsts, size_t n_edges,
                                const Idx_t *neighbor_indices,
                                size_t neighbor_indices_block_size,
-                                                             size_t n_neighbors,
-                                                             unsigned long long *out_count,
+                               size_t n_neighbors,
+                               unsigned long long *out_count,
                                cudaStream_t stream) {
 
   const int threads_per_block = 256;
-  const int blocks = static_cast<int>((n_edges + threads_per_block - 1) /
-                                      threads_per_block);
+  const int blocks =
+      static_cast<int>((n_edges + threads_per_block - 1) / threads_per_block);
 
   cudaMemsetAsync(out_count, 0, sizeof(unsigned long long), stream);
 
@@ -150,14 +152,13 @@ __global__ void filter_edges_by_neighbors_kernel(
 template <typename Idx_t, typename Payload_t>
 void filter_edges_by_neighbors(
     const Idx_t *srcs, const Idx_t *dsts, const Payload_t *payloads,
-    Idx_t *out_srcs, Idx_t *out_dsts, Payload_t *out_payloads,
-    size_t n_edges, const Idx_t *neighbor_indices,
-    size_t neighbor_indices_block_size, size_t n_neighbors,
-    unsigned long long *out_count, cudaStream_t stream) {
+    Idx_t *out_srcs, Idx_t *out_dsts, Payload_t *out_payloads, size_t n_edges,
+    const Idx_t *neighbor_indices, size_t neighbor_indices_block_size,
+    size_t n_neighbors, unsigned long long *out_count, cudaStream_t stream) {
 
   const int threads_per_block = 256;
-  const int blocks = static_cast<int>((n_edges + threads_per_block - 1) /
-                                      threads_per_block);
+  const int blocks =
+      static_cast<int>((n_edges + threads_per_block - 1) / threads_per_block);
 
   cudaMemsetAsync(out_count, 0, sizeof(unsigned long long), stream);
 
@@ -201,12 +202,11 @@ void update_sigma_for_dirty(const Idx_t *indices, size_t n_indices,
                             size_t neighbor_indices_block_size,
                             Data_t *neighbor_dists,
                             size_t neighbor_dists_block_size,
-                            size_t n_neighbors,
-                            cudaStream_t stream) {
+                            size_t n_neighbors, cudaStream_t stream) {
 
   const int threads_per_block = 256;
-  const int blocks = static_cast<int>((n_indices + threads_per_block - 1) /
-                                      threads_per_block);
+  const int blocks =
+      static_cast<int>((n_indices + threads_per_block - 1) / threads_per_block);
 
   update_sigma_for_dirty_kernel<Data_t, Idx_t>
       <<<blocks, threads_per_block, 0, stream>>>(
@@ -218,11 +218,11 @@ template <typename Data_t, typename Idx_t>
 __global__ void update_embeddings_kernel(
     const Idx_t *__restrict__ srcs, const Idx_t *__restrict__ dsts,
     size_t n_edges, Data_t *__restrict__ embedding, int n_components,
-    size_t n_rows, const Idx_t *__restrict__ neighbor_indices,
+    size_t n_inserted_instances, const Idx_t *__restrict__ neighbor_indices,
     size_t neighbor_indices_block_size,
-    const Data_t *__restrict__ neighbor_dists,
-    size_t neighbor_dists_block_size, size_t n_neighbors, float a, float b,
-    float alpha, size_t negative_sample_rate, unsigned long long seed) {
+    const Data_t *__restrict__ neighbor_dists, size_t neighbor_dists_block_size,
+    size_t n_neighbors, float a, float b, float alpha,
+    size_t negative_sample_rate, unsigned long long seed) {
 
   const size_t tid = static_cast<size_t>(blockIdx.x * blockDim.x + threadIdx.x);
   if (tid >= n_edges) {
@@ -231,18 +231,16 @@ __global__ void update_embeddings_kernel(
 
   const Idx_t src = srcs[tid];
   const Idx_t dst = dsts[tid];
-  if (src >= n_rows || dst >= n_rows) {
+  if (src >= n_inserted_instances || dst >= n_inserted_instances) {
     return;
   }
 
   const Idx_t *src_neighbors =
       neighbor_indices + src * neighbor_indices_block_size;
-  const Data_t *src_dists =
-      neighbor_dists + src * neighbor_dists_block_size;
+  const Data_t *src_dists = neighbor_dists + src * neighbor_dists_block_size;
   const Idx_t *dst_neighbors =
       neighbor_indices + dst * neighbor_indices_block_size;
-  const Data_t *dst_dists =
-      neighbor_dists + dst * neighbor_dists_block_size;
+  const Data_t *dst_dists = neighbor_dists + dst * neighbor_dists_block_size;
 
   bool found_ij = false;
   bool found_ji = false;
@@ -262,9 +260,10 @@ __global__ void update_embeddings_kernel(
   const Data_t denom_j = sigma_j > Data_t{1e-6f} ? sigma_j : Data_t{1e-6f};
   const Data_t p_ij = expf(-static_cast<float>(
       fmaxf(0.0f, static_cast<float>(d_ij - rho_i)) / denom_i));
-  const Data_t p_ji = found_ji ? expf(-static_cast<float>(
-      fmaxf(0.0f, static_cast<float>(d_ji - rho_j)) / denom_j))
-                               : Data_t{0};
+  const Data_t p_ji =
+      found_ji ? expf(-static_cast<float>(
+                     fmaxf(0.0f, static_cast<float>(d_ji - rho_j)) / denom_j))
+               : Data_t{0};
   const Data_t w_ij = Data_t{1} - (Data_t{1} - p_ij) * (Data_t{1} - p_ji);
 
   const size_t src_offset = static_cast<size_t>(src) * n_components;
@@ -273,8 +272,8 @@ __global__ void update_embeddings_kernel(
   const Data_t dy = embedding[src_offset + 1] - embedding[dst_offset + 1];
   const Data_t r2 = dx * dx + dy * dy + Data_t{1e-6f};
   const Data_t r2b = powf(r2, b);
-  const Data_t gpos = Data_t{2} * a * b * powf(r2, b - Data_t{1}) /
-                      (Data_t{1} + a * r2b);
+  const Data_t gpos =
+      Data_t{2} * a * b * powf(r2, b - Data_t{1}) / (Data_t{1} + a * r2b);
   const Data_t coeff = alpha * w_ij * gpos;
 
   atomicAdd(&embedding[src_offset], -coeff * dx);
@@ -282,15 +281,16 @@ __global__ void update_embeddings_kernel(
   atomicAdd(&embedding[dst_offset], coeff * dx);
   atomicAdd(&embedding[dst_offset + 1], coeff * dy);
 
-  unsigned long long rng = seed ^ (static_cast<unsigned long long>(src) * 73856093ULL) ^
-                           (static_cast<unsigned long long>(dst) * 19349663ULL) ^
-                           (static_cast<unsigned long long>(tid) * 83492791ULL);
+  unsigned long long rng =
+      seed ^ (static_cast<unsigned long long>(src) * 73856093ULL) ^
+      (static_cast<unsigned long long>(dst) * 19349663ULL) ^
+      (static_cast<unsigned long long>(tid) * 83492791ULL);
 
   for (size_t n = 0; n < negative_sample_rate; ++n) {
     rng = rng * 2862933555777941757ULL + 3037000493ULL;
-    Idx_t neg = static_cast<Idx_t>(rng % n_rows);
+    Idx_t neg = static_cast<Idx_t>(rng % n_inserted_instances);
     if (neg == src || neg == dst) {
-      neg = (neg + 1) % n_rows;
+      neg = (neg + 1) % n_inserted_instances;
     }
 
     const size_t neg_offset = static_cast<size_t>(neg) * n_components;
@@ -298,8 +298,7 @@ __global__ void update_embeddings_kernel(
     const Data_t ndy = embedding[src_offset + 1] - embedding[neg_offset + 1];
     const Data_t nr2 = ndx * ndx + ndy * ndy + Data_t{1e-6f};
     const Data_t nr2b = powf(nr2, b);
-    const Data_t gneg = (Data_t{2} * b) /
-                        ((Data_t{1} + a * nr2b) * nr2);
+    const Data_t gneg = (Data_t{2} * b) / ((Data_t{1} + a * nr2b) * nr2);
     const Data_t ncoeff = alpha * gneg;
 
     atomicAdd(&embedding[src_offset], ncoeff * ndx);
@@ -311,7 +310,8 @@ __global__ void update_embeddings_kernel(
 
 template <typename Data_t, typename Idx_t>
 void update_embeddings(const Idx_t *srcs, const Idx_t *dsts, size_t n_edges,
-                       Data_t *embedding, int n_components, size_t n_rows,
+                       Data_t *embedding, int n_components,
+                       size_t n_inserted_instances,
                        const Idx_t *neighbor_indices,
                        size_t neighbor_indices_block_size,
                        const Data_t *neighbor_dists,
@@ -324,12 +324,12 @@ void update_embeddings(const Idx_t *srcs, const Idx_t *dsts, size_t n_edges,
   }
 
   const int threads_per_block = 256;
-  const int blocks = static_cast<int>((n_edges + threads_per_block - 1) /
-                                      threads_per_block);
+  const int blocks =
+      static_cast<int>((n_edges + threads_per_block - 1) / threads_per_block);
   const unsigned long long seed = 42ULL;
   update_embeddings_kernel<Data_t, Idx_t>
       <<<blocks, threads_per_block, 0, stream>>>(
-          srcs, dsts, n_edges, embedding, n_components, n_rows,
+          srcs, dsts, n_edges, embedding, n_components, n_inserted_instances,
           neighbor_indices, neighbor_indices_block_size, neighbor_dists,
           neighbor_dists_block_size, n_neighbors, a, b, alpha,
           negative_sample_rate, seed);

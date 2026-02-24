@@ -333,12 +333,32 @@ forward_nndescent_kernel(const Data_t *input_data, InternalID_t *graph_buffer,
   }
 }
 
+template <typename Data_t, typename Idx_t, typename Index_t>
+__global__ __forceinline__ void
+initalize_random_embeddings_kernel(Data_t *embedding, int n_components,
+                                   uint32_t batch_size,
+                                   uint32_t batch_start_offset) {
+  const size_t row_local = blockIdx.x * blockDim.x + threadIdx.x;
+  if (row_local >= batch_size)
+    return;
+
+  const size_t row = static_cast<size_t>(batch_start_offset) + row_local;
+
+  curandStatePhilox4_32_10_t state;
+  curand_init(42, row, 0, &state);
+
+  for (uint32_t dim = 0; dim < n_components; ++dim) {
+    embedding[row_local * n_components + dim] =
+        static_cast<Data_t>(curand_uniform(&state));
+  }
+}
+
 template <typename Data_t>
 __global__ void initialize_embeddings_kernel(
     const InternalID_t *graph_buffer, const Data_t *distance_buffer,
     Data_t *embedding, uint32_t batch_size, uint32_t batch_start_offset,
     uint32_t n_neighbors, uint32_t n_inserted_instances,
-    uint32_t embedding_block_size) {
+    uint32_t n_components) {
   const size_t row_local = static_cast<size_t>(blockIdx.x);
   if (row_local >= batch_size) {
     return;
@@ -398,20 +418,18 @@ __global__ void initialize_embeddings_kernel(
     return;
   }
 
-  for (uint32_t dim = threadIdx.x; dim < embedding_block_size;
-       dim += blockDim.x) {
+  for (uint32_t dim = threadIdx.x; dim < n_components; dim += blockDim.x) {
     float accum = 0.0f;
     for (uint32_t j = 0; j < n_neighbors; ++j) {
       const int nid = s_neighbor_ids[j];
       if (nid < 0) {
         continue;
       }
-      accum +=
-          s_weights[j] *
-          static_cast<float>(
-              embedding[static_cast<size_t>(nid) * embedding_block_size + dim]);
+      accum += s_weights[j] *
+               static_cast<float>(
+                   embedding[static_cast<size_t>(nid) * n_components + dim]);
     }
-    embedding[row * embedding_block_size + dim] =
+    embedding[row * n_components + dim] =
         static_cast<Data_t>(accum / weight_sum);
   }
 }
@@ -578,54 +596,9 @@ void InsertionAlgo<Data_t, Idx_t, Index_t>::run(
              graph_buffer_ + batch_start_offset * MAX_NEIGHBORS,
              n_rows * MAX_NEIGHBORS, stream);
 
-  RAFT_CUDA_TRY(cudaStreamSynchronize(stream));
-
-  for (size_t i = 0; i < 1; ++i) {
-    for (size_t j = 0; j < MAX_NEIGHBORS; ++j) {
-      fprintf(stderr, "%d ",
-              buffers_.graph_host_buffer_.data_handle()[i * MAX_NEIGHBORS + j]
-                  .id());
-    }
-    fprintf(stderr, "\n");
-    fflush(stderr);
-  }
-
   for (size_t iter = 0; iter < max_iter_; ++iter) {
     sample_forward_candidates(graph_buffer_, candidate_buffer_, stream);
     forward_nndescent(graph_buffer_, dists_buffer_, candidate_buffer_, stream);
-
-    // === 수렴 추적: 매 iteration마다 row 0의 최소 거리 + new 이웃 수 출력 ===
-    RAFT_CUDA_TRY(cudaStreamSynchronize(stream));
-
-    float h_dists[MAX_NEIGHBORS];
-    cudaMemcpy(h_dists,
-               dists_buffer_ + (batch_start_offset + 2) * MAX_NEIGHBORS,
-               MAX_NEIGHBORS * sizeof(float), cudaMemcpyDeviceToHost);
-    int h_graph_raw[MAX_NEIGHBORS];
-    cudaMemcpy(h_graph_raw, graph_buffer_ + batch_start_offset * MAX_NEIGHBORS,
-               MAX_NEIGHBORS * sizeof(int), cudaMemcpyDeviceToHost);
-
-    float min_dist = h_dists[0];
-    int n_new = 0;
-    int n_candidates_valid = 0;
-    int h_cands[MAX_CANDIDATES];
-    cudaMemcpy(h_cands, candidate_buffer_ + batch_start_offset * MAX_CANDIDATES,
-               MAX_CANDIDATES * sizeof(int), cudaMemcpyDeviceToHost);
-    for (int j = 0; j < MAX_NEIGHBORS; j++) {
-      if (h_dists[j] < min_dist)
-        min_dist = h_dists[j];
-      if (h_graph_raw[j] >= 0)
-        n_new++;
-    }
-    for (int j = 0; j < MAX_CANDIDATES; j++)
-      if (h_cands[j] >= 0)
-        n_candidates_valid++;
-
-    fprintf(stderr,
-            "[iter %3zu] min_dist=%.4f  new_internal=%d/%d  candidates=%d/%d\n",
-            iter, min_dist, n_new, MAX_NEIGHBORS, n_candidates_valid,
-            MAX_CANDIDATES);
-    fflush(stderr);
   }
 
   // Buffers on host for graph structure and distances to be used for writing
@@ -651,14 +624,6 @@ void InsertionAlgo<Data_t, Idx_t, Index_t>::run(
       dst_graph[j] = src_graph[j];
       dst_dists[j] = src_dists[j];
     }
-  }
-
-  for (size_t i = 0; i < 1; ++i) {
-    for (size_t j = 0; j < MAX_NEIGHBORS; ++j) {
-      fprintf(stderr, "%d ", graph_host_buffer_[i * MAX_NEIGHBORS + j].id());
-    }
-    fprintf(stderr, "\n");
-    fflush(stderr);
   }
 
   write_new_neighbors_info(stream);
@@ -700,14 +665,18 @@ void InsertionAlgo<Data_t, Idx_t, Index_t>::initialize_embeddings(
   const uint32_t batch_start_offset =
       static_cast<uint32_t>(batch_indices_.front());
   const int threads_per_block =
-      static_cast<int>(std::min<uint32_t>(embedding_block_size_, 256));
+      static_cast<int>(std::min<uint32_t>(n_components_, 256));
+
+  initalize_random_embeddings_kernel<Data_t, Idx_t, Index_t>
+      <<<batch_size, threads_per_block, 0, stream>>>(
+          embedding, n_components_, batch_size, batch_start_offset);
 
   initialize_embeddings_kernel<Data_t>
       <<<batch_size, threads_per_block, 0, stream>>>(
           buffers_.graph_buffer_.data_handle(),
           buffers_.dists_buffer_.data_handle(), embedding, batch_size,
           batch_start_offset, n_neighbors_, n_inserted_instances_,
-          embedding_block_size_);
+          n_components_);
   RAFT_CUDA_TRY(cudaGetLastError());
 }
 

@@ -20,7 +20,7 @@ def load_mnist_numpy():
 
 class PreloadMNISTDataLoader(DataLoader):
     def __init__(self):
-        self.X, _ = load_mnist_numpy()
+        self.X, self.y = load_mnist_numpy()
         self.n_instances = len(self.X)
         self.n_features = self.X.shape[1]
         self._current_index = 0

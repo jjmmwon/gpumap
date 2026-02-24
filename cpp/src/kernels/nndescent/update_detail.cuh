@@ -704,6 +704,16 @@ local_join_kernel(const Index_t *graph_new, Index_t *rev_graph_new,
   }
 }
 
+/*
+h_graph: the original graph with old and new neighbors mixed together, used for
+sampling h_graph_old: the sampled old neighbors for each inserted instance
+h_graph_new: the sampled new neighbors for each inserted instance
+h_list_sizes_old: the number of sampled forward old neighbors for each inserted
+instance (x)
+h_list_sizes_new: the number of sampled forward new neighbors for each inserted
+instance (x)
+*/
+
 template <typename Data_t, typename Idx_t, typename Index_t>
 void UpdateAlgo<Data_t, Idx_t, Index_t>::sample_graph(bool sample_new) {
   const size_t n_rows = batch_indices_.size();
@@ -758,7 +768,13 @@ void UpdateAlgo<Data_t, Idx_t, Index_t>::sample_graph(bool sample_new) {
     }
   }
 }
-
+/*
+graph_host_buffer_: the updated graph by local join.
+h_graph_new: buffer to store the sampled new neighbors.
+h_list_sizes_new: buffer to store the number of sampled new neighbors.
+bloom_filter: a bloom filter to keep track of the sampled new neighbors to avoid
+duplication between different threads when sampling new neighbors.
+*/
 template <typename Data_t, typename Idx_t, typename Index_t>
 void UpdateAlgo<Data_t, Idx_t, Index_t>::sample_graph_new() {
   InternalID_t *new_neighbors = buffers_.graph_host_buffer_.data_handle();
@@ -920,9 +936,6 @@ void UpdateAlgo<Data_t, Idx_t, Index_t>::run(
              stream);
   raft::resource::sync_stream(res_);
 
-  fprintf(stderr, "Start sampling graph\n");
-  fflush(stderr);
-
   sample_graph(true);
 
   auto update_and_sample = [&](bool update_graph_flag) {
@@ -955,8 +968,6 @@ void UpdateAlgo<Data_t, Idx_t, Index_t>::run(
 
     RAFT_LOG_DEBUG("# GNND iteraton: %lu / %lu", iter + 1, max_iter_);
 
-    fprintf(stderr, "Start adding reverse edges at iteration %lu\n", iter);
-    fflush(stderr);
     add_reverse_edges(buffers_.h_graph_new.data_handle(),
                       buffers_.h_rev_graph_new_.data_handle(),
                       buffers_.d_rev_graph_buffer_.data_handle(),
@@ -966,18 +977,14 @@ void UpdateAlgo<Data_t, Idx_t, Index_t>::run(
                       buffers_.d_rev_graph_buffer_.data_handle(),
                       buffers_.d_list_sizes_old_.data_handle(), stream);
 
-    fprintf(stderr, "Start local join at iteration %lu\n", iter);
-    fflush(stderr);
     local_join(stream);
 
     update_and_sample_thread.join();
 
-    fprintf(stderr, "Finish iteration %lu with update_counter = %ld\n", iter,
-            update_counter_.load());
-
     // if (update_counter_ == -1) {
     //   break;
     // }
+
     raft::copy(buffers_.graph_host_buffer_.data_handle(),
                buffers_.graph_buffer_.data_handle(),
                n_inserted_instances_ * MAX_NEIGHBORS, stream);
@@ -986,8 +993,6 @@ void UpdateAlgo<Data_t, Idx_t, Index_t>::run(
                n_inserted_instances_ * MAX_NEIGHBORS, stream);
     raft::resource::sync_stream(res_);
 
-    fprintf(stderr, "Start sample_graph_new\n");
-    fflush(stderr);
     sample_graph_new();
   }
 
@@ -1017,11 +1022,14 @@ void UpdateAlgo<Data_t, Idx_t, Index_t>::run(
       auto row_graph = buffers_.h_graph.data_handle() + row * n_neighbors_;
       auto row_dists = buffers_.h_dists.data_handle() + row * n_neighbors_;
 
+      bool valid_row = false;
       for (size_t j = 0; j < n_neighbors_; ++j) {
         const int id = row_graph[j].id();
         const bool valid_id =
             (id >= 0 && static_cast<size_t>(id) < n_inserted_instances_) &&
             (static_cast<size_t>(id) != row);
+        valid_row = valid_row || valid_id;
+
         h_neighbor_row[j] = valid_id ? static_cast<Idx_t>(id)
                                      : std::numeric_limits<Idx_t>::max();
         h_dist_row[j] =
@@ -1039,9 +1047,12 @@ void UpdateAlgo<Data_t, Idx_t, Index_t>::run(
                  h_neighbor_row.data(), n_neighbors_, stream);
       raft::copy(neighbor_distances + row * neighbor_dists_block_size_,
                  h_dist_row.data(), n_neighbors_, stream);
-      raft::copy(neighbor_indices + row * neighbor_indices_block_size_ +
-                     (neighbor_indices_block_size_ - 1),
-                 &dirty_flag_one, 1, stream);
+
+      if (valid_row) {
+        raft::copy(neighbor_indices + row * neighbor_indices_block_size_ +
+                       (neighbor_indices_block_size_ - 1),
+                   &dirty_flag_one, 1, stream);
+      }
     }
     raft::resource::sync_stream(res_);
   }
