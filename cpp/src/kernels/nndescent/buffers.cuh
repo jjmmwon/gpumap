@@ -15,6 +15,7 @@
 namespace gpumap::nndescent {
 
 constexpr int MAX_NEIGHBORS = 32;
+constexpr int MAX_CANDIDATES = 216; // max 2-hop candidates per node (n_neighbors * n_neighbors)
 constexpr int NUM_SAMPLES = 32;
 constexpr int MAX_NUM_BI_SAMPLES = 64;
 constexpr int SKEWED_MAX_NUM_BI_SAMPLES = 68;
@@ -186,7 +187,7 @@ template <typename Data_t, typename Index_t = int> struct NNDBuffers {
         /// buffers used for storing candidates during insertion.
         candidate_buffer_{
             raft::make_device_matrix<int, size_t, raft::row_major>(
-                res, n_instances, MAX_NEIGHBORS)},
+                res, n_instances, MAX_CANDIDATES)},
 
         graph_host_buffer_{
             raft::make_pinned_matrix<InternalID_t, size_t, raft::row_major>(

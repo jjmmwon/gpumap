@@ -33,6 +33,8 @@ struct GPUMAP::Impl {
   UpdateQueue update_queue;
   EmbeddingQueue embedding_queue;
 
+  bool first_insertion = true;
+
   Impl(const GPUMAPParams &params_)
       : params(params_), storage(params_.n_instances, params_.n_features,
                                  params_.n_neighbors, params_.n_components),
@@ -92,6 +94,7 @@ struct GPUMAP::Impl {
       auto start = clock::now();
       insert(n_insertion_ops);
       cudaStreamSynchronize(insertion_stream);
+
       fprintf(stderr, "[GPUMAP] insert done\n");
       fflush(stderr);
       auto end = clock::now();
@@ -133,7 +136,7 @@ struct GPUMAP::Impl {
   }
 
   size_t insert(size_t n_ops) {
-    if (!insertion_queue.size()) {
+    if (!insertion_queue.size() || n_ops == 0) {
       return 0;
     }
 
@@ -148,20 +151,24 @@ struct GPUMAP::Impl {
         storage.neighbor_dists.data(), storage.embedding.data(),
 
         storage.data_block_size, storage.neighbor_indices_block_size,
-        storage.neighbor_dists_block_size, 2,
+        storage.neighbor_dists_block_size, storage.n_components,
 
         storage.n_instances, storage.n_features, storage.n_neighbors,
         storage.n_inserted_instances, affected_indices, new_edges,
         insertion_stream);
 
-    update_queue.push_batch(affected_indices);
+    if (!first_insertion) {
+      update_queue.push_batch(affected_indices);
+    } else {
+      first_insertion = false;
+    }
     embedding_queue.push_batch(new_edges);
 
     return batch_indices.size();
   }
 
   void update(size_t n_ops) {
-    if (!update_queue.size()) {
+    if (!update_queue.size() || n_ops == 0) {
       return;
     }
 

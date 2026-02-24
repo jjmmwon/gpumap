@@ -29,12 +29,10 @@ void insertion_kernel(nndescent::NNDBuffers<Data_t, int> &buffers,
       buffers, batch_indices, input_data, neighbor_indices, neighbor_distances,
       embedding, data_block_size, neighbor_indices_block_size,
       neighbor_dists_block_size, embedding_block_size, n_instances, n_features,
-      n_neighbors, n_inserted_instances, /*max_iter=*/30,
+      n_neighbors, n_inserted_instances, /*max_iter=*/20,
       /*termination_threshold=*/0.001f, seed);
 
   runner.run(insertion_stream, affected_indices, new_edges);
-
-  RAFT_CUDA_TRY(cudaStreamSynchronize(insertion_stream));
 }
 
 } // namespace gpumap

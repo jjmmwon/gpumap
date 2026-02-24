@@ -16,9 +16,6 @@
 #include <limits>
 #include <raft/core/resource/cuda_stream.hpp>
 #include <raft/util/cudart_utils.hpp>
-#include <sstream>
-#include <stdexcept>
-#include <string>
 #include <vector>
 
 namespace gpumap::nndescent {
@@ -26,16 +23,6 @@ namespace gpumap::nndescent {
 template <typename Idx_t>
 __device__ __forceinline__ bool list_contains_id(const Idx_t *arr, int k,
                                                  Idx_t v) {
-  for (int i = 0; i < k; ++i) {
-    if (arr[i] == v) {
-      return true;
-    }
-  }
-  return false;
-}
-
-template <typename Idx_t>
-inline bool host_list_contains_id(const Idx_t *arr, int k, Idx_t v) {
   for (int i = 0; i < k; ++i) {
     if (arr[i] == v) {
       return true;
@@ -168,12 +155,12 @@ __global__ __forceinline__ void sample_forward_candidates_kernel(
   for (uint32_t j = 0; j < n_neighbors && candidate_count < candidate_width;
        ++j) {
     InternalID_t neighbor_id_raw = my_neighbors[j];
-    if (!neighbor_id_raw.is_new() ||
-        static_cast<uint32_t>(neighbor_id_raw.id()) >= n_inserted_instances) {
+    if (!neighbor_id_raw.is_new()) {
       continue;
     }
 
     const Index_t neighbor_id = static_cast<Index_t>(neighbor_id_raw.id());
+    // my_neighbors[j].mark_old();
 
     InternalID_t *neigh2 =
         graph_buffer + static_cast<size_t>(neighbor_id) * graph_width;
@@ -181,9 +168,8 @@ __global__ __forceinline__ void sample_forward_candidates_kernel(
     for (uint32_t k = 0; k < n_neighbors && candidate_count < candidate_width;
          ++k) {
       InternalID_t candidate_id_raw = neigh2[k];
-      if (!candidate_id_raw.is_new() ||
-          static_cast<uint32_t>(candidate_id_raw.id()) >=
-              n_inserted_instances) {
+      if (static_cast<uint32_t>(candidate_id_raw.id()) >=
+          n_inserted_instances) {
         continue;
       }
 
@@ -202,7 +188,6 @@ __global__ __forceinline__ void sample_forward_candidates_kernel(
         continue;
       }
       my_candidates[candidate_count++] = static_cast<int>(candidate_id);
-      neigh2[k].mark_old();
     }
   }
 }
@@ -240,8 +225,8 @@ forward_nndescent_kernel(const Data_t *input_data, InternalID_t *graph_buffer,
   }
 
   // 1) Compute all candidate distances first.
-  Index_t candidate_ids[MAX_NEIGHBORS];
-  Data_t candidate_dists[MAX_NEIGHBORS];
+  Index_t candidate_ids[MAX_CANDIDATES];
+  Data_t candidate_dists[MAX_CANDIDATES];
   int valid_candidate_count = 0;
 
   const size_t offset1 = static_cast<size_t>(gid) * data_block_size;
@@ -451,7 +436,8 @@ void InsertionAlgo<Data_t, Idx_t, Index_t>::preprocess_l2_norms(
 
 template <typename Data_t, typename Idx_t, typename Index_t>
 void InsertionAlgo<Data_t, Idx_t, Index_t>::initialize_random_neighbors(
-    cudaStream_t stream, size_t seed) {
+    InternalID_t *graph_buffer_, Data_t *distance_buffer_, cudaStream_t stream,
+    size_t seed) {
 
   size_t n_rows = batch_indices_.size();
   if (n_rows == 0) {
@@ -461,10 +447,14 @@ void InsertionAlgo<Data_t, Idx_t, Index_t>::initialize_random_neighbors(
   const int threads_per_block = 256;
   const int n_blocks = (n_rows + threads_per_block - 1) / threads_per_block;
 
-  InternalID_t *graph_buffer_offset = buffers_.graph_buffer_.data_handle() +
-                                      batch_indices_.front() * MAX_NEIGHBORS;
-  Data_t *distance_buffer_offset = buffers_.dists_buffer_.data_handle() +
-                                   batch_indices_.front() * MAX_NEIGHBORS;
+  InternalID_t *graph_buffer_offset =
+      graph_buffer_ +
+      static_cast<size_t>(batch_indices_.front()) * MAX_NEIGHBORS;
+
+  Data_t *distance_buffer_offset =
+      distance_buffer_ +
+      static_cast<size_t>(batch_indices_.front()) * MAX_NEIGHBORS;
+
   uint32_t batch_start_offset = static_cast<uint32_t>(batch_indices_.front());
 
   initialize_random_neighbors_kernel<Data_t, Idx_t, Index_t>
@@ -476,7 +466,7 @@ void InsertionAlgo<Data_t, Idx_t, Index_t>::initialize_random_neighbors(
 
 template <typename Data_t, typename Idx_t, typename Index_t>
 void InsertionAlgo<Data_t, Idx_t, Index_t>::sample_forward_candidates(
-    cudaStream_t stream) {
+    InternalID_t *graph_buffer_, int *candidate_buffer_, cudaStream_t stream) {
   const uint32_t n_rows = static_cast<uint32_t>(batch_indices_.size());
   if (n_rows == 0) {
     return;
@@ -488,22 +478,21 @@ void InsertionAlgo<Data_t, Idx_t, Index_t>::sample_forward_candidates(
 
   sample_forward_candidates_kernel<Data_t, Idx_t, Index_t>
       <<<blocks, threads_per_block, 0, stream>>>(
-          buffers_.graph_buffer_.data_handle(),
-          buffers_.candidate_buffer_.data_handle(), MAX_NEIGHBORS,
-          MAX_NEIGHBORS, n_rows, batch_start_offset, n_neighbors_,
-          n_inserted_instances_);
+          graph_buffer_, candidate_buffer_, MAX_NEIGHBORS, MAX_CANDIDATES,
+          n_rows, batch_start_offset, MAX_NEIGHBORS, n_inserted_instances_);
   RAFT_CUDA_TRY(cudaGetLastError());
 }
 
 template <typename Data_t, typename Idx_t, typename Index_t>
 void InsertionAlgo<Data_t, Idx_t, Index_t>::forward_nndescent(
-    cudaStream_t stream) {
+    InternalID_t *graph_buffer_, Data_t *dists_buffer_,
+    const int *candidate_buffer_, cudaStream_t stream) {
   const uint32_t n_rows = static_cast<uint32_t>(batch_indices_.size());
   if (n_rows == 0) {
     return;
   }
   const uint32_t row_offset = static_cast<uint32_t>(batch_indices_.front());
-  constexpr uint32_t n_candidates = MAX_NEIGHBORS;
+  constexpr uint32_t n_candidates = MAX_CANDIDATES;
   const int threads_per_block = 256;
   const int blocks = (n_rows + threads_per_block - 1) / threads_per_block;
 
@@ -511,11 +500,9 @@ void InsertionAlgo<Data_t, Idx_t, Index_t>::forward_nndescent(
 
   forward_nndescent_kernel<Data_t, Idx_t, Index_t>
       <<<blocks, threads_per_block, 0, stream>>>(
-          input_data_offset, buffers_.graph_buffer_.data_handle(),
-          buffers_.dists_buffer_.data_handle(),
-          buffers_.candidate_buffer_.data_handle(), n_rows, row_offset,
-          n_neighbors_, n_features_, data_block_size_, n_candidates,
-          n_inserted_instances_);
+          input_data_offset, graph_buffer_, dists_buffer_, candidate_buffer_,
+          n_rows, row_offset, MAX_NEIGHBORS, n_features_, data_block_size_,
+          n_candidates, n_inserted_instances_);
   RAFT_CUDA_TRY(cudaGetLastError());
 }
 
@@ -562,61 +549,95 @@ void InsertionAlgo<Data_t, Idx_t, Index_t>::write_new_neighbors_info(
     raft::copy(neighbor_distances + row * neighbor_dists_block_size_ +
                    (neighbor_dists_block_size_ - 1),
                &sigma_init, 1, stream);
-  }
 
-  RAFT_CUDA_TRY(cudaStreamSynchronize(stream));
+    RAFT_CUDA_TRY(cudaStreamSynchronize(stream));
+  }
 }
 
 template <typename Data_t, typename Idx_t, typename Index_t>
 void InsertionAlgo<Data_t, Idx_t, Index_t>::run(
     cudaStream_t stream, std::vector<Idx_t> &affected_indices,
     std::vector<std::tuple<Idx_t, Idx_t, Idx_t>> &new_edges) {
-
-  if (n_neighbors_ == 0 || n_neighbors_ > MAX_NEIGHBORS) {
-    std::ostringstream oss;
-    oss << "Invalid n_neighbors=" << n_neighbors_ << " (valid range: 1.."
-        << MAX_NEIGHBORS << ")";
-    throw std::runtime_error(oss.str());
-  }
   if (batch_indices_.empty()) {
     return;
   }
-
-  {
-    const Idx_t start = batch_indices_.front();
-    for (size_t i = 1; i < batch_indices_.size(); ++i) {
-      if (batch_indices_[i] != static_cast<Idx_t>(start + i)) {
-        throw std::runtime_error(
-            "InsertionAlgo requires contiguous batch_indices");
-      }
-    }
-  }
-
   const size_t n_rows = batch_indices_.size();
   const size_t batch_start_offset = static_cast<size_t>(batch_indices_.front());
 
+  // Buffers on device for graph structure and distances during NNDESENT
+  // insertion iterations.
+  InternalID_t *graph_buffer_ = buffers_.graph_buffer_.data_handle();
+  Data_t *dists_buffer_ = buffers_.dists_buffer_.data_handle();
+  int *candidate_buffer_ = buffers_.candidate_buffer_.data_handle();
+
   preprocess_l2_norms(stream);
-  RAFT_CUDA_TRY(cudaStreamSynchronize(stream));
-  initialize_random_neighbors(stream, seed_);
-  RAFT_CUDA_TRY(cudaStreamSynchronize(stream));
+  initialize_random_neighbors(graph_buffer_, dists_buffer_, stream, seed_);
 
-  auto *graph_host = buffers_.graph_host_buffer_.data_handle();
-  auto *graph_dev = buffers_.graph_buffer_.data_handle();
-  auto *dists_host = buffers_.dists_host_buffer_.data_handle();
-  auto *dists_dev = buffers_.dists_buffer_.data_handle();
-  for (size_t iter = 0; iter < max_iter_; ++iter) {
-    sample_forward_candidates(stream);
-    RAFT_CUDA_TRY(cudaStreamSynchronize(stream));
-
-    forward_nndescent(stream);
-    RAFT_CUDA_TRY(cudaStreamSynchronize(stream));
-  };
-
-  raft::copy(graph_host + batch_start_offset * MAX_NEIGHBORS,
-             graph_dev + batch_start_offset * MAX_NEIGHBORS,
+  raft::copy(buffers_.graph_host_buffer_.data_handle() +
+                 batch_start_offset * MAX_NEIGHBORS,
+             graph_buffer_ + batch_start_offset * MAX_NEIGHBORS,
              n_rows * MAX_NEIGHBORS, stream);
-  raft::copy(dists_host + batch_start_offset * MAX_NEIGHBORS,
-             dists_dev + batch_start_offset * MAX_NEIGHBORS,
+
+  RAFT_CUDA_TRY(cudaStreamSynchronize(stream));
+
+  for (size_t i = 0; i < 1; ++i) {
+    for (size_t j = 0; j < MAX_NEIGHBORS; ++j) {
+      fprintf(stderr, "%d ",
+              buffers_.graph_host_buffer_.data_handle()[i * MAX_NEIGHBORS + j]
+                  .id());
+    }
+    fprintf(stderr, "\n");
+    fflush(stderr);
+  }
+
+  for (size_t iter = 0; iter < max_iter_; ++iter) {
+    sample_forward_candidates(graph_buffer_, candidate_buffer_, stream);
+    forward_nndescent(graph_buffer_, dists_buffer_, candidate_buffer_, stream);
+
+    // === 수렴 추적: 매 iteration마다 row 0의 최소 거리 + new 이웃 수 출력 ===
+    RAFT_CUDA_TRY(cudaStreamSynchronize(stream));
+
+    float h_dists[MAX_NEIGHBORS];
+    cudaMemcpy(h_dists,
+               dists_buffer_ + (batch_start_offset + 2) * MAX_NEIGHBORS,
+               MAX_NEIGHBORS * sizeof(float), cudaMemcpyDeviceToHost);
+    int h_graph_raw[MAX_NEIGHBORS];
+    cudaMemcpy(h_graph_raw, graph_buffer_ + batch_start_offset * MAX_NEIGHBORS,
+               MAX_NEIGHBORS * sizeof(int), cudaMemcpyDeviceToHost);
+
+    float min_dist = h_dists[0];
+    int n_new = 0;
+    int n_candidates_valid = 0;
+    int h_cands[MAX_CANDIDATES];
+    cudaMemcpy(h_cands, candidate_buffer_ + batch_start_offset * MAX_CANDIDATES,
+               MAX_CANDIDATES * sizeof(int), cudaMemcpyDeviceToHost);
+    for (int j = 0; j < MAX_NEIGHBORS; j++) {
+      if (h_dists[j] < min_dist)
+        min_dist = h_dists[j];
+      if (h_graph_raw[j] >= 0)
+        n_new++;
+    }
+    for (int j = 0; j < MAX_CANDIDATES; j++)
+      if (h_cands[j] >= 0)
+        n_candidates_valid++;
+
+    fprintf(stderr,
+            "[iter %3zu] min_dist=%.4f  new_internal=%d/%d  candidates=%d/%d\n",
+            iter, min_dist, n_new, MAX_NEIGHBORS, n_candidates_valid,
+            MAX_CANDIDATES);
+    fflush(stderr);
+  }
+
+  // Buffers on host for graph structure and distances to be used for writing
+  InternalID_t *graph_host_buffer_ = buffers_.graph_host_buffer_.data_handle();
+  Data_t *dists_host_buffer_ = buffers_.dists_host_buffer_.data_handle();
+
+  RAFT_CUDA_TRY(cudaStreamSynchronize(stream));
+  raft::copy(graph_host_buffer_ + batch_start_offset * MAX_NEIGHBORS,
+             graph_buffer_ + batch_start_offset * MAX_NEIGHBORS,
+             n_rows * MAX_NEIGHBORS, stream);
+  raft::copy(dists_host_buffer_ + batch_start_offset * MAX_NEIGHBORS,
+             dists_buffer_ + batch_start_offset * MAX_NEIGHBORS,
              n_rows * MAX_NEIGHBORS, stream);
   RAFT_CUDA_TRY(cudaStreamSynchronize(stream));
 
@@ -624,19 +645,28 @@ void InsertionAlgo<Data_t, Idx_t, Index_t>::run(
     const size_t row = batch_start_offset + i;
     auto *dst_graph = buffers_.h_graph.data_handle() + row * n_neighbors_;
     auto *dst_dists = buffers_.h_dists.data_handle() + row * n_neighbors_;
-    const auto *src_graph = graph_host + row * MAX_NEIGHBORS;
-    const auto *src_dists = dists_host + row * MAX_NEIGHBORS;
+    const auto *src_graph = graph_host_buffer_ + row * MAX_NEIGHBORS;
+    const auto *src_dists = dists_host_buffer_ + row * MAX_NEIGHBORS;
     for (size_t j = 0; j < n_neighbors_; ++j) {
       dst_graph[j] = src_graph[j];
       dst_dists[j] = src_dists[j];
     }
   }
 
+  for (size_t i = 0; i < 1; ++i) {
+    for (size_t j = 0; j < MAX_NEIGHBORS; ++j) {
+      fprintf(stderr, "%d ", graph_host_buffer_[i * MAX_NEIGHBORS + j].id());
+    }
+    fprintf(stderr, "\n");
+    fflush(stderr);
+  }
+
   write_new_neighbors_info(stream);
+  RAFT_CUDA_TRY(cudaStreamSynchronize(stream));
 
   for (size_t i = 0; i < n_rows; ++i) {
     const size_t row = static_cast<size_t>(batch_indices_[i]);
-    const InternalID_t *my_neighbors = graph_host + row * MAX_NEIGHBORS;
+    const InternalID_t *my_neighbors = graph_host_buffer_ + row * MAX_NEIGHBORS;
 
     for (uint32_t j = 0; j < n_neighbors_; ++j) {
       const int nid = my_neighbors[j].id();

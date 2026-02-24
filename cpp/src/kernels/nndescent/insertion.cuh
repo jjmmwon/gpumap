@@ -39,9 +39,15 @@ public:
   void run(cudaStream_t const stream, std::vector<Idx_t> &affected_indices,
            std::vector<std::tuple<Idx_t, Idx_t, Idx_t>> &new_edges);
   void preprocess_l2_norms(cudaStream_t const stream);
-  void initialize_random_neighbors(cudaStream_t const stream, size_t seed);
-  void sample_forward_candidates(cudaStream_t const stream);
-  void forward_nndescent(cudaStream_t const stream);
+  void initialize_random_neighbors(InternalID_t *graph_buffer,
+                                   Data_t *distance_buffer,
+                                   cudaStream_t const stream, size_t seed);
+  void sample_forward_candidates(InternalID_t *graph_buffer,
+                                 int *candidate_buffer,
+                                 cudaStream_t const stream);
+  void forward_nndescent(InternalID_t *graph_buffer_, Data_t *dists_buffer_,
+                         const int *candidate_buffer_,
+                         cudaStream_t const stream);
   void write_new_neighbors_info(cudaStream_t const stream);
   void initialize_embeddings(cudaStream_t const stream);
 
