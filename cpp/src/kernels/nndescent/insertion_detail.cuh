@@ -575,7 +575,7 @@ void InsertionAlgo<Data_t, Idx_t, Index_t>::write_new_neighbors_info(
 template <typename Data_t, typename Idx_t, typename Index_t>
 void InsertionAlgo<Data_t, Idx_t, Index_t>::run(
     cudaStream_t stream, std::vector<Idx_t> &affected_indices,
-    std::vector<std::tuple<Idx_t, Idx_t, Idx_t>> &new_edges) {
+    std::vector<std::tuple<Idx_t, Idx_t, float, float, float>> &new_edges) {
   if (batch_indices_.empty()) {
     return;
   }
@@ -640,7 +640,7 @@ void InsertionAlgo<Data_t, Idx_t, Index_t>::run(
       }
       affected_indices.push_back(static_cast<Idx_t>(nid));
       new_edges.emplace_back(static_cast<Idx_t>(batch_indices_[i]),
-                             static_cast<Idx_t>(nid), 0);
+                             static_cast<Idx_t>(nid), 0.f, -1.f, -1.f);
     }
   }
 

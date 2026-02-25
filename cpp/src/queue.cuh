@@ -51,15 +51,13 @@ struct InsertionQueue : public Queue<uint32_t> {
   InsertionQueue() = default;
 };
 
-struct UpdateQueue : public Queue<uint32_t> {
-};
+struct UpdateQueue : public Queue<uint32_t> {};
 
-template<typename Idx_t = uint32_t>
-using EdgeT = std::tuple<Idx_t, Idx_t, Idx_t>; // (src, dst, iter)
+template <typename Idx_t = uint32_t>
+using EdgeT = std::tuple<Idx_t, Idx_t, float, float, float>;
 
 using Edge = EdgeT<uint32_t>;
 
-struct EmbeddingQueue : public Queue<Edge> {
-};
+struct EmbeddingQueue : public Queue<Edge> {};
 
 } // namespace gpumap

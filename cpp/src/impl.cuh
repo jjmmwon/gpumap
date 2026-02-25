@@ -78,27 +78,27 @@ struct GPUMAP::Impl {
   GPUMAPResult run(size_t n_insertion_ops, size_t n_update_ops,
                    size_t n_embedding_ops) {
     GPUMAPResult result{};
-    fprintf(
-        stderr,
-        "[GPUMAP] run() start: insert=%zu update=%zu embed=%zu inserted=%u\n",
-        n_insertion_ops, n_update_ops, n_embedding_ops,
-        storage.n_inserted_instances);
-    fflush(stderr);
+    // fprintf(
+    //     stderr,
+    //     "[GPUMAP] run() start: insert=%zu update=%zu embed=%zu
+    //     inserted=%u\n", n_insertion_ops, n_update_ops, n_embedding_ops,
+    //     storage.n_inserted_instances);
+    // fflush(stderr);
 
     if (!insertion_queue.size()) {
       result.insertion_completed = true;
       result.n_insertion_ops = 0;
       result.insertion_time = 0.0f;
     } else {
-      fprintf(stderr, "[GPUMAP] starting insert(%zu), queue size=%zu\n",
-              n_insertion_ops, insertion_queue.size());
-      fflush(stderr);
+      // fprintf(stderr, "[GPUMAP] starting insert(%zu), queue size=%zu\n",
+      //         n_insertion_ops, insertion_queue.size());
+      // fflush(stderr);
       auto start = clock::now();
       insert(n_insertion_ops);
       cudaStreamSynchronize(insertion_stream);
 
-      fprintf(stderr, "[GPUMAP] insert done\n");
-      fflush(stderr);
+      // fprintf(stderr, "[GPUMAP] insert done\n");
+      // fflush(stderr);
       auto end = clock::now();
 
       result.insertion_completed = false;
@@ -106,8 +106,8 @@ struct GPUMAP::Impl {
       result.insertion_time = std::chrono::duration<float>(end - start).count();
     }
 
-    fprintf(stderr, "[GPUMAP] update queue size=%zu\n", update_queue.size());
-    fflush(stderr);
+    // fprintf(stderr, "[GPUMAP] update queue size=%zu\n", update_queue.size());
+    // fflush(stderr);
     if (n_update_ops == 0 || !update_queue.size()) {
       result.n_update_ops = 0;
       result.update_time = 0.0f;
@@ -115,17 +115,17 @@ struct GPUMAP::Impl {
       auto start = clock::now();
       update(n_update_ops);
       cudaStreamSynchronize(update_stream);
-      fprintf(stderr, "[GPUMAP] update done\n");
-      fflush(stderr);
+      // fprintf(stderr, "[GPUMAP] update done\n");
+      // fflush(stderr);
       auto end = clock::now();
 
       result.n_update_ops = n_update_ops;
       result.update_time = std::chrono::duration<float>(end - start).count();
     }
 
-    fprintf(stderr, "[GPUMAP] embedding queue size=%zu\n",
-            embedding_queue.size());
-    fflush(stderr);
+    // fprintf(stderr, "[GPUMAP] embedding queue size=%zu\n",
+    //         embedding_queue.size());
+    // fflush(stderr);
 
     if (n_embedding_ops == 0 || !embedding_queue.size()) {
       result.n_embedding_ops = 0;
@@ -194,17 +194,12 @@ struct GPUMAP::Impl {
         /*max_iter=*/2,
         /*termination_threshold=*/0.001f, /*seed=*/42);
 
-    printf("Affected indices count: %zu\n", affected_indices.size());
+    // printf("Affected indices count: %zu\n", affected_indices.size());
     update_queue.push_batch(affected_indices);
     embedding_queue.push_batch(affected_edges);
   }
 
   void embed(size_t n_ops) {
-    // embedding 단계에서 queue는 엣지들을 담고있다. 여기서 e = (src, dst,
-    // iter)임
-
-    // 먼저 n_ops 개수만큼 엣지를 빼자
-
     size_t left_ops = n_ops;
 
     while (left_ops > 0 && embedding_queue.size() > 0) {
@@ -212,49 +207,44 @@ struct GPUMAP::Impl {
       std::vector<gpumap::Edge> batch_edges =
           embedding_queue.pop_n(current_ops);
       // shufle batch_edges
-      std::shuffle(batch_edges.begin(), batch_edges.end(),
-                   std::default_random_engine(42));
+      // std::shuffle(batch_edges.begin(), batch_edges.end(),
+      //              std::default_random_engine(42));
       // src, dst, epoch 리스트를 만든다. h for host
-      std::vector<Idx_t> h_srcs, h_dsts;
-      std::vector<size_t> h_epochs;
-      h_srcs.reserve(batch_edges.size());
-      h_dsts.reserve(batch_edges.size());
-      h_epochs.reserve(batch_edges.size());
+      const size_t n_edges = batch_edges.size();
+      std::vector<Idx_t> h_srcs(n_edges), h_dsts(n_edges), h_indices(n_edges);
+      std::vector<float> h_current_epochs(n_edges),
+          h_next_sample_epochs(n_edges), h_next_neg_epochs(n_edges);
 
-      for (const auto &e : batch_edges) {
-        h_srcs.push_back(std::get<0>(e));
-        h_dsts.push_back(std::get<1>(e));
-        h_epochs.push_back(std::get<2>(e));
+      for (size_t i = 0; i < n_edges; ++i) {
+        h_srcs[i] = std::get<0>(batch_edges[i]);
+        h_dsts[i] = std::get<1>(batch_edges[i]);
+        h_indices[i] = static_cast<Idx_t>(i);
+        h_current_epochs[i] = std::get<2>(batch_edges[i]);
+        h_next_sample_epochs[i] = std::get<3>(batch_edges[i]);
+        h_next_neg_epochs[i] = std::get<4>(batch_edges[i]);
       }
 
-      // 커널 실행 준비를 위해 src,dst에 대한 디바이스 vector
-      rmm::device_uvector<Idx_t> d_srcs(h_srcs.size(), embedding_stream),
-          d_dsts(h_dsts.size(), embedding_stream);
-
-      rmm::device_uvector<Idx_t> d_out_srcs(h_srcs.size(), embedding_stream),
-          d_out_dsts(h_dsts.size(), embedding_stream);
-      rmm::device_uvector<size_t> d_epochs(h_epochs.size(), embedding_stream);
-      rmm::device_uvector<size_t> d_out_epochs(h_epochs.size(),
-                                               embedding_stream);
-
+      // 커널 실행 준비를 위해 src, dst, index 디바이스 vector 업로드
+      rmm::device_uvector<Idx_t> d_srcs(n_edges, embedding_stream),
+          d_dsts(n_edges, embedding_stream),
+          d_indices(n_edges, embedding_stream);
+      rmm::device_uvector<Idx_t> d_out_srcs(n_edges, embedding_stream),
+          d_out_dsts(n_edges, embedding_stream),
+          d_out_indices(n_edges, embedding_stream);
       rmm::device_scalar<unsigned long long> d_out_count(embedding_stream);
 
-      // 호스트 -> 디바이스 복사
-      cudaMemcpyAsync(d_srcs.data(), h_srcs.data(),
-                      h_srcs.size() * sizeof(Idx_t), cudaMemcpyHostToDevice,
+      cudaMemcpyAsync(d_srcs.data(), h_srcs.data(), n_edges * sizeof(Idx_t),
+                      cudaMemcpyHostToDevice, embedding_stream);
+      cudaMemcpyAsync(d_dsts.data(), h_dsts.data(), n_edges * sizeof(Idx_t),
+                      cudaMemcpyHostToDevice, embedding_stream);
+      cudaMemcpyAsync(d_indices.data(), h_indices.data(),
+                      n_edges * sizeof(Idx_t), cudaMemcpyHostToDevice,
                       embedding_stream);
 
-      cudaMemcpyAsync(d_dsts.data(), h_dsts.data(),
-                      h_dsts.size() * sizeof(Idx_t), cudaMemcpyHostToDevice,
-                      embedding_stream);
-      cudaMemcpyAsync(d_epochs.data(), h_epochs.data(),
-                      h_epochs.size() * sizeof(size_t), cudaMemcpyHostToDevice,
-                      embedding_stream);
-
-      // 이웃인 엣지들만 남긴다. (필터링 커널 실행)
-      filter_edges_by_neighbors<Idx_t, size_t>(
-          d_srcs.data(), d_dsts.data(), d_epochs.data(), d_out_srcs.data(),
-          d_out_dsts.data(), d_out_epochs.data(), batch_edges.size(),
+      // 이웃인 엣지들만 남긴다. payload = index → 살아남은 index를 복원에 사용
+      filter_edges_by_neighbors<Idx_t, Idx_t>(
+          d_srcs.data(), d_dsts.data(), d_indices.data(), d_out_srcs.data(),
+          d_out_dsts.data(), d_out_indices.data(), n_edges,
           storage.neighbor_indices.data(), storage.neighbor_indices_block_size,
           storage.n_neighbors, d_out_count.data(), embedding_stream);
 
@@ -268,13 +258,12 @@ struct GPUMAP::Impl {
       if (h_out_count == 0) {
         // 여전히 이웃인 pair가 하나도 없다면..
         // TODO 만약 진짜 하나도 없다면 몇 번 더봐야 하지 않나?
-        return;
+        continue;
       }
 
-      // 실제 src, dst 호스트로 복사
-      std::vector<Idx_t> h_out_srcs(h_out_count);
-      std::vector<Idx_t> h_out_dsts(h_out_count);
-      std::vector<size_t> h_out_epochs(h_out_count);
+      // 살아남은 edge의 src, dst, index 복사
+      std::vector<Idx_t> h_out_srcs(h_out_count), h_out_dsts(h_out_count),
+          h_out_indices(h_out_count);
 
       cudaMemcpyAsync(h_out_srcs.data(), d_out_srcs.data(),
                       h_out_count * sizeof(Idx_t), cudaMemcpyDeviceToHost,
@@ -282,9 +271,37 @@ struct GPUMAP::Impl {
       cudaMemcpyAsync(h_out_dsts.data(), d_out_dsts.data(),
                       h_out_count * sizeof(Idx_t), cudaMemcpyDeviceToHost,
                       embedding_stream);
-      cudaMemcpyAsync(h_out_epochs.data(), d_out_epochs.data(),
-                      h_out_count * sizeof(size_t), cudaMemcpyDeviceToHost,
+      cudaMemcpyAsync(h_out_indices.data(), d_out_indices.data(),
+                      h_out_count * sizeof(Idx_t), cudaMemcpyDeviceToHost,
                       embedding_stream);
+      cudaStreamSynchronize(embedding_stream);
+
+      // 살아남은 index를 이용해 epoch 배열 복원
+      std::vector<float> h_out_current_epochs(h_out_count),
+          h_out_next_sample_epochs(h_out_count),
+          h_out_next_neg_epochs(h_out_count);
+      for (size_t i = 0; i < h_out_count; ++i) {
+        const Idx_t idx = h_out_indices[i];
+        h_out_current_epochs[i] = h_current_epochs[idx];
+        h_out_next_sample_epochs[i] = h_next_sample_epochs[idx];
+        h_out_next_neg_epochs[i] = h_next_neg_epochs[idx];
+      }
+
+      // epoch 배열을 디바이스로 업로드
+      rmm::device_uvector<float> d_out_current_epochs(h_out_count,
+                                                      embedding_stream),
+          d_out_next_sample_epochs(h_out_count, embedding_stream),
+          d_out_next_neg_epochs(h_out_count, embedding_stream);
+      cudaMemcpyAsync(d_out_current_epochs.data(), h_out_current_epochs.data(),
+                      h_out_count * sizeof(float), cudaMemcpyHostToDevice,
+                      embedding_stream);
+      cudaMemcpyAsync(d_out_next_sample_epochs.data(),
+                      h_out_next_sample_epochs.data(),
+                      h_out_count * sizeof(float), cudaMemcpyHostToDevice,
+                      embedding_stream);
+      cudaMemcpyAsync(d_out_next_neg_epochs.data(),
+                      h_out_next_neg_epochs.data(), h_out_count * sizeof(float),
+                      cudaMemcpyHostToDevice, embedding_stream);
 
       cudaStreamSynchronize(embedding_stream);
 
@@ -299,8 +316,8 @@ struct GPUMAP::Impl {
       unique_indices.erase(
           std::unique(unique_indices.begin(), unique_indices.end()),
           unique_indices.end());
-      fprintf(stderr, "[GPUMAP] unique indices count=%zu\n",
-              unique_indices.size());
+      // fprintf(stderr, "[GPUMAP] unique indices count=%zu\n",
+      //         unique_indices.size());
 
       // 남은 엣지들 중에서 dirty한 녀석들을 보고 dirty하다면 sigma_i를
       // 업데이트해준다.
@@ -317,20 +334,31 @@ struct GPUMAP::Impl {
           storage.n_neighbors, embedding_stream);
 
       update_embeddings<Data_t, Idx_t>(
-          d_out_srcs.data(), d_out_dsts.data(), d_out_epochs.data(),
+          d_out_srcs.data(), d_out_dsts.data(), d_out_current_epochs.data(),
+          d_out_next_sample_epochs.data(), d_out_next_neg_epochs.data(),
           h_out_count, storage.embedding.data(), params.n_components,
           storage.n_inserted_instances, storage.neighbor_indices.data(),
           storage.neighbor_indices_block_size, storage.neighbor_dists.data(),
-          storage.neighbor_dists_block_size, storage.n_neighbors, params.a,
-          params.b, params.alpha, params.max_epoch, params.negative_sample_rate,
-          embedding_stream);
+          storage.neighbor_dists_block_size, storage.n_neighbors,
+          storage.max_w.data(), params.a, params.b, params.alpha,
+          params.max_epoch, params.negative_sample_rate, embedding_stream);
+
+      raft::copy(h_out_current_epochs.data(), d_out_current_epochs.data(),
+                 h_out_count, embedding_stream);
+      raft::copy(h_out_next_sample_epochs.data(),
+                 d_out_next_sample_epochs.data(), h_out_count,
+                 embedding_stream);
+      raft::copy(h_out_next_neg_epochs.data(), d_out_next_neg_epochs.data(),
+                 h_out_count, embedding_stream);
 
       std::vector<gpumap::Edge> requeue_edges;
       requeue_edges.reserve(h_out_count);
       for (size_t i = 0; i < h_out_count; ++i) {
-        const size_t next_epoch = h_out_epochs[i] + 1;
-        if (next_epoch <= params.max_epoch) {
-          requeue_edges.emplace_back(h_out_srcs[i], h_out_dsts[i], next_epoch);
+        const float next_epoch = h_out_current_epochs[i];
+        if (next_epoch <= static_cast<float>(params.max_epoch)) {
+          requeue_edges.emplace_back(
+              h_out_srcs[i], h_out_dsts[i], h_out_current_epochs[i],
+              h_out_next_sample_epochs[i], h_out_next_neg_epochs[i]);
         }
       }
 

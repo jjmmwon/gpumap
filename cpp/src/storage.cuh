@@ -1,10 +1,12 @@
 #pragma once
 
 #include "kernels/nndescent/buffers.cuh"
+#include "raft/core/device_mdarray.hpp"
 #include "rmm/device_uvector.hpp"
 #include <cuda_runtime.h>
 #include <raft/core/resources.hpp>
 #include <rmm/cuda_stream_view.hpp>
+#include <rmm/device_scalar.hpp>
 #include <rmm/mr/per_device_resource.hpp>
 
 namespace gpumap {
@@ -55,6 +57,7 @@ template <typename Data_t = float, typename Idx_t = uint32_t> struct Storage {
 
   // Embedding matrices
   rmm::device_uvector<Data_t> embedding;
+  rmm::device_scalar<float> max_w;
 
   // Declared before raft_res and nnd_buffer: initialized first, ensures CUDA
   // runtime is ready before NNDBuffers makes its first device/pinned alloc.
@@ -102,7 +105,8 @@ template <typename Data_t = float, typename Idx_t = uint32_t> struct Storage {
         data(0, rmm::cuda_stream_default),
         neighbor_indices(0, rmm::cuda_stream_default),
         neighbor_dists(0, rmm::cuda_stream_default),
-        embedding(0, rmm::cuda_stream_default), cuda_warmup(), raft_res(),
+        embedding(0, rmm::cuda_stream_default),
+        max_w(0.0f, rmm::cuda_stream_default), cuda_warmup(), raft_res(),
         nnd_buffer(raft_res, n_instances_, n_neighbors_) {
     allocate_matrices();
   }

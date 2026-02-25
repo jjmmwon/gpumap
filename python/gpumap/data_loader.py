@@ -14,8 +14,9 @@ class DataLoader:
 
 
 def load_mnist_numpy():
-    X, y = fetch_openml("mnist_784", version=1, return_X_y=True, as_frame=False)
-    return X.astype(np.float32) / 255.0, y.astype(np.int64)
+    X = np.load("data/mnist_X.npy")
+    y = np.load("data/mnist_y.npy")
+    return X, y
 
 
 class PreloadMNISTDataLoader(DataLoader):

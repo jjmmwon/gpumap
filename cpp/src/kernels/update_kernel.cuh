@@ -18,7 +18,7 @@ void update_kernel(
 
     nnd::NNDBuffers<Data_t, Index_t> &buffers, std::vector<Idx_t> batch_indices,
     std::vector<Idx_t> &affected_indices,
-    std::vector<std::tuple<Idx_t, Idx_t, Idx_t>> &affected_edges,
+    std::vector<std::tuple<Idx_t, Idx_t, float, float, float>> &affected_edges,
     cudaStream_t update_stream,
 
     Data_t *input_data, Idx_t *neighbor_indices, Data_t *neighbor_distances,

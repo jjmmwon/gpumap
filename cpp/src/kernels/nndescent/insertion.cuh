@@ -2,6 +2,7 @@
 
 #include "buffers.cuh"
 
+#include <cstdint>
 #include <utility>
 #include <vector>
 
@@ -35,8 +36,9 @@ public:
         n_inserted_instances_(n_inserted_instances), max_iter_(max_iter),
         termination_threshold_(termination_threshold), seed_(seed) {}
 
-  void run(cudaStream_t const stream, std::vector<Idx_t> &affected_indices,
-           std::vector<std::tuple<Idx_t, Idx_t, Idx_t>> &new_edges);
+  void
+  run(cudaStream_t const stream, std::vector<Idx_t> &affected_indices,
+      std::vector<std::tuple<Idx_t, Idx_t, float, float, float>> &new_edges);
   void preprocess_l2_norms(cudaStream_t const stream);
   void initialize_random_neighbors(InternalID_t *graph_buffer,
                                    Data_t *distance_buffer,

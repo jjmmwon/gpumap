@@ -918,7 +918,8 @@ void UpdateAlgo<Data_t, Idx_t, Index_t>::add_reverse_edges(
 template <typename Data_t, typename Idx_t, typename Index_t>
 void UpdateAlgo<Data_t, Idx_t, Index_t>::run(
     cudaStream_t stream, std::vector<Idx_t> &affected_indices,
-    std::vector<std::tuple<Idx_t, Idx_t, Idx_t>> &affected_edges) {
+    std::vector<std::tuple<Idx_t, Idx_t, float, float, float>>
+        &affected_edges) {
 
   const raft::resources res_;
   raft::resource::set_cuda_stream(res_, stream);
@@ -1040,8 +1041,8 @@ void UpdateAlgo<Data_t, Idx_t, Index_t>::run(
 
       for (size_t j = 0; j < n_neighbors_; ++j) {
         if (h_neighbor_row[j] != std::numeric_limits<Idx_t>::max()) {
-          affected_edges.emplace_back(row_id, h_neighbor_row[j],
-                                      static_cast<Idx_t>(0));
+          affected_edges.emplace_back(row_id, h_neighbor_row[j], 0.f, -1.f,
+                                      -1.f);
         }
       }
 

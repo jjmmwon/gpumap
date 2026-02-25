@@ -9,6 +9,17 @@
 
 namespace gpumap {
 
+__device__ __forceinline__ float atomicMaxFloat(float *addr, float val) {
+  int *addr_as_int = reinterpret_cast<int *>(addr);
+  int old = *addr_as_int, assumed;
+  do {
+    assumed = old;
+    old = atomicCAS(addr_as_int, assumed,
+                    __float_as_int(fmaxf(val, __int_as_float(assumed))));
+  } while (assumed != old);
+  return __int_as_float(old);
+}
+
 template <typename Idx_t>
 __device__ __forceinline__ bool is_neighbor(const Idx_t *neighbors,
                                             size_t n_neighbors, Idx_t dst) {
@@ -231,13 +242,14 @@ void update_sigma_for_dirty(const Idx_t *indices, size_t n_indices,
 template <typename Data_t, typename Idx_t>
 __global__ void update_embeddings_kernel(
     const Idx_t *__restrict__ srcs, const Idx_t *__restrict__ dsts,
-    const size_t *__restrict__ epochs, size_t n_edges,
+    float *__restrict__ current_epochs, float *__restrict__ next_sample_epochs,
+    float *__restrict__ next_neg_epochs, size_t n_edges,
     Data_t *__restrict__ embedding, int n_components,
     size_t n_inserted_instances, const Idx_t *__restrict__ neighbor_indices,
     size_t neighbor_indices_block_size,
     const Data_t *__restrict__ neighbor_dists, size_t neighbor_dists_block_size,
-    size_t n_neighbors, float a, float b, float alpha, size_t max_epoch,
-    size_t negative_sample_rate, unsigned long long seed) {
+    size_t n_neighbors, float *max_w, float a, float b, float alpha,
+    size_t max_epoch, size_t negative_sample_rate, unsigned long long seed) {
 
   const size_t tid = static_cast<size_t>(blockIdx.x * blockDim.x + threadIdx.x);
   if (tid >= n_edges) {
@@ -246,8 +258,18 @@ __global__ void update_embeddings_kernel(
 
   const Idx_t src = srcs[tid];
   const Idx_t dst = dsts[tid];
-  const size_t epoch = epochs[tid];
+
+  // TODO: skip if epoch < next_sample_epochs[tid] (UMAP-style sampling)
   if (src >= n_inserted_instances || dst >= n_inserted_instances) {
+    return;
+  }
+  const float current_epoch = current_epochs[tid];
+  const float next_sample_epoch = next_sample_epochs[tid];
+  const float next_neg_epoch = next_neg_epochs[tid];
+
+  current_epochs[tid] = current_epoch + 2.0f;
+
+  if (current_epoch < next_sample_epoch) {
     return;
   }
 
@@ -265,9 +287,12 @@ __global__ void update_embeddings_kernel(
   const Data_t d_ji =
       find_neighbor_dist(dst_neighbors, dst_dists, n_neighbors, src, &found_ji);
   if (!found_ij) {
+    current_epochs[tid] = max_epoch;
     return;
   }
 
+  // TODO: weight 계산을 update sigma할때 한번에 하고 재사용하는 방식을 할지
+  // 고려
   const Data_t rho_i = src_dists[0];
   const Data_t rho_j = dst_dists[0];
   const Data_t sigma_i = src_dists[neighbor_dists_block_size - 1];
@@ -282,28 +307,47 @@ __global__ void update_embeddings_kernel(
                : Data_t{0};
   const Data_t w_ij = Data_t{1} - (Data_t{1} - p_ij) * (Data_t{1} - p_ji);
 
+  atomicMaxFloat(max_w, w_ij);
+
+  const float epoch_per_sample =
+      *max_w / w_ij + 1e-6f; // add small value to avoid division by zero
+  const float epoch_per_negative_sample =
+      epoch_per_sample / static_cast<float>(negative_sample_rate);
+
+  if (current_epoch < 1.0f || next_sample_epoch < 0.0f ||
+      next_neg_epoch < 0.0f) {
+    next_sample_epochs[tid] = epoch_per_sample;
+    next_neg_epochs[tid] = epoch_per_negative_sample;
+    return;
+  }
+
   const size_t src_offset = static_cast<size_t>(src) * n_components;
   const size_t dst_offset = static_cast<size_t>(dst) * n_components;
   const Data_t dx = embedding[src_offset] - embedding[dst_offset];
   const Data_t dy = embedding[src_offset + 1] - embedding[dst_offset + 1];
   const Data_t r2 = dx * dx + dy * dy + Data_t{1e-6f};
   const Data_t r2b = powf(r2, b);
-  const Data_t gpos =
+  const Data_t grad_coeff =
       Data_t{2} * a * b * powf(r2, b - Data_t{1}) / (Data_t{1} + a * r2b);
-  const Data_t decayed_alpha = (1.0f - (float)epoch / max_epoch) * alpha;
-  const Data_t coeff = clip(w_ij * gpos) * decayed_alpha;
-  // Data_t coeff = clip(w_ij * gpos) * alpha;
+  const Data_t decayed_alpha =
+      (1.0f - current_epoch / static_cast<float>(max_epoch)) * alpha;
 
-  atomicAdd(&embedding[src_offset], -coeff * dx);
-  atomicAdd(&embedding[src_offset + 1], -coeff * dy);
-  atomicAdd(&embedding[dst_offset], coeff * dx);
-  atomicAdd(&embedding[dst_offset + 1], coeff * dy);
+  const Data_t grad_dx = clip(grad_coeff * dx) * decayed_alpha;
+  const Data_t grad_dy = clip(grad_coeff * dy) * decayed_alpha;
+
+  atomicAdd(&embedding[src_offset], -grad_dx);
+  atomicAdd(&embedding[src_offset + 1], -grad_dy);
+  atomicAdd(&embedding[dst_offset], grad_dx);
+  atomicAdd(&embedding[dst_offset + 1], grad_dy);
+
+  const int n_neg_samples = static_cast<int>((current_epoch - next_neg_epoch) /
+                                             epoch_per_negative_sample);
 
   curandStatePhilox4_32_10_t rng_state;
-  curand_init(seed ^ static_cast<unsigned long long>(tid), epoch, 0,
+  curand_init(seed ^ static_cast<unsigned long long>(tid), current_epoch, 0,
               &rng_state);
 
-  for (size_t n = 0; n < negative_sample_rate; ++n) {
+  for (size_t n = 0; n < n_neg_samples; ++n) {
     Idx_t neg = static_cast<Idx_t>(curand(&rng_state) % n_inserted_instances);
     if (neg == src || neg == dst) {
       neg = (neg + 1) % n_inserted_instances;
@@ -314,32 +358,37 @@ __global__ void update_embeddings_kernel(
     const Data_t ndy = embedding[src_offset + 1] - embedding[neg_offset + 1];
     const Data_t nr2 = ndx * ndx + ndy * ndy + Data_t{1e-6f};
     const Data_t nr2b = powf(nr2, b);
-    const Data_t gneg = (Data_t{2} * b) / ((Data_t{1} + a * nr2b) * nr2);
+    const Data_t gneg =
+        (Data_t{2} * b) / ((Data_t{1} + a * nr2b) * (nr2 + Data_t{1e-3f}));
     // Linearly increase from 0 to 1 in the first 50% of epochs
     float bypass_factor =
-        static_cast<float>(epoch) / static_cast<float>(max_epoch) > 0.2f
+        static_cast<float>(current_epoch) / static_cast<float>(max_epoch) > 0.2f
             ? 1.0f
-            : 5.0f * static_cast<float>(epoch) / static_cast<float>(max_epoch);
-    const Data_t ncoeff = clip(gneg) * decayed_alpha * bypass_factor;
-    // const Data_t ncoeff = clip(gneg) * alpha * bypass_factor;
+            : 5.0f * static_cast<float>(current_epoch) /
+                  static_cast<float>(max_epoch);
 
-    atomicAdd(&embedding[src_offset], ncoeff * ndx);
-    atomicAdd(&embedding[src_offset + 1], ncoeff * ndy);
-    // atomicAdd(&embedding[neg_offset], -ncoeff * ndx);
-    // atomicAdd(&embedding[neg_offset + 1], -ncoeff * ndy);
+    const Data_t grad_ndx = clip(gneg * ndx) * decayed_alpha * bypass_factor;
+    const Data_t grad_ndy = clip(gneg * ndy) * decayed_alpha * bypass_factor;
+
+    atomicAdd(&embedding[src_offset], grad_ndx);
+    atomicAdd(&embedding[src_offset + 1], grad_ndy);
+    // atomicAdd(&embedding[neg_offset], -grad_ndx);
+    // atomicAdd(&embedding[neg_offset + 1], -grad_ndy);
   }
+
+  next_sample_epochs[tid] += epoch_per_sample;
+  next_neg_epochs[tid] += epoch_per_negative_sample * n_neg_samples;
 }
 
 template <typename Data_t, typename Idx_t>
-void update_embeddings(const Idx_t *srcs, const Idx_t *dsts,
-                       const size_t *epochs, size_t n_edges, Data_t *embedding,
-                       int n_components, size_t n_inserted_instances,
-                       const Idx_t *neighbor_indices,
-                       size_t neighbor_indices_block_size,
-                       const Data_t *neighbor_dists,
-                       size_t neighbor_dists_block_size, size_t n_neighbors,
-                       float a, float b, float alpha, size_t max_epoch,
-                       size_t negative_sample_rate, cudaStream_t stream) {
+void update_embeddings(
+    const Idx_t *srcs, const Idx_t *dsts, float *current_epochs,
+    float *next_sample_epochs, float *next_neg_epochs, size_t n_edges,
+    Data_t *embedding, int n_components, size_t n_inserted_instances,
+    const Idx_t *neighbor_indices, size_t neighbor_indices_block_size,
+    const Data_t *neighbor_dists, size_t neighbor_dists_block_size,
+    size_t n_neighbors, float *max_w, float a, float b, float alpha,
+    size_t max_epoch, size_t negative_sample_rate, cudaStream_t stream) {
 
   if (n_edges == 0) {
     return;
@@ -350,10 +399,11 @@ void update_embeddings(const Idx_t *srcs, const Idx_t *dsts,
   const unsigned long long seed = 42ULL;
   update_embeddings_kernel<Data_t, Idx_t>
       <<<blocks, threads_per_block, 0, stream>>>(
-          srcs, dsts, epochs, n_edges, embedding, n_components,
-          n_inserted_instances, neighbor_indices, neighbor_indices_block_size,
-          neighbor_dists, neighbor_dists_block_size, n_neighbors, a, b, alpha,
-          max_epoch, negative_sample_rate, seed);
+          srcs, dsts, current_epochs, next_sample_epochs, next_neg_epochs,
+          n_edges, embedding, n_components, n_inserted_instances,
+          neighbor_indices, neighbor_indices_block_size, neighbor_dists,
+          neighbor_dists_block_size, n_neighbors, max_w, a, b, alpha, max_epoch,
+          negative_sample_rate, seed);
 }
 
 } // namespace gpumap
