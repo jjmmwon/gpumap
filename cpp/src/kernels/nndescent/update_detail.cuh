@@ -918,8 +918,7 @@ void UpdateAlgo<Data_t, Idx_t, Index_t>::add_reverse_edges(
 template <typename Data_t, typename Idx_t, typename Index_t>
 void UpdateAlgo<Data_t, Idx_t, Index_t>::run(
     cudaStream_t stream, std::vector<Idx_t> &affected_indices,
-    std::vector<std::tuple<Idx_t, Idx_t, float, float, float>>
-        &affected_edges) {
+    std::vector<std::tuple<Idx_t, Idx_t, float, float, float>> &new_edges) {
 
   const raft::resources res_;
   raft::resource::set_cuda_stream(res_, stream);
@@ -931,6 +930,17 @@ void UpdateAlgo<Data_t, Idx_t, Index_t>::run(
   std::vector<int> d_dirty_flags_host(n_inserted_instances_, 0);
   std::vector<Idx_t> neighbor_changed_indices;
 
+  auto neighbor_snapshot =
+      raft::make_host_matrix<Idx_t, size_t, raft::row_major>(
+          batch_indices_.size(), n_neighbors_);
+
+  for (size_t i = 0; i < batch_indices_.size(); ++i) {
+    size_t row = static_cast<size_t>(batch_indices_[i]);
+    raft::copy(neighbor_snapshot.data_handle() + i * n_neighbors_,
+               neighbor_indices + row * neighbor_indices_block_size_,
+               n_neighbors_, stream);
+  }
+
   std::fill_n(buffers_.h_dirty_flags_.data_handle(), n_inserted_instances_,
               DIRTY_NONE);
 
@@ -938,6 +948,16 @@ void UpdateAlgo<Data_t, Idx_t, Index_t>::run(
              buffers_.h_dirty_flags_.data_handle(), n_inserted_instances_,
              stream);
   raft::resource::sync_stream(res_);
+
+  // Returns true if id already existed in batch index i's pre-NND snapshot.
+  auto contains_id = [&](size_t i, int id) -> bool {
+    const Idx_t *snap = neighbor_snapshot.data_handle() + i * n_neighbors_;
+    for (uint32_t j = 0; j < n_neighbors_; ++j) {
+      if (static_cast<int>(snap[j]) == id)
+        return true;
+    }
+    return false;
+  };
 
   sample_graph(true);
 
@@ -1039,13 +1059,6 @@ void UpdateAlgo<Data_t, Idx_t, Index_t>::run(
             valid_id ? row_dists[j] : std::numeric_limits<Data_t>::max();
       }
 
-      for (size_t j = 0; j < n_neighbors_; ++j) {
-        if (h_neighbor_row[j] != std::numeric_limits<Idx_t>::max()) {
-          affected_edges.emplace_back(row_id, h_neighbor_row[j], 0.f, -1.f,
-                                      -1.f);
-        }
-      }
-
       raft::copy(neighbor_indices + row * neighbor_indices_block_size_,
                  h_neighbor_row.data(), n_neighbors_, stream);
       raft::copy(neighbor_distances + row * neighbor_dists_block_size_,
@@ -1059,6 +1072,22 @@ void UpdateAlgo<Data_t, Idx_t, Index_t>::run(
       }
     }
     raft::resource::sync_stream(res_);
+  }
+
+  // Emit only genuinely new edges: neighbors of batch_indices_ that were
+  // absent in the pre-NND snapshot.
+  for (size_t i = 0; i < batch_indices_.size(); ++i) {
+    const Idx_t idx = batch_indices_[i];
+    const size_t row = static_cast<size_t>(idx);
+    const InternalID_t *list =
+        buffers_.h_graph.data_handle() + row * n_neighbors_;
+    for (uint32_t j = 0; j < n_neighbors_; ++j) {
+      const int nid = list[j].id();
+      if (nid >= 0 && static_cast<size_t>(nid) < n_inserted_instances_ &&
+          static_cast<size_t>(nid) != row && !contains_id(i, nid)) {
+        new_edges.emplace_back(idx, static_cast<Idx_t>(nid), 0.f, -1.f, -1.f);
+      }
+    }
   }
 }
 

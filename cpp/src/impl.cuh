@@ -178,10 +178,10 @@ struct GPUMAP::Impl {
     std::vector<Idx_t> batch_indices = update_queue.pop_n(n_ops);
 
     std::vector<Idx_t> affected_indices;
-    std::vector<gpumap::Edge> affected_edges;
+    std::vector<gpumap::Edge> new_edges;
 
     update_kernel<Data_t, Idx_t>(
-        storage.nnd_buffer, batch_indices, affected_indices, affected_edges,
+        storage.nnd_buffer, batch_indices, affected_indices, new_edges,
         update_stream,
 
         storage.data.data(), storage.neighbor_indices.data(),
@@ -196,7 +196,7 @@ struct GPUMAP::Impl {
 
     // printf("Affected indices count: %zu\n", affected_indices.size());
     update_queue.push_batch(affected_indices);
-    embedding_queue.push_batch(affected_edges);
+    embedding_queue.push_batch(new_edges);
   }
 
   void embed(size_t n_ops) {
