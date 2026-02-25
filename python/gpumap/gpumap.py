@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import numpy as np
 import cupy as cp
+from scipy.optimize import curve_fit
+
 
 from gpumap.validators import validate_data_chunk
 from gpumap.utils import _as_f32_c_contig_2d
@@ -10,6 +12,18 @@ from . import _core
 from .scheduler import Scheduler, DefaultScheduler
 from .estimator import Estimator, DefaultLinearEstimator
 from .data_loader import DataLoader
+
+
+def find_ab_params(spread, min_dist):
+    def curve(x, a, b):
+        return 1.0 / (1.0 + a * x ** (2 * b))
+
+    xv = np.linspace(0, spread * 3, 300)
+    yv = np.zeros(xv.shape)
+    yv[xv < min_dist] = 1.0
+    yv[xv >= min_dist] = np.exp(-(xv[xv >= min_dist] - min_dist) / spread)
+    params, _ = curve_fit(curve, xv, yv)
+    return params[0], params[1]
 
 
 class GPUMAP:
@@ -27,6 +41,11 @@ class GPUMAP:
         self.data_loader = data_loader
         self._params = params
         self.scheduler = scheduler
+
+        if self.params.min_dist > 1.0:
+            raise ValueError("min_dist must be <= 1.0")
+        self.params.a, self.params.b = find_ab_params(1.0, self.params.min_dist)
+
         try:
             self._impl = _core.GPUMAP(self.params)
         except MemoryError:
@@ -42,7 +61,6 @@ class GPUMAP:
 
         self.default_n_ops = default_n_ops
 
-        # TODO
         self._impl.initialize(self.data_loader.n_instances, self.data_loader.n_features)
 
     @property
@@ -51,7 +69,6 @@ class GPUMAP:
 
     def close(self):
         if not self._closed:
-            # TODO
             self._impl.close()
             self._closed = True
 
