@@ -349,7 +349,7 @@ initalize_random_embeddings_kernel(Data_t *embedding, int n_components,
 
   for (uint32_t dim = 0; dim < n_components; ++dim) {
     embedding[row * n_components + dim] =
-        static_cast<Data_t>(curand_uniform(&state));
+        static_cast<Data_t>(curand_normal(&state));
   }
 }
 

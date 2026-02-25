@@ -3,7 +3,9 @@
 // #include <__clang_cuda_runtime_wrapper.h>
 #include <cmath>
 #include <cstddef>
+#include <cstdio>
 #include <cuda_runtime.h>
+#include <curand_kernel.h>
 
 namespace gpumap {
 
@@ -16,6 +18,17 @@ __device__ __forceinline__ bool is_neighbor(const Idx_t *neighbors,
     }
   }
   return false;
+}
+
+template <typename Data_t>
+__device__ __forceinline__ Data_t clip(Data_t value) {
+  if (value > static_cast<Data_t>(4.0)) {
+    return static_cast<Data_t>(4.0);
+  } else if (value < static_cast<Data_t>(-4.0)) {
+    return static_cast<Data_t>(-4.0);
+  } else {
+    return value;
+  }
 }
 
 template <typename Idx_t, typename Data_t>
@@ -278,24 +291,20 @@ __global__ void update_embeddings_kernel(
   const Data_t gpos =
       Data_t{2} * a * b * powf(r2, b - Data_t{1}) / (Data_t{1} + a * r2b);
   const Data_t decayed_alpha = (1.0f - (float)epoch / max_epoch) * alpha;
-  const Data_t coeff = max(min(w_ij * gpos, 4.0), -4.0) * decayed_alpha;
-
-  // embedding[src_offset] = 0;
-  // embedding[dst_offset] = 0;
+  const Data_t coeff = clip(w_ij * gpos) * decayed_alpha;
+  // Data_t coeff = clip(w_ij * gpos) * alpha;
 
   atomicAdd(&embedding[src_offset], -coeff * dx);
   atomicAdd(&embedding[src_offset + 1], -coeff * dy);
   atomicAdd(&embedding[dst_offset], coeff * dx);
   atomicAdd(&embedding[dst_offset + 1], coeff * dy);
 
-  unsigned long long rng =
-      (epoch + 1) ^ (static_cast<unsigned long long>(src) * 73856093ULL) ^
-      (static_cast<unsigned long long>(dst) * 19349663ULL) ^
-      (static_cast<unsigned long long>(tid) * 83492791ULL);
+  curandStatePhilox4_32_10_t rng_state;
+  curand_init(seed ^ static_cast<unsigned long long>(tid), epoch, 0,
+              &rng_state);
 
   for (size_t n = 0; n < negative_sample_rate; ++n) {
-    rng = rng * 2862933555777941757ULL + 3037000493ULL;
-    Idx_t neg = static_cast<Idx_t>(rng % n_inserted_instances);
+    Idx_t neg = static_cast<Idx_t>(curand(&rng_state) % n_inserted_instances);
     if (neg == src || neg == dst) {
       neg = (neg + 1) % n_inserted_instances;
     }
@@ -306,7 +315,13 @@ __global__ void update_embeddings_kernel(
     const Data_t nr2 = ndx * ndx + ndy * ndy + Data_t{1e-6f};
     const Data_t nr2b = powf(nr2, b);
     const Data_t gneg = (Data_t{2} * b) / ((Data_t{1} + a * nr2b) * nr2);
-    const Data_t ncoeff = max(min(gneg, 4.0), -4.0) * decayed_alpha;
+    // Linearly increase from 0 to 1 in the first 50% of epochs
+    float bypass_factor =
+        static_cast<float>(epoch) / static_cast<float>(max_epoch) > 0.2f
+            ? 1.0f
+            : 5.0f * static_cast<float>(epoch) / static_cast<float>(max_epoch);
+    const Data_t ncoeff = clip(gneg) * decayed_alpha * bypass_factor;
+    // const Data_t ncoeff = clip(gneg) * alpha * bypass_factor;
 
     atomicAdd(&embedding[src_offset], ncoeff * ndx);
     atomicAdd(&embedding[src_offset + 1], ncoeff * ndy);
@@ -329,7 +344,6 @@ void update_embeddings(const Idx_t *srcs, const Idx_t *dsts,
   if (n_edges == 0) {
     return;
   }
-
   const int threads_per_block = 256;
   const int blocks =
       static_cast<int>((n_edges + threads_per_block - 1) / threads_per_block);

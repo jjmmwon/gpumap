@@ -917,11 +917,13 @@ void UpdateAlgo<Data_t, Idx_t, Index_t>::add_reverse_edges(
 
 template <typename Data_t, typename Idx_t, typename Index_t>
 void UpdateAlgo<Data_t, Idx_t, Index_t>::run(
-    cudaStream_t stream,
+    cudaStream_t stream, std::vector<Idx_t> &affected_indices,
     std::vector<std::tuple<Idx_t, Idx_t, Idx_t>> &affected_edges) {
 
   const raft::resources res_;
   raft::resource::set_cuda_stream(res_, stream);
+  cudaMemsetAsync(buffers_.d_locks_.data_handle(), 0,
+                  n_inserted_instances_ * sizeof(int), stream);
 
   update_counter_ = 0;
 
@@ -1052,6 +1054,7 @@ void UpdateAlgo<Data_t, Idx_t, Index_t>::run(
         raft::copy(neighbor_indices + row * neighbor_indices_block_size_ +
                        (neighbor_indices_block_size_ - 1),
                    &dirty_flag_one, 1, stream);
+        affected_indices.push_back(row_id);
       }
     }
     raft::resource::sync_stream(res_);

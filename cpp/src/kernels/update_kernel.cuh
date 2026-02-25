@@ -15,8 +15,9 @@ namespace nnd = nndescent;
 
 template <typename Data_t, typename Idx_t, typename Index_t = int>
 void update_kernel(
-    // Buffers and parameters
+
     nnd::NNDBuffers<Data_t, Index_t> &buffers, std::vector<Idx_t> batch_indices,
+    std::vector<Idx_t> &affected_indices,
     std::vector<std::tuple<Idx_t, Idx_t, Idx_t>> &affected_edges,
     cudaStream_t update_stream,
 
@@ -48,7 +49,7 @@ void update_kernel(
       n_instances, n_features, n_neighbors, n_inserted_instances, max_iter,
       termination_threshold);
 
-  updater.run(update_stream, affected_edges);
+  updater.run(update_stream, affected_indices, affected_edges);
 
   // neighbor_changed_indices를 embedding_queue에 추가
 }

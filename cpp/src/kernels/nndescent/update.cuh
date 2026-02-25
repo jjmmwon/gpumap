@@ -44,7 +44,7 @@ public:
         batch_indices_.end());
   }
 
-  void run(cudaStream_t const stream,
+  void run(cudaStream_t const stream, std::vector<Idx_t> &affected_indices,
            std::vector<std::tuple<Idx_t, Idx_t, Idx_t>> &affected_edges);
   void local_join(cudaStream_t const stream);
   void add_reverse_edges(Index_t *graph_ptr, Index_t *h_rev_graph_ptr,
