@@ -33,14 +33,16 @@ struct GPUMAP::Impl {
 
   InsertionQueue insertion_queue;
   UpdateQueue update_queue;
-  EmbeddingQueue embedding_queue;
+  MultiLevelEmbeddingQueue embedding_queue;
 
   bool first_insertion = true;
+  std::mt19937 rng_{42};
 
   Impl(const GPUMAPParams &params_)
       : params(params_), storage(params_.n_instances, params_.n_features,
                                  params_.n_neighbors, params_.n_components),
-        insertion_queue() {
+        insertion_queue(),
+        embedding_queue(static_cast<float>(params_.max_epoch)) {
     initialize();
   }
 
@@ -108,7 +110,7 @@ struct GPUMAP::Impl {
 
     // fprintf(stderr, "[GPUMAP] update queue size=%zu\n", update_queue.size());
     // fflush(stderr);
-    if (n_update_ops == 0 || !update_queue.size()) {
+    if (n_update_ops == 0) {
       result.n_update_ops = 0;
       result.update_time = 0.0f;
     } else {
@@ -172,31 +174,70 @@ struct GPUMAP::Impl {
   }
 
   void update(size_t n_ops) {
-    if (!update_queue.size() || n_ops == 0) {
+    if (n_ops == 0 || storage.n_inserted_instances == 0)
       return;
+
+    size_t left_ops = n_ops;
+
+    while (left_ops > 0) {
+      fprintf(stderr, "[GPUMAP] update: left_ops=%zu, queue_size=%zu\n",
+              left_ops, update_queue.size());
+      fflush(stderr);
+      std::vector<Idx_t> batch_indices;
+
+      if (!update_queue.empty()) {
+        size_t pop_count = std::min(left_ops, update_queue.size());
+        batch_indices = update_queue.pop_n(pop_count);
+      } else {
+        size_t sample_size = std::min(
+            left_ops, static_cast<size_t>(storage.n_inserted_instances));
+        std::uniform_int_distribution<Idx_t> dist(
+            0, static_cast<Idx_t>(storage.n_inserted_instances - 1));
+        batch_indices.resize(sample_size);
+        auto start_offset = dist(rng_);
+        for (size_t i = 0; i < sample_size; ++i) {
+          batch_indices[i] = (start_offset + i) % storage.n_inserted_instances;
+        }
+      }
+
+      if (batch_indices.empty())
+        break;
+
+      std::vector<Idx_t> affected_indices;
+      std::vector<gpumap::Edge> new_edges;
+
+      update_kernel<Data_t, Idx_t>(
+          storage.nnd_buffer, batch_indices, affected_indices, new_edges,
+          update_stream,
+
+          storage.data.data(), storage.neighbor_indices.data(),
+          storage.neighbor_dists.data(), storage.data_block_size,
+          storage.neighbor_indices_block_size,
+          storage.neighbor_dists_block_size,
+
+          storage.n_instances, storage.n_features, storage.n_neighbors,
+          storage.n_inserted_instances,
+
+          /*max_iter=*/1, /*termination_threshold=*/0.001f, /*seed=*/42);
+
+      update_queue.push_batch(affected_indices);
+
+      // Cascade 1-hop neighbors of affected nodes into the queue.
+      const auto *h_graph = storage.nnd_buffer.h_graph.data_handle();
+      for (auto idx : affected_indices) {
+        const auto *nbrs =
+            h_graph + static_cast<size_t>(idx) * storage.n_neighbors;
+        for (uint32_t j = 0; j < storage.n_neighbors; ++j) {
+          int nid = nbrs[j].id();
+          if (nid >= 0 &&
+              static_cast<size_t>(nid) < storage.n_inserted_instances)
+            update_queue.push(static_cast<Idx_t>(nid));
+        }
+      }
+
+      embedding_queue.push_batch(new_edges);
+      left_ops -= batch_indices.size();
     }
-    std::vector<Idx_t> batch_indices = update_queue.pop_n(n_ops);
-
-    std::vector<Idx_t> affected_indices;
-    std::vector<gpumap::Edge> new_edges;
-
-    update_kernel<Data_t, Idx_t>(
-        storage.nnd_buffer, batch_indices, affected_indices, new_edges,
-        update_stream,
-
-        storage.data.data(), storage.neighbor_indices.data(),
-        storage.neighbor_dists.data(), storage.data_block_size,
-        storage.neighbor_indices_block_size, storage.neighbor_dists_block_size,
-
-        storage.n_instances, storage.n_features, storage.n_neighbors,
-        storage.n_inserted_instances,
-
-        /*max_iter=*/2,
-        /*termination_threshold=*/0.001f, /*seed=*/42);
-
-    // printf("Affected indices count: %zu\n", affected_indices.size());
-    update_queue.push_batch(affected_indices);
-    embedding_queue.push_batch(new_edges);
   }
 
   void embed(size_t n_ops) {
@@ -206,9 +247,7 @@ struct GPUMAP::Impl {
       size_t current_ops = std::min(left_ops, embedding_queue.size());
       std::vector<gpumap::Edge> batch_edges =
           embedding_queue.pop_n(current_ops);
-      // shufle batch_edges
-      // std::shuffle(batch_edges.begin(), batch_edges.end(),
-      //              std::default_random_engine(42));
+
       // src, dst, epoch 리스트를 만든다. h for host
       const size_t n_edges = batch_edges.size();
       std::vector<Idx_t> h_srcs(n_edges), h_dsts(n_edges), h_indices(n_edges);

@@ -22,7 +22,6 @@
 #include <raft/core/resources.hpp>
 #include <raft/matrix/init.cuh>
 #include <raft/util/cudart_utils.hpp>
-#include <thread>
 #include <utility>
 #include <vector>
 
@@ -552,7 +551,7 @@ local_join_kernel(const Index_t *graph_new, Index_t *rev_graph_new,
       float dot = s_distances[i];
       float dist2 = data[a * (size_t)data_block_size + n_features] +
                     data[b * (size_t)data_block_size + n_features] - 2.0f * dot;
-      s_distances[i] = dist2;
+      s_distances[i] = dist2 < 0.0f ? 0.0f : dist2; // handle numerical issues
     }
   }
   __syncthreads();
@@ -657,7 +656,7 @@ local_join_kernel(const Index_t *graph_new, Index_t *rev_graph_new,
       float dot = s_distances[i];
       float dist2 = data[a * (size_t)data_block_size + n_features] +
                     data[b * (size_t)data_block_size + n_features] - 2.0f * dot;
-      s_distances[i] = dist2;
+      s_distances[i] = dist2 < 0.0f ? 0.0f : dist2; // handle numerical issues
     }
   }
   __syncthreads();
@@ -865,7 +864,8 @@ void UpdateAlgo<Data_t, Idx_t, Index_t>::sort_lists() {
       sorted_list.emplace_back(
           buffers_.h_dists.data_handle()[i * n_neighbors_ + j],
           static_cast<Index_t>(
-              buffers_.h_graph.data_handle()[i * n_neighbors_ + j].id()));
+              buffers_.h_graph.data_handle()[i * n_neighbors_ + j]
+                  .id_with_flag()));
     }
 
     std::sort(sorted_list.begin(), sorted_list.end());
@@ -960,64 +960,39 @@ void UpdateAlgo<Data_t, Idx_t, Index_t>::run(
   };
 
   sample_graph(true);
+  raft::copy(buffers_.d_list_sizes_new_.data_handle(),
+             buffers_.h_list_sizes_new.data_handle(), n_inserted_instances_,
+             stream);
+  raft::copy(buffers_.h_graph_old_.data_handle(),
+             buffers_.h_graph_old.data_handle(),
+             n_inserted_instances_ * NUM_SAMPLES, stream);
+  raft::copy(buffers_.d_list_sizes_old_.data_handle(),
+             buffers_.h_list_sizes_old.data_handle(), n_inserted_instances_,
+             stream);
 
-  auto update_and_sample = [&](bool update_graph_flag) {
-    if (update_graph_flag) {
-      update_counter_ = 0;
-      update_graph(update_counter_);
+  raft::resource::sync_stream(res_);
 
-      if (update_counter_ <
-          termination_threshold_ * n_inserted_instances_ * NUM_SAMPLES) {
-        update_counter_ = -1;
-      }
-    }
-    sample_graph(false);
-  };
+  RAFT_LOG_DEBUG("# GNND single-pass update (max_iter=%lu)",
+                 static_cast<unsigned long>(max_iter_));
 
-  for (size_t iter = 0; iter < max_iter_; ++iter) {
-    raft::copy(buffers_.d_list_sizes_new_.data_handle(),
-               buffers_.h_list_sizes_new.data_handle(), n_inserted_instances_,
-               stream);
-    raft::copy(buffers_.h_graph_old_.data_handle(),
-               buffers_.h_graph_old.data_handle(),
-               n_inserted_instances_ * NUM_SAMPLES, stream);
-    raft::copy(buffers_.d_list_sizes_old_.data_handle(),
-               buffers_.h_list_sizes_old.data_handle(), n_inserted_instances_,
-               stream);
+  add_reverse_edges(buffers_.h_graph_new.data_handle(),
+                    buffers_.h_rev_graph_new_.data_handle(),
+                    buffers_.d_rev_graph_buffer_.data_handle(),
+                    buffers_.d_list_sizes_new_.data_handle(), stream);
+  add_reverse_edges(buffers_.h_graph_old_.data_handle(),
+                    buffers_.h_rev_graph_old_.data_handle(),
+                    buffers_.d_rev_graph_buffer_.data_handle(),
+                    buffers_.d_list_sizes_old_.data_handle(), stream);
 
-    raft::resource::sync_stream(res_);
+  local_join(stream);
 
-    std::thread update_and_sample_thread(update_and_sample, iter > 0);
-
-    RAFT_LOG_DEBUG("# GNND iteraton: %lu / %lu", iter + 1, max_iter_);
-
-    add_reverse_edges(buffers_.h_graph_new.data_handle(),
-                      buffers_.h_rev_graph_new_.data_handle(),
-                      buffers_.d_rev_graph_buffer_.data_handle(),
-                      buffers_.d_list_sizes_new_.data_handle(), stream);
-    add_reverse_edges(buffers_.h_graph_old_.data_handle(),
-                      buffers_.h_rev_graph_old_.data_handle(),
-                      buffers_.d_rev_graph_buffer_.data_handle(),
-                      buffers_.d_list_sizes_old_.data_handle(), stream);
-
-    local_join(stream);
-
-    update_and_sample_thread.join();
-
-    // if (update_counter_ == -1) {
-    //   break;
-    // }
-
-    raft::copy(buffers_.graph_host_buffer_.data_handle(),
-               buffers_.graph_buffer_.data_handle(),
-               n_inserted_instances_ * MAX_NEIGHBORS, stream);
-    raft::copy(buffers_.dists_host_buffer_.data_handle(),
-               buffers_.dists_buffer_.data_handle(),
-               n_inserted_instances_ * MAX_NEIGHBORS, stream);
-    raft::resource::sync_stream(res_);
-
-    sample_graph_new();
-  }
+  raft::copy(buffers_.graph_host_buffer_.data_handle(),
+             buffers_.graph_buffer_.data_handle(),
+             n_inserted_instances_ * MAX_NEIGHBORS, stream);
+  raft::copy(buffers_.dists_host_buffer_.data_handle(),
+             buffers_.dists_buffer_.data_handle(),
+             n_inserted_instances_ * MAX_NEIGHBORS, stream);
+  raft::resource::sync_stream(res_);
 
   update_graph(update_counter_);
   raft::resource::sync_stream(res_);

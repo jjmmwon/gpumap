@@ -44,11 +44,7 @@ public:
   void clear() {
     if (is_cleared_)
       return;
-#pragma omp parallel for
-    for (size_t i = 0;
-         i < n_instances_ * num_sets_per_list_ * num_bits_per_set_; ++i) {
-      bitsets_[i] = 0;
-    }
+    std::fill(bitsets_.begin(), bitsets_.end(), false);
     is_cleared_ = true;
   }
 

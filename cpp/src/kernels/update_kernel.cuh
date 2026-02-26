@@ -36,10 +36,6 @@ void update_kernel(
     return;
   }
 
-  std::sort(batch_indices.begin(), batch_indices.end());
-  batch_indices.erase(std::unique(batch_indices.begin(), batch_indices.end()),
-                      batch_indices.end());
-
   raft::resources res;
   raft::resource::set_cuda_stream(res, update_stream);
 

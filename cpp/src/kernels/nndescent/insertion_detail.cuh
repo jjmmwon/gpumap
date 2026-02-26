@@ -148,6 +148,11 @@ __global__ __forceinline__ void sample_forward_candidates_kernel(
 
   Index_t my_neighbors_l[MAX_NEIGHBORS];
   for (uint32_t i = 0; i < n_neighbors; ++i) {
+    if (my_neighbors[i].id() < 0 ||
+        static_cast<uint32_t>(my_neighbors[i].id()) >= n_inserted_instances) {
+      continue;
+    }
+
     my_neighbors_l[i] = static_cast<Index_t>(my_neighbors[i].id());
   }
 
@@ -160,7 +165,7 @@ __global__ __forceinline__ void sample_forward_candidates_kernel(
     }
 
     const Index_t neighbor_id = static_cast<Index_t>(neighbor_id_raw.id());
-    // my_neighbors[j].mark_old();
+    my_neighbors[j].mark_old();
 
     InternalID_t *neigh2 =
         graph_buffer + static_cast<size_t>(neighbor_id) * graph_width;
@@ -633,6 +638,7 @@ void InsertionAlgo<Data_t, Idx_t, Index_t>::run(
     const size_t row = static_cast<size_t>(batch_indices_[i]);
     const InternalID_t *my_neighbors = graph_host_buffer_ + row * MAX_NEIGHBORS;
 
+    affected_indices.push_back(static_cast<Idx_t>(row));
     for (uint32_t j = 0; j < n_neighbors_; ++j) {
       const int nid = my_neighbors[j].id();
       if (nid < 0 || static_cast<uint32_t>(nid) >= n_inserted_instances_) {
@@ -644,10 +650,10 @@ void InsertionAlgo<Data_t, Idx_t, Index_t>::run(
     }
   }
 
-  std::sort(affected_indices.begin(), affected_indices.end());
-  affected_indices.erase(
-      std::unique(affected_indices.begin(), affected_indices.end()),
-      affected_indices.end());
+  // std::sort(affected_indices.begin(), affected_indices.end());
+  // affected_indices.erase(
+  //     std::unique(affected_indices.begin(), affected_indices.end()),
+  //     affected_indices.end());
 
   initialize_embeddings(stream);
 }
