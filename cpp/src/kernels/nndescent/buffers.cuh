@@ -15,7 +15,7 @@
 namespace gpumap::nndescent {
 
 constexpr int MAX_NEIGHBORS = 32;
-constexpr int MAX_CANDIDATES = 216; // max 2-hop candidates per node (n_neighbors * n_neighbors)
+constexpr int MAX_CANDIDATES = 216;
 constexpr int NUM_SAMPLES = 32;
 constexpr int MAX_NUM_BI_SAMPLES = 64;
 constexpr int SKEWED_MAX_NUM_BI_SAMPLES = 68;
@@ -186,11 +186,11 @@ template <typename Data_t, typename Index_t = int> struct NNDBuffers {
                 res, n_instances, MAX_CANDIDATES)},
 
         graph_host_buffer_{
-            raft::make_pinned_matrix<InternalID_t, size_t, raft::row_major>(
-                res, n_instances, MAX_NEIGHBORS)},
+            raft::make_host_matrix<InternalID_t, size_t, raft::row_major>(
+                n_instances, MAX_NEIGHBORS)},
         dists_host_buffer_{
-            raft::make_pinned_matrix<Data_t, size_t, raft::row_major>(
-                res, n_instances, MAX_NEIGHBORS)},
+            raft::make_host_matrix<Data_t, size_t, raft::row_major>(
+                n_instances, MAX_NEIGHBORS)},
 
         d_locks_{raft::make_device_vector<int, size_t>(res, n_instances)},
         d_dirty_flags_{raft::make_device_vector<int, size_t>(res, n_instances)},
@@ -247,13 +247,11 @@ template <typename Data_t, typename Index_t = int> struct NNDBuffers {
   // Device buffer for candidate neighbors during insertion.
   raft::device_matrix<int, size_t, raft::row_major> candidate_buffer_;
 
-  // Pinned (page-locked) CPU mirrors of graph_buffer_ and dists_buffer_.
-  // After each NND iteration, graph_buffer_/dists_buffer_ are copied here so
-  // the CPU can run update_graph() and sort_lists() concurrently with the next
-  // GPU local_join. Also used by sample_graph_new() to sample new neighbors
-  // from the latest GPU results. Pinned allocation ensures fast DMA transfers.
-  raft::pinned_matrix<InternalID_t, size_t> graph_host_buffer_;
-  raft::pinned_matrix<Data_t, size_t> dists_host_buffer_;
+  // CPU mirrors of graph_buffer_ and dists_buffer_.
+  // Kept pageable (not pinned) to reduce locked-memory pressure under WSL2
+  // and environments with low RLIMIT_MEMLOCK.
+  raft::host_matrix<InternalID_t, size_t> graph_host_buffer_;
+  raft::host_matrix<Data_t, size_t> dists_host_buffer_;
 
   raft::device_vector<int, size_t> d_locks_;
   raft::device_vector<int, size_t> d_dirty_flags_;

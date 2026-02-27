@@ -18,8 +18,6 @@
 #include <raft/core/device_mdarray.hpp>
 #include <raft/core/host_mdarray.hpp>
 #include <raft/core/pinned_mdarray.hpp>
-#include <raft/core/resource/cuda_stream.hpp>
-#include <raft/core/resources.hpp>
 #include <raft/matrix/init.cuh>
 #include <raft/util/cudart_utils.hpp>
 #include <utility>
@@ -899,14 +897,11 @@ template <typename Data_t, typename Idx_t, typename Index_t>
 void UpdateAlgo<Data_t, Idx_t, Index_t>::add_reverse_edges(
     Index_t *graph_ptr, Index_t *h_rev_graph_ptr, Index_t *d_rev_graph_ptr,
     int2 *list_sizes, cudaStream_t const stream) {
-  raft::resources res_;
-  raft::resource::set_cuda_stream(res_, stream);
 
-  raft::matrix::fill(
-      res_,
-      raft::make_device_matrix_view(d_rev_graph_ptr, n_inserted_instances_,
-                                    static_cast<uint32_t>(NUM_SAMPLES)),
-      std::numeric_limits<Index_t>::max());
+  cudaMemsetAsync(d_rev_graph_ptr, 0xFF,
+                  static_cast<size_t>(n_inserted_instances_) * NUM_SAMPLES *
+                      sizeof(Index_t),
+                  stream);
 
   add_rev_edges_kernel<<<n_inserted_instances_, 256, 0, stream>>>(
       graph_ptr, d_rev_graph_ptr, NUM_SAMPLES, list_sizes);
@@ -920,8 +915,6 @@ void UpdateAlgo<Data_t, Idx_t, Index_t>::run(
     cudaStream_t stream, std::vector<Idx_t> &affected_indices,
     std::vector<std::tuple<Idx_t, Idx_t, float, float, float>> &new_edges) {
 
-  const raft::resources res_;
-  raft::resource::set_cuda_stream(res_, stream);
   cudaMemsetAsync(buffers_.d_locks_.data_handle(), 0,
                   n_inserted_instances_ * sizeof(int), stream);
 
@@ -947,7 +940,7 @@ void UpdateAlgo<Data_t, Idx_t, Index_t>::run(
   raft::copy(buffers_.d_dirty_flags_.data_handle(),
              buffers_.h_dirty_flags_.data_handle(), n_inserted_instances_,
              stream);
-  raft::resource::sync_stream(res_);
+  cudaStreamSynchronize(stream);
 
   // Returns true if id already existed in batch index i's pre-NND snapshot.
   auto contains_id = [&](size_t i, int id) -> bool {
@@ -970,7 +963,7 @@ void UpdateAlgo<Data_t, Idx_t, Index_t>::run(
              buffers_.h_list_sizes_old.data_handle(), n_inserted_instances_,
              stream);
 
-  raft::resource::sync_stream(res_);
+  cudaStreamSynchronize(stream);
 
   RAFT_LOG_DEBUG("# GNND single-pass update (max_iter=%lu)",
                  static_cast<unsigned long>(max_iter_));
@@ -992,13 +985,13 @@ void UpdateAlgo<Data_t, Idx_t, Index_t>::run(
   raft::copy(buffers_.dists_host_buffer_.data_handle(),
              buffers_.dists_buffer_.data_handle(),
              n_inserted_instances_ * MAX_NEIGHBORS, stream);
-  raft::resource::sync_stream(res_);
+  cudaStreamSynchronize(stream);
 
   update_graph(update_counter_);
-  raft::resource::sync_stream(res_);
+  cudaStreamSynchronize(stream);
   raft::copy(d_dirty_flags_host.data(), buffers_.d_dirty_flags_.data_handle(),
              n_inserted_instances_, stream);
-  raft::resource::sync_stream(res_);
+  cudaStreamSynchronize(stream);
 
   for (size_t i = 0; i < n_inserted_instances_; ++i) {
     if (d_dirty_flags_host[i] > buffers_.h_dirty_flags_.data_handle()[i]) {
@@ -1046,7 +1039,7 @@ void UpdateAlgo<Data_t, Idx_t, Index_t>::run(
         affected_indices.push_back(row_id);
       }
     }
-    raft::resource::sync_stream(res_);
+    cudaStreamSynchronize(stream);
   }
 
   // Emit only genuinely new edges: neighbors of batch_indices_ that were

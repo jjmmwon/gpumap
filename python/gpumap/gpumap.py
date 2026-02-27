@@ -120,10 +120,8 @@ class GPUMAP:
             except ValueError as e:
                 print(f"Error validating data chunk: {e}")
 
-            # TODO
             self._impl.append_data(data_chunk)
 
-        # TODO
         res = self._impl.run(n_insertion_ops, n_update_ops, n_embedding_ops)
 
         if res.insertion_completed:

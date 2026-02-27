@@ -25,6 +25,14 @@ struct CudaWarmup {
     cudaGetLastError(); // clear any pending CUDA error
     // Pre-initialize the RMM per-device resource map (CPU-only operation).
     (void)rmm::mr::get_current_device_resource();
+    // WSL2 WDDM에서 이전 인스턴스가 cudaFreeHost()한 pinned memory가
+    // 드라이버 레이어에 실제로 반납되기 전에 새 cudaMallocHost()를 시도하면
+    // std::bad_alloc이 발생한다. 1바이트 alloc/free로 pinned memory
+    // subsystem을 미리 건드려 WDDM 레이어의 상태를 안정화한다.
+    void *pinned = nullptr;
+    if (cudaMallocHost(&pinned, 1) == cudaSuccess && pinned != nullptr)
+      cudaFreeHost(pinned);
+    cudaGetLastError(); // clear any error from the probe
   }
 };
 
