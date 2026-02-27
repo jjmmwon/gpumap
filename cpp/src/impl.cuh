@@ -142,6 +142,8 @@ struct GPUMAP::Impl {
       result.embedding_time = std::chrono::duration<float>(end - start).count();
     }
 
+    result.embedding_queue_level_sizes = embedding_queue.level_sizes();
+
     return result;
   }
 
@@ -180,9 +182,9 @@ struct GPUMAP::Impl {
     size_t left_ops = n_ops;
 
     while (left_ops > 0) {
-      fprintf(stderr, "[GPUMAP] update: left_ops=%zu, queue_size=%zu\n",
-              left_ops, update_queue.size());
-      fflush(stderr);
+      // fprintf(stderr, "[GPUMAP] update: left_ops=%zu, queue_size=%zu\n",
+      //         left_ops, update_queue.size());
+      // fflush(stderr);
       std::vector<Idx_t> batch_indices;
 
       if (!update_queue.empty()) {
@@ -245,8 +247,8 @@ struct GPUMAP::Impl {
 
     while (left_ops > 0 && embedding_queue.size() > 0) {
       size_t current_ops = std::min(left_ops, embedding_queue.size());
-      std::vector<gpumap::Edge> batch_edges =
-          embedding_queue.pop_n(current_ops);
+      std::vector<gpumap::Edge> batch_edges;
+      embedding_queue.pop_n(current_ops, batch_edges);
 
       // src, dst, epoch 리스트를 만든다. h for host
       const size_t n_edges = batch_edges.size();
@@ -409,6 +411,12 @@ struct GPUMAP::Impl {
   }
 
   void close() {
+    // 스트림 destroy 전에 device 전체를 동기화한다.
+    // 각 스트림을 개별 sync하는 것만으로는 스트림 간 dependency나
+    // 비동기 메모리 오퍼레이션이 남아있을 수 있다.
+    // 특히 WSL2에서 이후 cudaFreeHost()가 WDDM 레이어에 완전히
+    // 반납되려면 모든 GPU 작업이 종료된 상태여야 한다.
+    cudaDeviceSynchronize();
     cudaStreamDestroy(insertion_stream);
     cudaStreamDestroy(update_stream);
     cudaStreamDestroy(embedding_stream);

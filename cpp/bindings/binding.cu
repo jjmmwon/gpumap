@@ -33,7 +33,9 @@ PYBIND11_MODULE(_core, m) {
       .def_readonly("update_time", &gpumap::GPUMAPResult::update_time)
       .def_readonly("embedding_time", &gpumap::GPUMAPResult::embedding_time)
       .def_readonly("insertion_completed",
-                    &gpumap::GPUMAPResult::insertion_completed);
+                    &gpumap::GPUMAPResult::insertion_completed)
+      .def_readonly("embedding_queue_level_sizes",
+                    &gpumap::GPUMAPResult::embedding_queue_level_sizes);
 
   py::class_<GPUMAPWrapper>(m, "GPUMAP")
       .def(py::init<const gpumap::GPUMAPParams &>(), py::arg("config"))

@@ -3,6 +3,7 @@
 #include <array>
 #include <queue>
 #include <unordered_set>
+#include <vector>
 
 namespace gpumap {
 
@@ -118,6 +119,15 @@ struct MultiLevelEmbeddingQueue {
   size_t size() const { return total_size_; }
   bool empty() const { return total_size_ == 0; }
 
+  std::vector<uint32_t> level_sizes() const {
+    std::vector<uint32_t> sizes;
+    sizes.reserve(N_LEVELS);
+    for (int lvl = 0; lvl < N_LEVELS; ++lvl) {
+      sizes.push_back(static_cast<uint32_t>(levels_[lvl].size()));
+    }
+    return sizes;
+  }
+
   void push(const Edge &e) {
     int level = get_level(std::get<2>(e)); // current_epoch is field 2
     levels_[level].push(e);
@@ -131,9 +141,10 @@ struct MultiLevelEmbeddingQueue {
   }
 
   // Drains from the lowest-epoch bin first.
-  std::vector<Edge> pop_n(size_t n) {
+  std::vector<Edge> pop_n(size_t n, std::vector<Edge> &result) {
+    // std::vector<Edge> pop_n(size_t n){
     size_t actual_n = std::min(n, total_size_);
-    std::vector<Edge> result;
+    result.clear();
     result.reserve(actual_n);
 
     size_t remaining = actual_n;
