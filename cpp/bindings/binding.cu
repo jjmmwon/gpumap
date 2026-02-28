@@ -43,7 +43,8 @@ PYBIND11_MODULE(_core, m) {
            py::arg("n_features"))
       .def("append_data", &GPUMAPWrapper::append_data, py::arg("x"))
       .def("run", &GPUMAPWrapper::run, py::arg("n_jobs_insertion"),
-           py::arg("n_jobs_update"), py::arg("n_jobs_embedding"))
+           py::arg("n_jobs_update"), py::arg("n_jobs_embedding"),
+       py::call_guard<py::gil_scoped_release>())
       .def("close", &GPUMAPWrapper::close)
       .def("get_embedding", &GPUMAPWrapper::get_embedding)
       .def("get_neighbor_indices", &GPUMAPWrapper::get_neighbor_indices)
