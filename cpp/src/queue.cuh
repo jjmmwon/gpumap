@@ -140,22 +140,49 @@ struct MultiLevelEmbeddingQueue {
     }
   }
 
-  // Drains from the lowest-epoch bin first.
+  // Drains from the highest-epoch bin first.
+  // Each level receives an equal base quota of actual_n / N_LEVELS items.
+  // If a level has fewer items than its quota, the shortfall carries over to
+  // the next lower level. A final sweep collects any items missed due to
+  // integer-division remainder or carry that accumulated past level 0.
   std::vector<Edge> pop_n(size_t n, std::vector<Edge> &result) {
-    // std::vector<Edge> pop_n(size_t n){
     size_t actual_n = std::min(n, total_size_);
     result.clear();
     result.reserve(actual_n);
 
-    size_t remaining = actual_n;
-    for (int lvl = 0; lvl < N_LEVELS && remaining > 0; ++lvl) {
-      while (!levels_[lvl].empty() && remaining > 0) {
+    size_t base_quota = actual_n / N_LEVELS;
+    size_t carry = 0;
+
+    for (int lvl = N_LEVELS - 1; lvl >= 0; --lvl) {
+      size_t effective_quota = base_quota + carry;
+      carry = 0;
+
+      size_t pulled = 0;
+      while (!levels_[lvl].empty() && pulled < effective_quota) {
         result.push_back(levels_[lvl].front());
         levels_[lvl].pop();
         --total_size_;
-        --remaining;
+        ++pulled;
+      }
+
+      carry =
+          effective_quota - pulled; // unmet quota carries to next lower level
+    }
+
+    // Collect items missed due to integer-division remainder or carry from
+    // level 0
+    if (result.size() < actual_n) {
+      size_t still_needed = actual_n - result.size();
+      for (int lvl = N_LEVELS - 1; lvl >= 0 && still_needed > 0; --lvl) {
+        while (!levels_[lvl].empty() && still_needed > 0) {
+          result.push_back(levels_[lvl].front());
+          levels_[lvl].pop();
+          --total_size_;
+          --still_needed;
+        }
       }
     }
+
     return result;
   }
 };
