@@ -34,7 +34,7 @@ class DefaultLinearEstimator(Estimator):
         P(time <= budget) >= confidence
     """
 
-    def __init__(self, window_size: int = 20, min_samples: int = 5):
+    def __init__(self, window_size: int = 20, min_samples: int = 3):
         self.window_size = window_size
         self.min_samples = min_samples
         self._samples: Deque[Tuple[int, float]] = deque(maxlen=window_size)

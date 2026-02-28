@@ -35,7 +35,7 @@ class GPUMAP:
         insertion_estimator: Estimator = DefaultLinearEstimator(),
         update_estimator: Estimator = DefaultLinearEstimator(),
         embedding_estimator: Estimator = DefaultLinearEstimator(),
-        default_n_ops: int = 500,
+        default_n_ops: int = 100,
     ):
 
         self.data_loader = data_loader
