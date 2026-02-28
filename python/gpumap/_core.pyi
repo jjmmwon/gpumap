@@ -28,6 +28,8 @@ class GPUMAPResult:
     update_time: float
     embedding_time: float
     insertion_completed: bool
+    insertion_queue_size: int
+    update_queue_size: int
     embedding_queue_level_sizes: list[int]
 
 GPUMAPIterationResult: TypeAlias = GPUMAPResult

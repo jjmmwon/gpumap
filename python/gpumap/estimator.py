@@ -1,7 +1,7 @@
 from collections import deque
 from dataclasses import dataclass
 from statistics import NormalDist
-from typing import Deque, Iterable, Optional, Tuple
+from typing import Deque, Optional, Tuple
 
 
 class Estimator:
@@ -17,12 +17,92 @@ class Estimator:
                      confidence: float = 0.95) -> int:
         raise NotImplementedError()
 
+    def predict_time(self,
+                     ops: int,
+                     quantile: float = 0.95) -> float:
+        raise NotImplementedError()
+
 @dataclass
 class FitResult:
     slope_a: float      # sec per op
     intercept_b: float  # fixed overhead
     sigma: float        # residual std
     n_samples: int
+
+
+@dataclass
+class RateFitResult:
+    mean_rate: float    # sec per op
+    sigma_rate: float   # residual std in sec per op
+    n_samples: int
+
+
+class MeanRateEstimator(Estimator):
+    """
+    Model:
+        t ≈ (mean_rate ± noise_rate) * ops
+
+    Uses a rolling window of per-op time rates (elapsed_sec / ops) and returns
+    a conservative ops estimate with a normal-quantile safety margin.
+    """
+
+    def __init__(self, window_size: int = 20, min_samples: int = 3):
+        self.window_size = window_size
+        self.min_samples = min_samples
+        self._samples: Deque[Tuple[int, float]] = deque(maxlen=window_size)
+        self._fit: Optional[RateFitResult] = None
+
+    def add_sample(self, ops: int, elapsed_sec: float):
+        if ops <= 0 or elapsed_sec < 0:
+            return
+        self._samples.append((ops, elapsed_sec))
+        self._fit = None
+
+    def fit(self) -> RateFitResult:
+        rates = [elapsed_sec / ops for ops, elapsed_sec in self._samples if ops > 0]
+        n = len(rates)
+        if n < self.min_samples:
+            raise ValueError("Not enough samples.")
+
+        mean_rate = sum(rates) / n
+        if mean_rate <= 0:
+            raise ValueError("Non-positive mean rate.")
+
+        if n >= 2:
+            m = mean_rate
+            var = sum((r - m) ** 2 for r in rates) / (n - 1)
+            sigma_rate = var ** 0.5
+        else:
+            sigma_rate = 0.0
+
+        self._fit = RateFitResult(mean_rate, sigma_rate, n)
+        return self._fit
+
+    def fit_result(self) -> RateFitResult:
+        return self._fit if self._fit else self.fit()
+
+    def estimate_ops(self,
+                     time_budget_sec: float,
+                     confidence: float = 0.95) -> int:
+        if time_budget_sec <= 0:
+            return 0
+
+        fr = self.fit_result()
+        z = NormalDist().inv_cdf(confidence)
+        safe_rate = fr.mean_rate + z * fr.sigma_rate
+        if safe_rate <= 0:
+            return 0
+        return max(0, int(time_budget_sec / safe_rate))
+
+    def predict_time(self,
+                     ops: int,
+                     quantile: float = 0.95) -> float:
+        if ops <= 0:
+            return 0.0
+        fr = self.fit_result()
+        z = NormalDist().inv_cdf(quantile)
+        safe_rate = fr.mean_rate + z * fr.sigma_rate
+        return ops * max(0.0, safe_rate)
 
 class DefaultLinearEstimator(Estimator):
     """

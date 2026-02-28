@@ -34,6 +34,10 @@ PYBIND11_MODULE(_core, m) {
       .def_readonly("embedding_time", &gpumap::GPUMAPResult::embedding_time)
       .def_readonly("insertion_completed",
                     &gpumap::GPUMAPResult::insertion_completed)
+      .def_readonly("insertion_queue_size",
+                    &gpumap::GPUMAPResult::insertion_queue_size)
+      .def_readonly("update_queue_size",
+                    &gpumap::GPUMAPResult::update_queue_size)
       .def_readonly("embedding_queue_level_sizes",
                     &gpumap::GPUMAPResult::embedding_queue_level_sizes);
 

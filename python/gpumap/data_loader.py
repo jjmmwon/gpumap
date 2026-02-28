@@ -1,3 +1,4 @@
+import os
 import numpy as np
 from sklearn.datasets import fetch_openml
 
@@ -14,8 +15,9 @@ class DataLoader:
 
 
 def load_mnist_numpy():
-    X = np.load("data/mnist_X.npy")
-    y = np.load("data/mnist_y.npy")
+    file_dir_path = os.path.dirname(os.path.realpath(__file__))
+    X = np.load(f"{file_dir_path}/data/mnist_X.npy")
+    y = np.load(f"{file_dir_path}/data/mnist_y.npy")
     return X, y
 
 

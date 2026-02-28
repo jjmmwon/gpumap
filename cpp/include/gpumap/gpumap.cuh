@@ -43,6 +43,8 @@ struct GPUMAPResult {
   float embedding_time;
 
   bool insertion_completed;
+  size_t insertion_queue_size;
+  size_t update_queue_size;
   std::vector<uint32_t> embedding_queue_level_sizes;
 };
 

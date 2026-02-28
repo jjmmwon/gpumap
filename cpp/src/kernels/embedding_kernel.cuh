@@ -362,9 +362,9 @@ __global__ void update_embeddings_kernel(
         (Data_t{2} * b) / ((Data_t{1} + a * nr2b) * (nr2 + Data_t{1e-3f}));
     // Linearly increase from 0 to 1 in the first 50% of epochs
     float bypass_factor =
-        static_cast<float>(current_epoch) / static_cast<float>(max_epoch) > 0.5f
+        static_cast<float>(current_epoch) / static_cast<float>(max_epoch) > 0.1f
             ? 1.0f
-            : 2.0f * static_cast<float>(current_epoch) /
+            : 10.0f * static_cast<float>(current_epoch) /
                   static_cast<float>(max_epoch);
 
     const Data_t grad_ndx = clip(gneg * ndx) * decayed_alpha * bypass_factor;

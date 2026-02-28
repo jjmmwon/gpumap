@@ -9,8 +9,9 @@ from gpumap.validators import validate_data_chunk
 from gpumap.utils import _as_f32_c_contig_2d
 
 from . import _core
-from .scheduler import Scheduler, DefaultScheduler
-from .estimator import Estimator, DefaultLinearEstimator
+from .scheduler import Scheduler
+from .estimator import Estimator
+from .policy import BaseOpsPolicy, DefaultWeightedPolicy
 from .data_loader import DataLoader
 
 
@@ -31,16 +32,17 @@ class GPUMAP:
         self,
         data_loader: DataLoader,
         params: _core.GPUMAPParams,
-        scheduler: Scheduler = DefaultScheduler(),
-        insertion_estimator: Estimator = DefaultLinearEstimator(),
-        update_estimator: Estimator = DefaultLinearEstimator(),
-        embedding_estimator: Estimator = DefaultLinearEstimator(),
+        policy: BaseOpsPolicy | None = None,
+        # Legacy parameters — ignored when policy is provided.
+        scheduler: Scheduler | None = None,
+        insertion_estimator: Estimator | None = None,
+        update_estimator: Estimator | None = None,
+        embedding_estimator: Estimator | None = None,
         default_n_ops: int = 100,
     ):
 
         self.data_loader = data_loader
         self._params = params
-        self.scheduler = scheduler
 
         if self.params.min_dist > 1.0:
             raise ValueError("min_dist must be <= 1.0")
@@ -55,17 +57,27 @@ class GPUMAP:
             self._impl = _core.GPUMAP(self.params)
         self._closed = False
 
-        self.insertion_estimator = insertion_estimator
-        self.update_estimator = update_estimator
-        self.embedding_estimator = embedding_estimator
+        if policy is not None:
+            self._policy = policy
+        else:
+            self._policy = DefaultWeightedPolicy(
+                scheduler=scheduler,
+                insertion_estimator=insertion_estimator,
+                update_estimator=update_estimator,
+                embedding_estimator=embedding_estimator,
+                default_n_ops=default_n_ops,
+            )
 
-        self.default_n_ops = default_n_ops
-
+        self._inserted_instances = 0
         self._impl.initialize(self.data_loader.n_instances, self.data_loader.n_features)
 
     @property
     def params(self) -> _core.GPUMAPParams:
         return self._params
+
+    @property
+    def n_inserted_instances(self) -> int:
+        return self._inserted_instances
 
     def close(self):
         if not self._closed:
@@ -86,31 +98,23 @@ class GPUMAP:
             self._impl.append_data(data_chunk)
 
         res = self._impl.run(n_insertion_ops, n_update_ops, n_embedding_ops)
+        self._inserted_instances += res.n_insertion_ops
         return res
 
     def run(self, target_latency: float = 10.0) -> _core.GPUMAPIterationResult:
-        time_slices = self.scheduler.schedule(target_latency)
+        allocation = self._policy.allocate(target_latency)
+        n_insertion_ops = min(
+            allocation.n_insertion_ops,
+            self.data_loader.n_instances - self._inserted_instances,
+        )
+        n_update_ops = min(
+            allocation.n_update_ops, self._inserted_instances + n_insertion_ops
+        )
 
-        try:
-            n_insertion_ops = self.insertion_estimator.estimate_ops(time_slices[0])
-        except ValueError:
-            n_insertion_ops = self.default_n_ops + np.random.randint(
-                -self.default_n_ops // 10, self.default_n_ops // 10
-            )
-
-        try:
-            n_update_ops = self.update_estimator.estimate_ops(time_slices[1])
-        except ValueError:
-            n_update_ops = self.default_n_ops + np.random.randint(
-                -self.default_n_ops // 10, self.default_n_ops // 10
-            )
-
-        try:
-            n_embedding_ops = self.embedding_estimator.estimate_ops(time_slices[2])
-        except ValueError:
-            n_embedding_ops = self.default_n_ops + np.random.randint(
-                -self.default_n_ops // 10, self.default_n_ops // 10
-            )
+        n_embedding_ops = min(
+            allocation.n_embedding_ops,
+            (self._inserted_instances + n_insertion_ops) * self._params.n_neighbors * 3,
+        )
 
         if n_insertion_ops > 0:
             data_chunk = self.data_loader.get_next_chunk(n_insertion_ops)
@@ -124,19 +128,17 @@ class GPUMAP:
 
         res = self._impl.run(n_insertion_ops, n_update_ops, n_embedding_ops)
 
-        if res.insertion_completed:
-            self.scheduler.set_insertion_weight(0)
-        else:
-            self.insertion_estimator.add_sample(res.n_insertion_ops, res.insertion_time)
+        self._inserted_instances += res.n_insertion_ops
 
-        self.update_estimator.add_sample(res.n_update_ops, res.update_time)
-        self.embedding_estimator.add_sample(res.n_embedding_ops, res.embedding_time)
+        self._policy.update(res)
+        if res.insertion_completed:
+            self._policy.on_insertion_complete()
 
         return res
 
     def get_embedding(self) -> cp.ndarray:
         embedding_view = cp.asarray(self._impl.get_embedding())
-        return embedding_view
+        return embedding_view[: self._inserted_instances]
 
     def get_neighbor_indices(self) -> cp.ndarray:
         neighbor_indices_view = cp.asarray(self._impl.get_neighbor_indices())
