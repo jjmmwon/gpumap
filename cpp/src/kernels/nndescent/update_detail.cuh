@@ -9,7 +9,7 @@
 #include <__clang_cuda_runtime_wrapper.h>
 #endif
 #include <algorithm>
-#include <atomic>
+
 #include <cstddef>
 #include <cstring>
 #include <cuda_runtime.h>
@@ -813,37 +813,42 @@ void UpdateAlgo<Data_t, Idx_t, Index_t>::sample_graph_new() {
 
 template <typename Data_t, typename Idx_t, typename Index_t>
 void UpdateAlgo<Data_t, Idx_t, Index_t>::update_graph(
-    std::atomic<int64_t> &update_counter) {
+    std::vector<std::tuple<Idx_t, Idx_t, float, float, float>> &new_edges) {
   const InternalID_t *new_neighbors = buffers_.graph_host_buffer_.data_handle();
   const Data_t *new_dists = buffers_.dists_host_buffer_.data_handle();
-  int64_t local_updates = 0;
 
-#pragma omp parallel for reduction(+ : local_updates)
-  for (size_t i = 0; i < n_inserted_instances_; i++) {
-    for (size_t j = 0; j < MAX_NEIGHBORS; j++) {
-      auto neighbor = new_neighbors[i * MAX_NEIGHBORS + j];
-      auto new_dist = new_dists[i * MAX_NEIGHBORS + j];
+#pragma omp parallel
+  {
+    std::vector<std::tuple<Idx_t, Idx_t, float, float, float>> local_edges;
 
-      if (new_dist == std::numeric_limits<Data_t>::max()) {
-        break;
-      }
-      if (neighbor.id() >= n_inserted_instances_ || (size_t)neighbor.id() == i)
-        continue;
+#pragma omp for
+    for (size_t i = 0; i < n_inserted_instances_; i++) {
+      for (size_t j = 0; j < MAX_NEIGHBORS; j++) {
+        auto neighbor = new_neighbors[i * MAX_NEIGHBORS + j];
+        auto new_dist = new_dists[i * MAX_NEIGHBORS + j];
 
-      auto list = buffers_.h_graph.data_handle() + i * n_neighbors_;
-      auto dist_list = buffers_.h_dists.data_handle() + i * n_neighbors_;
-      uint32_t insert_pos = insert_to_ordered_list(
-          list, dist_list, n_neighbors_, neighbor, new_dist);
+        if (new_dist == std::numeric_limits<Data_t>::max())
+          break;
+        if (neighbor.id() >= n_inserted_instances_ ||
+            (size_t)neighbor.id() == i)
+          continue;
 
-      if (insert_pos != n_neighbors_) {
-        local_updates++;
-        buffers_.h_dirty_flags_.data_handle()[i] = DIRTY_NEIGHBOR_CHANGED;
+        auto list = buffers_.h_graph.data_handle() + i * n_neighbors_;
+        auto dist_list = buffers_.h_dists.data_handle() + i * n_neighbors_;
+        uint32_t insert_pos = insert_to_ordered_list(
+            list, dist_list, n_neighbors_, neighbor, new_dist);
+
+        if (insert_pos != n_neighbors_) {
+          local_edges.emplace_back(static_cast<Idx_t>(i),
+                                   static_cast<Idx_t>(neighbor.id()), 0.f, -1.f,
+                                   -1.f);
+          buffers_.h_dirty_flags_.data_handle()[i] = DIRTY_NEIGHBOR_CHANGED;
+        }
       }
     }
-  }
 
-  if (local_updates > 0) {
-    update_counter.fetch_add(local_updates, std::memory_order_relaxed);
+#pragma omp critical
+    new_edges.insert(new_edges.end(), local_edges.begin(), local_edges.end());
   }
 }
 
@@ -911,28 +916,15 @@ void UpdateAlgo<Data_t, Idx_t, Index_t>::add_reverse_edges(
 }
 
 template <typename Data_t, typename Idx_t, typename Index_t>
-void UpdateAlgo<Data_t, Idx_t, Index_t>::run(
+size_t UpdateAlgo<Data_t, Idx_t, Index_t>::run(
     cudaStream_t stream, std::vector<Idx_t> &affected_indices,
     std::vector<std::tuple<Idx_t, Idx_t, float, float, float>> &new_edges) {
 
   cudaMemsetAsync(buffers_.d_locks_.data_handle(), 0,
                   n_inserted_instances_ * sizeof(int), stream);
 
-  update_counter_ = 0;
-
   std::vector<int> d_dirty_flags_host(n_inserted_instances_, 0);
   std::vector<Idx_t> neighbor_changed_indices;
-
-  auto neighbor_snapshot =
-      raft::make_host_matrix<Idx_t, size_t, raft::row_major>(
-          batch_indices_.size(), n_neighbors_);
-
-  for (size_t i = 0; i < batch_indices_.size(); ++i) {
-    size_t row = static_cast<size_t>(batch_indices_[i]);
-    raft::copy(neighbor_snapshot.data_handle() + i * n_neighbors_,
-               neighbor_indices + row * neighbor_indices_block_size_,
-               n_neighbors_, stream);
-  }
 
   std::fill_n(buffers_.h_dirty_flags_.data_handle(), n_inserted_instances_,
               DIRTY_NONE);
@@ -941,16 +933,6 @@ void UpdateAlgo<Data_t, Idx_t, Index_t>::run(
              buffers_.h_dirty_flags_.data_handle(), n_inserted_instances_,
              stream);
   cudaStreamSynchronize(stream);
-
-  // Returns true if id already existed in batch index i's pre-NND snapshot.
-  auto contains_id = [&](size_t i, int id) -> bool {
-    const Idx_t *snap = neighbor_snapshot.data_handle() + i * n_neighbors_;
-    for (uint32_t j = 0; j < n_neighbors_; ++j) {
-      if (static_cast<int>(snap[j]) == id)
-        return true;
-    }
-    return false;
-  };
 
   sample_graph(true);
   raft::copy(buffers_.d_list_sizes_new_.data_handle(),
@@ -987,7 +969,7 @@ void UpdateAlgo<Data_t, Idx_t, Index_t>::run(
              n_inserted_instances_ * MAX_NEIGHBORS, stream);
   cudaStreamSynchronize(stream);
 
-  update_graph(update_counter_);
+  update_graph(new_edges);
   cudaStreamSynchronize(stream);
   raft::copy(d_dirty_flags_host.data(), buffers_.d_dirty_flags_.data_handle(),
              n_inserted_instances_, stream);
@@ -1042,21 +1024,7 @@ void UpdateAlgo<Data_t, Idx_t, Index_t>::run(
     cudaStreamSynchronize(stream);
   }
 
-  // Emit only genuinely new edges: neighbors of batch_indices_ that were
-  // absent in the pre-NND snapshot.
-  for (size_t i = 0; i < batch_indices_.size(); ++i) {
-    const Idx_t idx = batch_indices_[i];
-    const size_t row = static_cast<size_t>(idx);
-    const InternalID_t *list =
-        buffers_.h_graph.data_handle() + row * n_neighbors_;
-    for (uint32_t j = 0; j < n_neighbors_; ++j) {
-      const int nid = list[j].id();
-      if (nid >= 0 && static_cast<size_t>(nid) < n_inserted_instances_ &&
-          static_cast<size_t>(nid) != row && !contains_id(i, nid)) {
-        new_edges.emplace_back(idx, static_cast<Idx_t>(nid), 0.f, -1.f, -1.f);
-      }
-    }
-  }
+  return static_cast<size_t>(new_edges.size());
 }
 
 } // namespace gpumap::nndescent

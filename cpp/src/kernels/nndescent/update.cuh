@@ -2,8 +2,8 @@
 
 #include "buffers.cuh"
 #include <algorithm>
-#include <atomic>
 #include <cstdint>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -26,8 +26,7 @@ public:
              uint32_t n_instances, uint32_t n_features, uint32_t n_neighbors,
              uint32_t n_inserted_instances, uint32_t max_iter = 30,
              float termination_threshold = 0.001f)
-      : buffers_(buffers), update_counter_{0},
-        batch_indices_(std::move(batch_indices)),
+      : buffers_(buffers), batch_indices_(std::move(batch_indices)),
 
         input_data(input_data), neighbor_indices(neighbor_indices),
         neighbor_distances(neighbor_distances),
@@ -44,7 +43,7 @@ public:
         batch_indices_.end());
   }
 
-  void
+  size_t
   run(cudaStream_t const stream, std::vector<Idx_t> &affected_indices,
       std::vector<std::tuple<Idx_t, Idx_t, float, float, float>> &new_edges);
   void local_join(cudaStream_t const stream);
@@ -54,12 +53,12 @@ public:
 
   void sample_graph_new();
   void sample_graph(bool sample_new);
-  void update_graph(std::atomic<int64_t> &update_counter);
+  void update_graph(
+      std::vector<std::tuple<Idx_t, Idx_t, float, float, float>> &new_edges);
   void sort_lists();
 
 private:
   NNDBuffers<Data_t, int> &buffers_;
-  std::atomic<int64_t> update_counter_;
   // Row mapping for partial update mode: local row i -> global row
   // batch_indices_[i].
   std::vector<Idx_t> batch_indices_;

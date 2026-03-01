@@ -14,7 +14,7 @@ namespace gpumap {
 namespace nnd = nndescent;
 
 template <typename Data_t, typename Idx_t, typename Index_t = int>
-void update_kernel(
+size_t update_kernel(
 
     nnd::NNDBuffers<Data_t, Index_t> &buffers, std::vector<Idx_t> batch_indices,
     std::vector<Idx_t> &affected_indices,
@@ -33,7 +33,7 @@ void update_kernel(
 
 ) {
   if (batch_indices.empty()) {
-    return;
+    return 0;
   }
 
   raft::resources res;
@@ -45,7 +45,7 @@ void update_kernel(
       n_instances, n_features, n_neighbors, n_inserted_instances, max_iter,
       termination_threshold);
 
-  updater.run(update_stream, affected_indices, new_edges);
+  return updater.run(update_stream, affected_indices, new_edges);
 
   // neighbor_changed_indices를 embedding_queue에 추가
 }
