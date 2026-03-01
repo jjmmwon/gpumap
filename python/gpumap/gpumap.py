@@ -9,9 +9,12 @@ from gpumap.validators import validate_data_chunk
 from gpumap.utils import _as_f32_c_contig_2d
 
 from . import _core
-from .scheduler import Scheduler
 from .estimator import Estimator
-from .policy import BaseOpsPolicy, DefaultWeightedPolicy
+from .strategy import (
+    BaseOpsStrategy,
+    DefaultWeightedStrategy,
+    SequentialPriorityStrategy,
+)
 from .data_loader import DataLoader
 
 
@@ -32,9 +35,7 @@ class GPUMAP:
         self,
         data_loader: DataLoader,
         params: _core.GPUMAPParams,
-        policy: BaseOpsPolicy | None = None,
-        # Legacy parameters — ignored when policy is provided.
-        scheduler: Scheduler | None = None,
+        strategy: BaseOpsStrategy | None = None,
         insertion_estimator: Estimator | None = None,
         update_estimator: Estimator | None = None,
         embedding_estimator: Estimator | None = None,
@@ -57,11 +58,10 @@ class GPUMAP:
             self._impl = _core.GPUMAP(self.params)
         self._closed = False
 
-        if policy is not None:
-            self._policy = policy
+        if strategy is not None:
+            self._strategy = strategy
         else:
-            self._policy = DefaultWeightedPolicy(
-                scheduler=scheduler,
+            self._strategy = DefaultWeightedStrategy(
                 insertion_estimator=insertion_estimator,
                 update_estimator=update_estimator,
                 embedding_estimator=embedding_estimator,
@@ -70,6 +70,7 @@ class GPUMAP:
 
         self._inserted_instances = 0
         self._impl.initialize(self.data_loader.n_instances, self.data_loader.n_features)
+        self._strategy.set_total_instances(self.data_loader.n_instances)
 
     @property
     def params(self) -> _core.GPUMAPParams:
@@ -98,21 +99,19 @@ class GPUMAP:
             self._impl.append_data(data_chunk)
 
         res = self._impl.run(n_insertion_ops, n_update_ops, n_embedding_ops)
-        self._inserted_instances += res.n_insertion_ops
+        self._inserted_instances = res.n_inserted_instances
         return res
 
     def run(self, target_latency: float = 10.0) -> _core.GPUMAPIterationResult:
-        allocation = self._policy.allocate(target_latency)
+        allocation = self._strategy.allocate(target_latency)
         n_insertion_ops = min(
-            allocation.n_insertion_ops,
+            allocation[0],
             self.data_loader.n_instances - self._inserted_instances,
         )
-        n_update_ops = min(
-            allocation.n_update_ops, self._inserted_instances + n_insertion_ops
-        )
+        n_update_ops = min(allocation[1], self._inserted_instances + n_insertion_ops)
 
         n_embedding_ops = min(
-            allocation.n_embedding_ops,
+            allocation[2],
             (self._inserted_instances + n_insertion_ops) * self._params.n_neighbors * 3,
         )
 
@@ -128,11 +127,11 @@ class GPUMAP:
 
         res = self._impl.run(n_insertion_ops, n_update_ops, n_embedding_ops)
 
-        self._inserted_instances += res.n_insertion_ops
+        self._inserted_instances = res.n_inserted_instances
 
-        self._policy.update(res)
+        self._strategy.update(res)
         if res.insertion_completed:
-            self._policy.on_insertion_complete()
+            self._strategy.on_insertion_complete()
 
         return res
 
@@ -142,8 +141,12 @@ class GPUMAP:
 
     def get_neighbor_indices(self) -> cp.ndarray:
         neighbor_indices_view = cp.asarray(self._impl.get_neighbor_indices())
-        return neighbor_indices_view[:, : self._params.n_neighbors]
+        return neighbor_indices_view[
+            : self._inserted_instances, : self._params.n_neighbors
+        ]
 
     def get_neighbor_dists(self) -> cp.ndarray:
         neighbor_dists_view = cp.asarray(self._impl.get_neighbor_dists())
-        return neighbor_dists_view[:, : self._params.n_neighbors]
+        return neighbor_dists_view[
+            : self._inserted_instances, : self._params.n_neighbors
+        ]

@@ -2,6 +2,9 @@ from collections import deque
 from dataclasses import dataclass
 from statistics import NormalDist
 from typing import Deque, Optional, Tuple
+import os
+import sqlite3
+import time as _time
 
 
 class Estimator:
@@ -12,28 +15,25 @@ class Estimator:
     def add_sample(self, ops: int, elapsed_sec: float):
         raise NotImplementedError()
 
-    def estimate_ops(self,
-                     time_budget_sec: float,
-                     confidence: float = 0.95) -> int:
+    def estimate_ops(self, time_budget_sec: float, confidence: float = 0.95) -> int:
         raise NotImplementedError()
 
-    def predict_time(self,
-                     ops: int,
-                     quantile: float = 0.95) -> float:
+    def predict_time(self, ops: int, quantile: float = 0.95) -> float:
         raise NotImplementedError()
+
 
 @dataclass
 class FitResult:
-    slope_a: float      # sec per op
+    slope_a: float  # sec per op
     intercept_b: float  # fixed overhead
-    sigma: float        # residual std
+    sigma: float  # residual std
     n_samples: int
 
 
 @dataclass
 class RateFitResult:
-    mean_rate: float    # sec per op
-    sigma_rate: float   # residual std in sec per op
+    mean_rate: float  # sec per op
+    sigma_rate: float  # residual std in sec per op
     n_samples: int
 
 
@@ -71,7 +71,7 @@ class MeanRateEstimator(Estimator):
         if n >= 2:
             m = mean_rate
             var = sum((r - m) ** 2 for r in rates) / (n - 1)
-            sigma_rate = var ** 0.5
+            sigma_rate = var**0.5
         else:
             sigma_rate = 0.0
 
@@ -81,9 +81,7 @@ class MeanRateEstimator(Estimator):
     def fit_result(self) -> RateFitResult:
         return self._fit if self._fit else self.fit()
 
-    def estimate_ops(self,
-                     time_budget_sec: float,
-                     confidence: float = 0.95) -> int:
+    def estimate_ops(self, time_budget_sec: float, confidence: float = 0.95) -> int:
         if time_budget_sec <= 0:
             return 0
 
@@ -94,15 +92,14 @@ class MeanRateEstimator(Estimator):
             return 0
         return max(0, int(time_budget_sec / safe_rate))
 
-    def predict_time(self,
-                     ops: int,
-                     quantile: float = 0.95) -> float:
+    def predict_time(self, ops: int, quantile: float = 0.95) -> float:
         if ops <= 0:
             return 0.0
         fr = self.fit_result()
         z = NormalDist().inv_cdf(quantile)
         safe_rate = fr.mean_rate + z * fr.sigma_rate
         return ops * max(0.0, safe_rate)
+
 
 class DefaultLinearEstimator(Estimator):
     """
@@ -140,8 +137,7 @@ class DefaultLinearEstimator(Estimator):
         mean_y = sum(ys) / n
 
         sxx = sum((x - mean_x) ** 2 for x in xs)
-        sxy = sum((x - mean_x) * (y - mean_y)
-                  for x, y in zip(xs, ys))
+        sxy = sum((x - mean_x) * (y - mean_y) for x, y in zip(xs, ys))
 
         if sxx == 0:
             raise ValueError("Degenerate samples.")
@@ -149,13 +145,12 @@ class DefaultLinearEstimator(Estimator):
         a = sxy / sxx
         b = mean_y - a * mean_x
 
-        residuals = [y - (a * x + b)
-                     for x, y in zip(xs, ys)]
+        residuals = [y - (a * x + b) for x, y in zip(xs, ys)]
 
         if n >= 2:
             m = sum(residuals) / n
             var = sum((r - m) ** 2 for r in residuals) / (n - 1)
-            sigma = var ** 0.5
+            sigma = var**0.5
         else:
             sigma = 0.0
 
@@ -165,9 +160,7 @@ class DefaultLinearEstimator(Estimator):
     def fit_result(self) -> FitResult:
         return self._fit if self._fit else self.fit()
 
-    def estimate_ops(self,
-                     time_budget_sec: float,
-                     confidence: float = 0.95) -> int:
+    def estimate_ops(self, time_budget_sec: float, confidence: float = 0.95) -> int:
         fr = self.fit_result()
         a, b, sigma = fr.slope_a, fr.intercept_b, fr.sigma
 
@@ -183,13 +176,86 @@ class DefaultLinearEstimator(Estimator):
         ops = safe_budget / a
         return max(0, int(ops))
 
-
-    def predict_time(self,
-                     ops: int,
-                     quantile: float = 0.95) -> float:
+    def predict_time(self, ops: int, quantile: float = 0.95) -> float:
         fr = self.fit_result()
         z = NormalDist().inv_cdf(quantile)
         return fr.slope_a * ops + fr.intercept_b + z * fr.sigma
+
+
+class PersistentEstimator(Estimator):
+    """
+    Wraps any Estimator with SQLite-backed persistence.
+
+    Past samples survive process restarts. On init, up to `load_limit`
+    most-recent rows are loaded into the base estimator so it can start
+    making predictions immediately without a cold-start warm-up period.
+
+    Parameters
+    ----------
+    base:
+        The underlying estimator to delegate add_sample / estimate_ops /
+        predict_time to.
+    db_path:
+        Path to the SQLite database file. The directory is created if it
+        does not exist.
+    kind:
+        Logical name for this estimator (e.g. "insertion", "update",
+        "embedding"). Used as the table key so multiple estimators can
+        share the same DB file.
+    load_limit:
+        How many historical rows to pre-load into `base` on startup.
+    """
+
+    def __init__(
+        self,
+        base: Estimator,
+        db_path: str,
+        kind: str,
+        load_limit: int = 100,
+    ):
+        self._base = base
+        self._kind = kind
+        os.makedirs(os.path.dirname(os.path.abspath(db_path)), exist_ok=True)
+        self._conn = sqlite3.connect(db_path, check_same_thread=False)
+        self._conn.execute(
+            "CREATE TABLE IF NOT EXISTS samples "
+            "(id INTEGER PRIMARY KEY AUTOINCREMENT, "
+            " kind TEXT NOT NULL, ops INTEGER NOT NULL, elapsed REAL NOT NULL, "
+            " ts REAL NOT NULL)"
+        )
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_kind_ts ON samples(kind, ts)"
+        )
+        self._conn.commit()
+        self._load(load_limit)
+
+    def _load(self, limit: int) -> None:
+        rows = self._conn.execute(
+            "SELECT ops, elapsed FROM samples WHERE kind=? " "ORDER BY ts DESC LIMIT ?",
+            (self._kind, limit),
+        ).fetchall()
+        for ops, elapsed in reversed(rows):
+            self._base.add_sample(int(ops), float(elapsed))
+
+    def add_sample(self, ops: int, elapsed_sec: float) -> None:
+        self._base.add_sample(ops, elapsed_sec)
+        self._conn.execute(
+            "INSERT INTO samples(kind, ops, elapsed, ts) VALUES(?,?,?,?)",
+            (self._kind, ops, elapsed_sec, _time.time()),
+        )
+        self._conn.commit()
+
+    def estimate_ops(self, time_budget_sec: float, confidence: float = 0.95) -> int:
+        return self._base.estimate_ops(time_budget_sec, confidence)
+
+    def predict_time(self, ops: int, quantile: float = 0.95) -> float:
+        return self._base.predict_time(ops, quantile)
+
+    def close(self) -> None:
+        try:
+            self._conn.close()
+        except Exception:
+            pass
 
 
 # -----------------------------
