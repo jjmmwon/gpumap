@@ -34,6 +34,12 @@ PYBIND11_MODULE(_core, m) {
       .def_readonly("embedding_time", &gpumap::GPUMAPResult::embedding_time)
       .def_readonly("insertion_completed",
                     &gpumap::GPUMAPResult::insertion_completed)
+      .def_readonly("n_inserted_instances",
+                    &gpumap::GPUMAPResult::n_inserted_instances)
+      .def_readonly("n_update_changed_edges",
+                    &gpumap::GPUMAPResult::n_update_changed_edges)
+      .def_readonly("embedding_pending_edges",
+                    &gpumap::GPUMAPResult::embedding_pending_edges)
       .def_readonly("insertion_queue_size",
                     &gpumap::GPUMAPResult::insertion_queue_size)
       .def_readonly("update_queue_size",
@@ -48,7 +54,7 @@ PYBIND11_MODULE(_core, m) {
       .def("append_data", &GPUMAPWrapper::append_data, py::arg("x"))
       .def("run", &GPUMAPWrapper::run, py::arg("n_jobs_insertion"),
            py::arg("n_jobs_update"), py::arg("n_jobs_embedding"),
-       py::call_guard<py::gil_scoped_release>())
+           py::call_guard<py::gil_scoped_release>())
       .def("close", &GPUMAPWrapper::close)
       .def("get_embedding", &GPUMAPWrapper::get_embedding)
       .def("get_neighbor_indices", &GPUMAPWrapper::get_neighbor_indices)

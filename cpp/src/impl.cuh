@@ -16,7 +16,6 @@
 #include <random>
 #include <rmm/cuda_stream_view.hpp>
 #include <rmm/device_scalar.hpp>
-#include <unordered_set>
 
 namespace gpumap {
 
@@ -53,6 +52,13 @@ struct GPUMAP::Impl {
     cudaStreamCreate(&embedding_stream);
   }
 
+  template <typename... Args> void log(const char *fmt, Args... args) const {
+    if (params.verbose) {
+      fprintf(stderr, fmt, args...);
+      fflush(stderr);
+    }
+  }
+
   void append_data(const Data_t *ptr, Idx_t n_new_instances) {
 
     if (storage.n_inserted_instances + n_new_instances > storage.n_instances) {
@@ -81,68 +87,69 @@ struct GPUMAP::Impl {
   GPUMAPResult run(size_t n_insertion_ops, size_t n_update_ops,
                    size_t n_embedding_ops) {
     GPUMAPResult result{};
-    // fprintf(
-    //     stderr,
-    //     "[GPUMAP] run() start: insert=%zu update=%zu embed=%zu
-    //     inserted=%u\n", n_insertion_ops, n_update_ops, n_embedding_ops,
-    //     storage.n_inserted_instances);
-    // fflush(stderr);
+    log("[GPUMAP] run() start: insert=%zu update=%zu embed=%zu inserted=%u\n",
+        n_insertion_ops, n_update_ops, n_embedding_ops,
+        storage.n_inserted_instances);
 
-    if (!insertion_queue.size()) {
+    if (!insertion_queue.size() &&
+        storage.n_inserted_instances == storage.n_instances) {
       result.insertion_completed = true;
       result.n_insertion_ops = 0;
       result.insertion_time = 0.0f;
     } else {
-      // fprintf(stderr, "[GPUMAP] starting insert(%zu), queue size=%zu\n",
-      //         n_insertion_ops, insertion_queue.size());
-      // fflush(stderr);
+      log("[GPUMAP] insert start: n_ops=%zu queue=%zu\n", n_insertion_ops,
+          insertion_queue.size());
       auto start = clock::now();
-      insert(n_insertion_ops);
+      result.n_insertion_ops = insert(n_insertion_ops);
       cudaStreamSynchronize(insertion_stream);
-
-      // fprintf(stderr, "[GPUMAP] insert done\n");
-      // fflush(stderr);
       auto end = clock::now();
+      log("[GPUMAP] insert done: actual=%zu time=%.3fs\n",
+          result.n_insertion_ops,
+          std::chrono::duration<float>(end - start).count());
 
-      result.insertion_completed = false;
-      result.n_insertion_ops = n_insertion_ops;
+      result.insertion_completed =
+          insertion_queue.size() == 0 &&
+          storage.n_inserted_instances == storage.n_instances;
       result.insertion_time = std::chrono::duration<float>(end - start).count();
     }
 
-    // fprintf(stderr, "[GPUMAP] update queue size=%zu\n", update_queue.size());
-    // fflush(stderr);
+    log("[GPUMAP] update queue size=%zu\n", update_queue.size());
     if (n_update_ops == 0) {
       result.n_update_ops = 0;
+      result.n_update_changed_edges = 0;
       result.update_time = 0.0f;
     } else {
+      size_t n_changed_edges = 0;
       auto start = clock::now();
-      update(n_update_ops);
+      result.n_update_ops = update(n_update_ops, n_changed_edges);
       cudaStreamSynchronize(update_stream);
-      // fprintf(stderr, "[GPUMAP] update done\n");
-      // fflush(stderr);
       auto end = clock::now();
+      result.n_update_changed_edges = n_changed_edges;
+      log("[GPUMAP] update done: actual=%zu changed_edges=%zu time=%.3fs\n",
+          result.n_update_ops, result.n_update_changed_edges,
+          std::chrono::duration<float>(end - start).count());
 
-      result.n_update_ops = n_update_ops;
       result.update_time = std::chrono::duration<float>(end - start).count();
     }
 
-    // fprintf(stderr, "[GPUMAP] embedding queue size=%zu\n",
-    //         embedding_queue.size());
-    // fflush(stderr);
-
+    result.embedding_pending_edges = embedding_queue.size();
+    log("[GPUMAP] embedding queue size=%zu\n", result.embedding_pending_edges);
     if (n_embedding_ops == 0 || !embedding_queue.size()) {
       result.n_embedding_ops = 0;
       result.embedding_time = 0.0f;
     } else {
       auto start = clock::now();
-      embed(n_embedding_ops);
+      result.n_embedding_ops = embed(n_embedding_ops);
       cudaStreamSynchronize(embedding_stream);
       auto end = clock::now();
+      log("[GPUMAP] embed done: actual=%zu time=%.3fs\n",
+          result.n_embedding_ops,
+          std::chrono::duration<float>(end - start).count());
 
-      result.n_embedding_ops = n_embedding_ops;
       result.embedding_time = std::chrono::duration<float>(end - start).count();
     }
 
+    result.n_inserted_instances = storage.n_inserted_instances;
     result.insertion_queue_size = insertion_queue.size();
     result.update_queue_size = update_queue.size();
     result.embedding_queue_level_sizes = embedding_queue.level_sizes();
@@ -178,128 +185,89 @@ struct GPUMAP::Impl {
     return batch_indices.size();
   }
 
-  void update(size_t n_ops) {
+  size_t update(size_t n_ops, size_t &n_changed_edges_out) {
+    n_changed_edges_out = 0;
     if (n_ops == 0 || storage.n_inserted_instances == 0)
-      return;
+      return 0;
 
-    std::vector<Idx_t> batch_indices;
-    std::unordered_set<Idx_t> unique_indices;
+    constexpr float termination_sigma = 0.001f;
+    const size_t convergence_threshold = static_cast<size_t>(
+        termination_sigma * static_cast<float>(storage.n_inserted_instances) *
+        static_cast<float>(storage.n_neighbors));
 
-    size_t pop_count = std::min(n_ops, update_queue.size());
-    batch_indices = update_queue.pop_n(pop_count);
-    unique_indices.insert(batch_indices.begin(), batch_indices.end());
+    size_t left_ops = n_ops;
 
-    if (n_ops > pop_count) {
-      size_t sample_size = std::min(
-          n_ops - pop_count,
-          static_cast<size_t>(storage.n_inserted_instances) - pop_count);
+    while (left_ops > 0) {
+      std::vector<Idx_t> batch_indices;
 
-      std::uniform_int_distribution<Idx_t> dist(
-          0, static_cast<Idx_t>(storage.n_inserted_instances - 1));
-      for (size_t i = 0; i < sample_size; ++i) {
-        Idx_t idx = dist(rng_);
-        if (unique_indices.find(idx) == unique_indices.end()) {
-          batch_indices.push_back(idx);
+      if (!update_queue.empty()) {
+        size_t pop_count = std::min(left_ops, update_queue.size());
+        batch_indices = update_queue.pop_n(pop_count);
+      } else {
+        size_t sample_size = std::min(
+            left_ops, static_cast<size_t>(storage.n_inserted_instances));
+        std::uniform_int_distribution<Idx_t> dist(
+            0, static_cast<Idx_t>(storage.n_inserted_instances - 1));
+        batch_indices.resize(sample_size);
+        auto start_offset = dist(rng_);
+        for (size_t i = 0; i < sample_size; ++i) {
+          batch_indices[i] = (start_offset + i) % storage.n_inserted_instances;
+        }
+      }
+
+      if (batch_indices.empty())
+        break;
+
+      std::vector<Idx_t> affected_indices;
+      std::vector<gpumap::Edge> new_edges;
+
+      size_t n_changed = update_kernel<Data_t, Idx_t>(
+          storage.nnd_buffer, batch_indices, affected_indices, new_edges,
+          update_stream,
+
+          storage.data.data(), storage.neighbor_indices.data(),
+          storage.neighbor_dists.data(), storage.data_block_size,
+          storage.neighbor_indices_block_size,
+          storage.neighbor_dists_block_size,
+
+          storage.n_instances, storage.n_features, storage.n_neighbors,
+          storage.n_inserted_instances,
+
+          /*max_iter=*/1, /*termination_threshold=*/termination_sigma,
+          /*seed=*/42);
+
+      n_changed_edges_out += new_edges.size();
+      embedding_queue.push_batch(new_edges);
+      left_ops -= batch_indices.size();
+
+      // Convergence check: stop loop when neighbor changes drop below
+      // threshold.
+      if (n_changed < convergence_threshold) {
+        log("[GPUMAP] update convergence: n_changed=%zu < threshold=%zu\n",
+            n_changed, convergence_threshold);
+        break;
+      }
+
+      update_queue.push_batch(affected_indices);
+
+      // Cascade 1-hop neighbors of affected nodes into the queue.
+      const auto *h_graph = storage.nnd_buffer.h_graph.data_handle();
+      for (auto idx : affected_indices) {
+        const auto *nbrs =
+            h_graph + static_cast<size_t>(idx) * storage.n_neighbors;
+        for (uint32_t j = 0; j < storage.n_neighbors; ++j) {
+          int nid = nbrs[j].id();
+          if (nid >= 0 &&
+              static_cast<size_t>(nid) < storage.n_inserted_instances)
+            update_queue.push(static_cast<Idx_t>(nid));
         }
       }
     }
-    std::vector<Idx_t> affected_indices;
-    std::vector<gpumap::Edge> new_edges;
 
-    update_kernel<Data_t, Idx_t>(
-        storage.nnd_buffer, batch_indices, affected_indices, new_edges,
-        update_stream,
-
-        storage.data.data(), storage.neighbor_indices.data(),
-        storage.neighbor_dists.data(), storage.data_block_size,
-        storage.neighbor_indices_block_size, storage.neighbor_dists_block_size,
-
-        storage.n_instances, storage.n_features, storage.n_neighbors,
-        storage.n_inserted_instances,
-
-        /*max_iter=*/1, /*termination_threshold=*/0.001f, /*seed=*/42);
-
-    update_queue.push_batch(affected_indices);
-
-    // Cascade 1-hop neighbors of affected nodes into the queue.
-    const auto *h_graph = storage.nnd_buffer.h_graph.data_handle();
-    for (auto idx : affected_indices) {
-      const auto *nbrs =
-          h_graph + static_cast<size_t>(idx) * storage.n_neighbors;
-      for (uint32_t j = 0; j < storage.n_neighbors; ++j) {
-        int nid = nbrs[j].id();
-        if (nid >= 0 && static_cast<size_t>(nid) < storage.n_inserted_instances)
-          update_queue.push(static_cast<Idx_t>(nid));
-      }
-    }
-
-    embedding_queue.push_batch(new_edges);
-
-    // size_t left_ops = n_ops;
-
-    // while (left_ops > 0) {
-    //   // fprintf(stderr, "[GPUMAP] update: left_ops=%zu, queue_size=%zu\n",
-    //   //         left_ops, update_queue.size());
-    //   // fflush(stderr);
-    //   std::vector<Idx_t> batch_indices;
-
-    //   if (!update_queue.empty()) {
-    //     size_t pop_count = std::min(left_ops, update_queue.size());
-    //     batch_indices = update_queue.pop_n(pop_count);
-    //   } else {
-    //     size_t sample_size = std::min(
-    //         left_ops, static_cast<size_t>(storage.n_inserted_instances));
-    //     std::uniform_int_distribution<Idx_t> dist(
-    //         0, static_cast<Idx_t>(storage.n_inserted_instances - 1));
-    //     batch_indices.resize(sample_size);
-    //     auto start_offset = dist(rng_);
-    //     for (size_t i = 0; i < sample_size; ++i) {
-    //       batch_indices[i] = (start_offset + i) %
-    //       storage.n_inserted_instances;
-    //     }
-    //   }
-
-    //   if (batch_indices.empty())
-    //     break;
-
-    //   std::vector<Idx_t> affected_indices;
-    //   std::vector<gpumap::Edge> new_edges;
-
-    //   update_kernel<Data_t, Idx_t>(
-    //       storage.nnd_buffer, batch_indices, affected_indices, new_edges,
-    //       update_stream,
-
-    //       storage.data.data(), storage.neighbor_indices.data(),
-    //       storage.neighbor_dists.data(), storage.data_block_size,
-    //       storage.neighbor_indices_block_size,
-    //       storage.neighbor_dists_block_size,
-
-    //       storage.n_instances, storage.n_features, storage.n_neighbors,
-    //       storage.n_inserted_instances,
-
-    //       /*max_iter=*/1, /*termination_threshold=*/0.001f, /*seed=*/42);
-
-    //   update_queue.push_batch(affected_indices);
-
-    //   // Cascade 1-hop neighbors of affected nodes into the queue.
-    //   const auto *h_graph = storage.nnd_buffer.h_graph.data_handle();
-    //   for (auto idx : affected_indices) {
-    //     const auto *nbrs =
-    //         h_graph + static_cast<size_t>(idx) * storage.n_neighbors;
-    //     for (uint32_t j = 0; j < storage.n_neighbors; ++j) {
-    //       int nid = nbrs[j].id();
-    //       if (nid >= 0 &&
-    //           static_cast<size_t>(nid) < storage.n_inserted_instances)
-    //         update_queue.push(static_cast<Idx_t>(nid));
-    //     }
-    //   }
-
-    //   embedding_queue.push_batch(new_edges);
-    //   left_ops -= batch_indices.size();
-    // }
+    return n_ops - left_ops;
   }
 
-  void embed(size_t n_ops) {
+  size_t embed(size_t n_ops) {
     size_t left_ops = n_ops;
 
     while (left_ops > 0 && embedding_queue.size() > 0) {
@@ -465,6 +433,7 @@ struct GPUMAP::Impl {
       }
       left_ops -= current_ops;
     }
+    return n_ops - left_ops;
   }
 
   void close() {

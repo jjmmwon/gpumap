@@ -2,12 +2,26 @@ from __future__ import annotations
 
 from .gpumap import GPUMAP
 from ._core import GPUMAPParams
-from .policy import BaseOpsPolicy, DefaultWeightedPolicy, SequentialPriorityPolicy
+from .strategy import (
+    BaseOpsStrategy,
+    DefaultWeightedStrategy,
+    SequentialPriorityStrategy,
+)
+from .estimator import (
+    Estimator,
+    MeanRateEstimator,
+    DefaultLinearEstimator,
+    PersistentEstimator,
+)
 
 __all__ = [
     "GPUMAP",
     "GPUMAPParams",
-    "BaseOpsPolicy",
-    "DefaultWeightedPolicy",
-    "SequentialPriorityPolicy",
+    "BaseOpsStrategy",
+    "DefaultWeightedStrategy",
+    "SequentialPriorityStrategy",
+    "Estimator",
+    "MeanRateEstimator",
+    "DefaultLinearEstimator",
+    "PersistentEstimator",
 ]

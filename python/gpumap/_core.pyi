@@ -28,6 +28,9 @@ class GPUMAPResult:
     update_time: float
     embedding_time: float
     insertion_completed: bool
+    n_inserted_instances: int
+    n_update_changed_edges: int
+    embedding_pending_edges: int
     insertion_queue_size: int
     update_queue_size: int
     embedding_queue_level_sizes: list[int]
