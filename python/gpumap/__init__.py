@@ -2,12 +2,14 @@ from __future__ import annotations
 
 from .gpumap import GPUMAP
 from ._core import GPUMAPParams
-from .strategy import (
-    BaseOpsStrategy,
-    DefaultWeightedStrategy,
+from .schedule import (
+    BaseStrategy,
+    WeightedStrategy,
+    FixedInsertionStrategy,
     SequentialPriorityStrategy,
-)
-from .estimator import (
+    PhaseSpec,
+    DEFAULT_PHASE_SPECS,
+    PhaseBasedStrategy,
     Estimator,
     MeanRateEstimator,
     DefaultLinearEstimator,
@@ -17,9 +19,15 @@ from .estimator import (
 __all__ = [
     "GPUMAP",
     "GPUMAPParams",
-    "BaseOpsStrategy",
-    "DefaultWeightedStrategy",
+    # strategies
+    "BaseStrategy",
+    "WeightedStrategy",
+    "FixedInsertionStrategy",
     "SequentialPriorityStrategy",
+    "PhaseSpec",
+    "DEFAULT_PHASE_SPECS",
+    "PhaseBasedStrategy",
+    # estimators
     "Estimator",
     "MeanRateEstimator",
     "DefaultLinearEstimator",

@@ -1,20 +1,19 @@
 from __future__ import annotations
 
 import numpy as np
-import cupy as cp
 from scipy.optimize import curve_fit
+
+from . import _core
+
+# Import CuPy after loading gpumap._core to avoid mixing CUDA libs
+# from different package managers (e.g., pip nvidia-* vs conda CUDA libs).
+import cupy as cp
 
 
 from gpumap.validators import validate_data_chunk
 from gpumap.utils import _as_f32_c_contig_2d
 
-from . import _core
-from .estimator import Estimator
-from .strategy import (
-    BaseOpsStrategy,
-    DefaultWeightedStrategy,
-    SequentialPriorityStrategy,
-)
+from .schedule import Estimator, BaseStrategy, WeightedStrategy
 from .data_loader import DataLoader
 
 
@@ -35,7 +34,7 @@ class GPUMAP:
         self,
         data_loader: DataLoader,
         params: _core.GPUMAPParams,
-        strategy: BaseOpsStrategy | None = None,
+        strategy: BaseStrategy | None = None,
         insertion_estimator: Estimator | None = None,
         update_estimator: Estimator | None = None,
         embedding_estimator: Estimator | None = None,
@@ -61,7 +60,9 @@ class GPUMAP:
         if strategy is not None:
             self._strategy = strategy
         else:
-            self._strategy = DefaultWeightedStrategy(
+            self._strategy = WeightedStrategy(
+                n_instances=data_loader.n_instances,
+                n_neighbors=params.n_neighbors,
                 insertion_estimator=insertion_estimator,
                 update_estimator=update_estimator,
                 embedding_estimator=embedding_estimator,
@@ -70,7 +71,6 @@ class GPUMAP:
 
         self._inserted_instances = 0
         self._impl.initialize(self.data_loader.n_instances, self.data_loader.n_features)
-        self._strategy.set_total_instances(self.data_loader.n_instances)
 
     @property
     def params(self) -> _core.GPUMAPParams:

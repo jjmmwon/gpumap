@@ -118,6 +118,8 @@ class DefaultLinearEstimator(Estimator):
         self._fit: Optional[FitResult] = None
 
     def add_sample(self, ops: int, elapsed_sec: float):
+        if ops <= 0 or elapsed_sec < 0:
+            return
         self._samples.append((ops, elapsed_sec))
         self._fit = None
 
@@ -226,6 +228,13 @@ class PersistentEstimator(Estimator):
         self._conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_kind_ts ON samples(kind, ts)"
         )
+        self._conn.execute(
+            "CREATE TABLE IF NOT EXISTS runs "
+            "(id INTEGER PRIMARY KEY AUTOINCREMENT, "
+            " kind TEXT NOT NULL, data_name TEXT NOT NULL, "
+            " n_features INTEGER NOT NULL, n_inserted_instances INTEGER NOT NULL, "
+            " ts REAL NOT NULL)"
+        )
         self._conn.commit()
         self._load(load_limit)
 
@@ -238,6 +247,8 @@ class PersistentEstimator(Estimator):
             self._base.add_sample(int(ops), float(elapsed))
 
     def add_sample(self, ops: int, elapsed_sec: float) -> None:
+        if ops <= 0 or elapsed_sec < 0:
+            return
         self._base.add_sample(ops, elapsed_sec)
         self._conn.execute(
             "INSERT INTO samples(kind, ops, elapsed, ts) VALUES(?,?,?,?)",
@@ -250,6 +261,19 @@ class PersistentEstimator(Estimator):
 
     def predict_time(self, ops: int, quantile: float = 0.95) -> float:
         return self._base.predict_time(ops, quantile)
+
+    def log_run(
+        self,
+        data_name: str,
+        n_features: int,
+        n_inserted_instances: int,
+    ) -> None:
+        self._conn.execute(
+            "INSERT INTO runs(kind, data_name, n_features, n_inserted_instances, ts) "
+            "VALUES(?,?,?,?,?)",
+            (self._kind, data_name, n_features, n_inserted_instances, _time.time()),
+        )
+        self._conn.commit()
 
     def close(self) -> None:
         try:
