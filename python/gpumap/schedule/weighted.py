@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Optional
+from typing import Literal, Optional
 
 from .estimator import Estimator, MeanRateEstimator
 from .strategy import BaseStrategy, _estimate_or_fallback, clip_ops
@@ -59,32 +59,29 @@ class WeightedStrategy(BaseStrategy):
         )
 
 
-class FixedInsertionStrategy(WeightedStrategy):
+class FocusedStrategy(WeightedStrategy):
     """
-    Fixed insertion ops until all instances are inserted, then switch to
-    weighted allocation for update and embedding.
+    Allocates a fixed fraction of the budget to one phase, with the remainder
+    split among the other two phases by their relative weights.
 
-    This is a simple strategy that ensures steady progress on insertion, which is
-    important for overall convergence. The insertion ops can be tuned to balance
-    insertion speed with responsiveness of update/embedding phases.
+    `focus` selects the prioritized phase: "insertion", "update", or "embedding".
+    `focus_rate` sets what fraction of total time goes to that phase (0 < focus_rate < 1).
     """
 
     def __init__(
         self,
         n_instances: int,
         n_neighbors: int = 15,
-        weights: tuple[float, float, float] = (1.0, 1.0, 1.0),
-        reserved: float = 0.1,
         insertion_estimator: Optional[Estimator] = None,
         update_estimator: Optional[Estimator] = None,
         embedding_estimator: Optional[Estimator] = None,
         default_n_ops: int = 100,
         confidence: float = 0.95,
-        fixed_insertion_rate: float = 0.5,
+        focus: Literal["insertion", "update", "embedding"] = "insertion",
+        focus_rate: float = 0.5,
+        reserved: float = 0.1,
     ):
         super().__init__(
-            weights=weights,
-            reserved=reserved,
             insertion_estimator=insertion_estimator or MeanRateEstimator(),
             update_estimator=update_estimator or MeanRateEstimator(),
             embedding_estimator=embedding_estimator or MeanRateEstimator(),
@@ -92,9 +89,13 @@ class FixedInsertionStrategy(WeightedStrategy):
             n_neighbors=n_neighbors,
             default_n_ops=default_n_ops,
             confidence=confidence,
+            reserved=reserved,
         )
-        self._weights[0] = (
-            (self._weights[1] + self._weights[2])
-            * fixed_insertion_rate
-            / (1 - fixed_insertion_rate)
-        )
+        if not (0.0 < focus_rate < 1.0):
+            raise ValueError("focus_rate must be in the range (0, 1)")
+
+        focus_index = {"insertion": 0, "update": 1, "embedding": 2}[focus]
+        other_weight = (1.0 - focus_rate) / 2
+
+        self._weights = [other_weight] * 3
+        self._weights[focus_index] = focus_rate
