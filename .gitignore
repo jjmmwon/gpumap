@@ -97,6 +97,8 @@ data/
 outputs/
 checkpoints/
 results/
+evaluation/*results/
+evaluation/*data/
 
 
 # -----------------------------

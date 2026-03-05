@@ -62,24 +62,24 @@ def fill_unembedded_by_density(
 
 
 def eval_in_progress_emb_certainty(
-    incomplete_embedding: np.ndarray,
-    complete_embedding: np.ndarray,
+    in_progress_embedding: np.ndarray, ground_truth: np.ndarray
 ):
-    """
-    진행 중인 임베딩의 품질을 complete_embedding과 동일한 지표로 평가한다.
+    filled = fill_unembedded_by_density(in_progress_embedding, ground_truth.shape[0])
+    return eval_emb_certainty(filled, ground_truth)
 
-    Parameters
-    ----------
-    incomplete_embedding : (n_samples, 2)  일부 행이 NaN일 수 있음
-    complete_embedding   : (n_samples, 2)  완전한 임베딩
 
-    Returns
-    -------
-    float
-        평가 지표 값
-    """
-    filled_embedding = fill_unembedded_by_density(
-        incomplete_embedding, complete_embedding.shape[0]
-    )
+def eval_emb_certainty(
+    emb_knn_indices: np.ndarray, ground_truth_sets: np.ndarray
+) -> tuple[float, np.ndarray]:
+    n, k = emb_knn_indices.shape
 
-    pass
+    assert ground_truth_sets.shape[0] == (n)
+
+    accuracy = np.zeros(n, dtype=np.float32)
+
+    for i, gt in enumerate(ground_truth_sets):
+        gt_valid = gt[: gt[-1]]
+        true_positives = np.isin(gt_valid, emb_knn_indices[i]).sum()
+        accuracy[i] = true_positives / k
+
+    return np.mean(accuracy), accuracy
