@@ -24,7 +24,7 @@ public:
              uint32_t neighbor_dists_block_size,
 
              uint32_t n_instances, uint32_t n_features, uint32_t n_neighbors,
-             uint32_t n_inserted_instances, uint32_t max_iter = 30,
+             uint32_t n_inserted_instances,
              float termination_threshold = 0.001f)
       : buffers_(buffers), batch_indices_(std::move(batch_indices)),
 
@@ -36,7 +36,7 @@ public:
 
         n_instances_(n_instances), n_features_(n_features),
         n_neighbors_(n_neighbors), n_inserted_instances_(n_inserted_instances),
-        max_iter_(max_iter), termination_threshold_(termination_threshold) {
+        termination_threshold_(termination_threshold) {
     std::sort(batch_indices_.begin(), batch_indices_.end());
     batch_indices_.erase(
         std::unique(batch_indices_.begin(), batch_indices_.end()),
@@ -75,7 +75,6 @@ private:
   uint32_t n_features_;
   uint32_t n_neighbors_;
   uint32_t n_inserted_instances_;
-  uint32_t max_iter_;
   float termination_threshold_;
 };
 

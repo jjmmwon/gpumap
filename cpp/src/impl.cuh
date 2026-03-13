@@ -87,6 +87,7 @@ struct GPUMAP::Impl {
   GPUMAPResult run(size_t n_insertion_ops, size_t n_update_ops,
                    size_t n_embedding_ops) {
     GPUMAPResult result{};
+    printf("Debugging Trial #2\n");
     log("[GPUMAP] run() start: insert=%zu update=%zu embed=%zu inserted=%u\n",
         n_insertion_ops, n_update_ops, n_embedding_ops,
         storage.n_inserted_instances);
@@ -166,18 +167,12 @@ struct GPUMAP::Impl {
     std::vector<Idx_t> affected_indices;
     std::vector<gpumap::Edge> new_edges;
 
-    insertion_kernel<Data_t, Idx_t>(
-        storage.nnd_buffer, batch_indices,
-
-        storage.data.data(), storage.neighbor_indices.data(),
-        storage.neighbor_dists.data(), storage.embedding.data(),
-
-        storage.data_block_size, storage.neighbor_indices_block_size,
-        storage.neighbor_dists_block_size, storage.n_components,
-
-        storage.n_instances, storage.n_features, storage.n_neighbors,
-        storage.n_inserted_instances, affected_indices, new_edges,
-        insertion_stream);
+    run_insertion<Data_t, Idx_t>(
+        storage.nnd_buffer, batch_indices, storage.data.data(),
+        storage.data_block_size, storage.n_features, storage.n_neighbors,
+        storage.n_inserted_instances,
+        /*max_iter=*/3, /*seed=*/42, insertion_stream, affected_indices,
+        new_edges, storage.embedding.data(), storage.n_components);
 
     update_queue.push_batch(affected_indices);
     embedding_queue.push_batch(new_edges);
@@ -233,8 +228,7 @@ struct GPUMAP::Impl {
           storage.n_instances, storage.n_features, storage.n_neighbors,
           storage.n_inserted_instances,
 
-          /*max_iter=*/1, /*termination_threshold=*/termination_sigma,
-          /*seed=*/42);
+          /*termination_threshold=*/termination_sigma, /*seed=*/42);
 
       n_changed_edges_out += new_edges.size();
       embedding_queue.push_batch(new_edges);

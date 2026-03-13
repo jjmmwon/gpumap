@@ -15,7 +15,7 @@
 namespace gpumap::nndescent {
 
 constexpr int MAX_NEIGHBORS = 32;
-constexpr int MAX_CANDIDATES = 216;
+constexpr int MAX_CANDIDATES = 256;
 constexpr int NUM_SAMPLES = 32;
 constexpr int MAX_NUM_BI_SAMPLES = 64;
 constexpr int SKEWED_MAX_NUM_BI_SAMPLES = 68;
@@ -141,7 +141,7 @@ private:
   int id_{std::numeric_limits<int>::max()};
 
 public:
-  InternalID_t(int id) : id_(id) {}
+  inline __host__ __device__ InternalID_t(int id) : id_(id) {}
 
   inline __host__ __device__ bool is_new() const { return id_ >= 0; }
   inline __host__ __device__ int &id_with_flag() { return id_; }

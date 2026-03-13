@@ -947,9 +947,6 @@ size_t UpdateAlgo<Data_t, Idx_t, Index_t>::run(
 
   cudaStreamSynchronize(stream);
 
-  RAFT_LOG_DEBUG("# GNND single-pass update (max_iter=%lu)",
-                 static_cast<unsigned long>(max_iter_));
-
   add_reverse_edges(buffers_.h_graph_new.data_handle(),
                     buffers_.h_rev_graph_new_.data_handle(),
                     buffers_.d_rev_graph_buffer_.data_handle(),

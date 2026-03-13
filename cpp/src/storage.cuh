@@ -49,7 +49,6 @@ template <typename Data_t = float, typename Idx_t = uint32_t> struct Storage {
   Idx_t seed;
 
   // configs for nndescent
-  Idx_t max_iter_nnd;
   float termination_threshold_nnd;
 
   // high dim raw vectors
@@ -103,12 +102,10 @@ template <typename Data_t = float, typename Idx_t = uint32_t> struct Storage {
 
   Storage() = delete;
   Storage(Idx_t n_instances_, Idx_t n_features_, Idx_t n_neighbors_,
-          Idx_t n_components_ = 2, Idx_t seed_ = 42, Idx_t max_iter_nnd_ = 30,
-          Idx_t n_samples_nnd_ = 150,
+          Idx_t n_components_ = 2, Idx_t seed_ = 42, Idx_t n_samples_nnd_ = 150,
           float termination_threshold_nnd_ = 0.0001f)
       : n_instances(n_instances_), n_features(n_features_),
         n_neighbors(n_neighbors_), n_components(n_components_), seed(seed_),
-        max_iter_nnd(max_iter_nnd_),
         termination_threshold_nnd(termination_threshold_nnd_),
         data(0, rmm::cuda_stream_default),
         neighbor_indices(0, rmm::cuda_stream_default),

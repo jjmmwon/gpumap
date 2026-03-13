@@ -28,8 +28,7 @@ size_t update_kernel(
     uint32_t n_instances, uint32_t n_features, uint32_t n_neighbors,
     size_t n_inserted_instances,
 
-    uint32_t max_iter = 30, float termination_threshold = 0.001f,
-    size_t seed = 42
+    float termination_threshold = 0.001f, size_t seed = 42
 
 ) {
   if (batch_indices.empty()) {
@@ -42,7 +41,7 @@ size_t update_kernel(
   nndescent::UpdateAlgo<Data_t, Idx_t> updater(
       buffers, batch_indices, input_data, neighbor_indices, neighbor_distances,
       data_block_size, neighbor_block_size, neighbor_dists_block_size,
-      n_instances, n_features, n_neighbors, n_inserted_instances, max_iter,
+      n_instances, n_features, n_neighbors, n_inserted_instances,
       termination_threshold);
 
   return updater.run(update_stream, affected_indices, new_edges);
