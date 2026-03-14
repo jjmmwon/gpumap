@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <csignal>
 #include <cstdio>
+#include <deque>
 #include <random>
 #include <rmm/cuda_stream_view.hpp>
 #include <rmm/device_scalar.hpp>
@@ -33,7 +34,20 @@ struct GPUMAP::Impl {
 
   InsertionQueue insertion_queue;
   UpdateQueue update_queue;
-  MultiLevelEmbeddingQueue embedding_queue;
+
+  static constexpr float FIRST_MAX_EPOCH = 20.f;
+  static constexpr float SECOND_MAX_EPOCH = 40.f;
+  static constexpr float THIRD_MAX_EPOCH = 60.f;
+  static constexpr float LAST_MAX_EPOCH = 80.f;
+
+  Queue<Edge> first_embed_queue;
+  Queue<Edge> second_embed_queue;
+  Queue<Edge> third_embed_queue;
+  Queue<Edge> last_embed_queue;
+
+  // Recent-window tracking for initialize_random_neighbors.
+  static constexpr int WINDOW_N_BATCHES = 3;
+  std::deque<uint32_t> batch_start_history_;
 
   bool first_insertion = true;
   std::mt19937 rng_{42};
@@ -41,8 +55,7 @@ struct GPUMAP::Impl {
   Impl(const GPUMAPParams &params_)
       : params(params_), storage(params_.n_instances, params_.n_features,
                                  params_.n_neighbors, params_.n_components),
-        insertion_queue(),
-        embedding_queue(static_cast<float>(params_.max_epoch)) {
+        insertion_queue() {
     initialize();
   }
 
@@ -87,7 +100,7 @@ struct GPUMAP::Impl {
   GPUMAPResult run(size_t n_insertion_ops, size_t n_update_ops,
                    size_t n_embedding_ops) {
     GPUMAPResult result{};
-    printf("Debugging Trial #2\n");
+    printf("Debugging Trial #3\n");
     log("[GPUMAP] run() start: insert=%zu update=%zu embed=%zu inserted=%u\n",
         n_insertion_ops, n_update_ops, n_embedding_ops,
         storage.n_inserted_instances);
@@ -133,9 +146,11 @@ struct GPUMAP::Impl {
       result.update_time = std::chrono::duration<float>(end - start).count();
     }
 
-    result.embedding_pending_edges = embedding_queue.size();
+    result.embedding_pending_edges =
+        first_embed_queue.size() + second_embed_queue.size() +
+        third_embed_queue.size() + last_embed_queue.size();
     log("[GPUMAP] embedding queue size=%zu\n", result.embedding_pending_edges);
-    if (n_embedding_ops == 0 || !embedding_queue.size()) {
+    if (n_embedding_ops == 0 || !result.embedding_pending_edges) {
       result.n_embedding_ops = 0;
       result.embedding_time = 0.0f;
     } else {
@@ -153,7 +168,12 @@ struct GPUMAP::Impl {
     result.n_inserted_instances = storage.n_inserted_instances;
     result.insertion_queue_size = insertion_queue.size();
     result.update_queue_size = update_queue.size();
-    result.embedding_queue_level_sizes = embedding_queue.level_sizes();
+    result.embedding_queue_level_sizes = {
+        static_cast<uint32_t>(first_embed_queue.size()),
+        static_cast<uint32_t>(second_embed_queue.size()),
+        static_cast<uint32_t>(third_embed_queue.size()),
+        static_cast<uint32_t>(last_embed_queue.size()),
+    };
 
     return result;
   }
@@ -167,15 +187,22 @@ struct GPUMAP::Impl {
     std::vector<Idx_t> affected_indices;
     std::vector<gpumap::Edge> new_edges;
 
+    // Record this batch's start and maintain a sliding window of size W.
+    batch_start_history_.push_back(batch_indices.front());
+    if (static_cast<int>(batch_start_history_.size()) > WINDOW_N_BATCHES)
+      batch_start_history_.pop_front();
+    const uint32_t window_start = batch_start_history_.front();
+
     run_insertion<Data_t, Idx_t>(
         storage.nnd_buffer, batch_indices, storage.data.data(),
         storage.data_block_size, storage.n_features, storage.n_neighbors,
         storage.n_inserted_instances,
         /*max_iter=*/3, /*seed=*/42, insertion_stream, affected_indices,
-        new_edges, storage.embedding.data(), storage.n_components);
+        new_edges, storage.embedding.data(), storage.n_components,
+        window_start);
 
     update_queue.push_batch(affected_indices);
-    embedding_queue.push_batch(new_edges);
+    first_embed_queue.push_batch(new_edges);
 
     return batch_indices.size();
   }
@@ -231,7 +258,7 @@ struct GPUMAP::Impl {
           /*termination_threshold=*/termination_sigma, /*seed=*/42);
 
       n_changed_edges_out += new_edges.size();
-      embedding_queue.push_batch(new_edges);
+      first_embed_queue.push_batch(new_edges);
       left_ops -= batch_indices.size();
 
       // Convergence check: stop loop when neighbor changes drop below
@@ -261,13 +288,18 @@ struct GPUMAP::Impl {
     return n_ops - left_ops;
   }
 
-  size_t embed(size_t n_ops) {
+  // 하나의 stage에 대해 embedding SGD를 수행한다.
+  // src_queue에서 current_ops개의 edge를 꺼내 update_embeddings를 실행한다.
+  // stage가 끝나지 않은 edge는 src_queue에 다시 넣고,
+  // stage_max_epoch을 넘은 edge는 epoch을 초기화해 dst_queue로 승격한다
+  // (dst_queue가 nullptr이면 마지막 stage이므로 해당 edge는 그냥 버린다).
+  size_t embed_stage(size_t n_ops, Queue<Edge> &src_queue,
+                     float stage_max_epoch, Queue<Edge> *dst_queue) {
     size_t left_ops = n_ops;
 
-    while (left_ops > 0 && embedding_queue.size() > 0) {
-      size_t current_ops = std::min(left_ops, embedding_queue.size());
-      std::vector<gpumap::Edge> batch_edges;
-      embedding_queue.pop_n(current_ops, batch_edges);
+    while (left_ops > 0 && !src_queue.empty()) {
+      size_t current_ops = std::min(left_ops, src_queue.size());
+      std::vector<gpumap::Edge> batch_edges = src_queue.pop_n(current_ops);
 
       // src, dst, epoch 리스트를 만든다. h for host
       const size_t n_edges = batch_edges.size();
@@ -316,8 +348,7 @@ struct GPUMAP::Impl {
       cudaStreamSynchronize(embedding_stream);
 
       if (h_out_count == 0) {
-        // 여전히 이웃인 pair가 하나도 없다면..
-        // TODO 만약 진짜 하나도 없다면 몇 번 더봐야 하지 않나?
+        left_ops -= current_ops;
         continue;
       }
 
@@ -376,11 +407,7 @@ struct GPUMAP::Impl {
       unique_indices.erase(
           std::unique(unique_indices.begin(), unique_indices.end()),
           unique_indices.end());
-      // fprintf(stderr, "[GPUMAP] unique indices count=%zu\n",
-      //         unique_indices.size());
 
-      // 남은 엣지들 중에서 dirty한 녀석들을 보고 dirty하다면 sigma_i를
-      // 업데이트해준다.
       rmm::device_uvector<Idx_t> d_unique_indices(unique_indices.size(),
                                                   embedding_stream);
       cudaMemcpyAsync(d_unique_indices.data(), unique_indices.data(),
@@ -401,7 +428,8 @@ struct GPUMAP::Impl {
           storage.neighbor_indices_block_size, storage.neighbor_dists.data(),
           storage.neighbor_dists_block_size, storage.n_neighbors,
           storage.max_w.data(), params.a, params.b, params.alpha,
-          params.max_epoch, params.negative_sample_rate, embedding_stream);
+          static_cast<size_t>(stage_max_epoch), params.negative_sample_rate,
+          embedding_stream);
 
       raft::copy(h_out_current_epochs.data(), d_out_current_epochs.data(),
                  h_out_count, embedding_stream);
@@ -410,24 +438,45 @@ struct GPUMAP::Impl {
                  embedding_stream);
       raft::copy(h_out_next_neg_epochs.data(), d_out_next_neg_epochs.data(),
                  h_out_count, embedding_stream);
+      cudaStreamSynchronize(embedding_stream);
 
-      std::vector<gpumap::Edge> requeue_edges;
-      requeue_edges.reserve(h_out_count);
+      // stage 내에서 아직 덜 끝난 edge는 src_queue로 돌려보내고,
+      // stage를 완료한 edge는 epoch을 초기화해 dst_queue로 승격한다.
+      std::vector<gpumap::Edge> requeue_edges, promote_edges;
       for (size_t i = 0; i < h_out_count; ++i) {
-        const float next_epoch = h_out_current_epochs[i];
-        if (next_epoch <= static_cast<float>(params.max_epoch)) {
+        if (h_out_current_epochs[i] <= stage_max_epoch) {
           requeue_edges.emplace_back(
               h_out_srcs[i], h_out_dsts[i], h_out_current_epochs[i],
               h_out_next_sample_epochs[i], h_out_next_neg_epochs[i]);
+        } else if (dst_queue != nullptr) {
+          promote_edges.emplace_back(h_out_srcs[i], h_out_dsts[i], 0.f, -1.f,
+                                     -1.f);
         }
       }
 
-      if (!requeue_edges.empty()) {
-        embedding_queue.push_batch(requeue_edges);
-      }
+      if (!requeue_edges.empty())
+        src_queue.push_batch(requeue_edges);
+      if (!promote_edges.empty())
+        dst_queue->push_batch(promote_edges);
+
       left_ops -= current_ops;
     }
     return n_ops - left_ops;
+  }
+
+  size_t embed(size_t n_ops) {
+    // first stage를 먼저 소진하고, 남은 ops를 순서대로 다음 stage로 넘긴다.
+    size_t done = 0;
+    done += embed_stage(n_ops - done, first_embed_queue, FIRST_MAX_EPOCH,
+                        &second_embed_queue);
+    done += embed_stage(n_ops - done, second_embed_queue, SECOND_MAX_EPOCH,
+                        &third_embed_queue);
+    done += embed_stage(n_ops - done, third_embed_queue, THIRD_MAX_EPOCH,
+                        &last_embed_queue);
+
+    done +=
+        embed_stage(n_ops - done, last_embed_queue, LAST_MAX_EPOCH, nullptr);
+    return done;
   }
 
   void close() {

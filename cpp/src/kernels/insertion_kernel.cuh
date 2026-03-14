@@ -84,11 +84,14 @@ preprocess_l2_norms_kernel(Data_t *input_data, uint32_t batch_size,
   }
 }
 
+// Sampling strategy: 50% from recent window [window_start, n_inserted),
+// 50% from full range [0, n_inserted). If the window has fewer unique
+// candidates than its quota, the shortfall is filled from the full range.
 template <typename Data_t, typename Idx_t, typename Index_t = int>
 __global__ __forceinline__ void initialize_random_neighbors_kernel(
     InternalID_t *graph_buffer_, Data_t *distance_buffer_, int width,
     uint32_t batch_size, uint32_t batch_start_offset,
-    uint32_t n_inserted_instances, size_t seed) {
+    uint32_t n_inserted_instances, uint32_t window_start, size_t seed) {
 
   size_t row_local = blockIdx.x * blockDim.x + threadIdx.x;
   if (row_local >= batch_size)
@@ -116,18 +119,39 @@ __global__ __forceinline__ void initialize_random_neighbors_kernel(
   const int max_unique_fill =
       min(width, static_cast<int>(n_inserted_instances) - 1);
 
-  // Accumulate selected IDs in registers to avoid O(k²) global memory reads
-  // during the duplicate check. Global memory is written only once at the end.
+  // window_quota: how many slots we try to fill from the recent window.
+  // Capped by available unique window nodes (subtract 1 for possible self).
+  const int window_size =
+      static_cast<int>(n_inserted_instances) - static_cast<int>(window_start);
+  const int window_quota = min(width / 2, max(0, window_size - 1));
+
   Index_t filled_ids[MAX_NEIGHBORS];
   int filled = 0;
 
+  // Phase 1: sample from recent window [window_start, n_inserted_instances).
+  // Limit attempts to avoid spinning when window is nearly exhausted.
+  int attempts = 0;
+  const int max_attempts = window_quota * 16;
+  while (filled < window_quota && attempts < max_attempts) {
+    ++attempts;
+    const Index_t candidate = static_cast<Index_t>(
+        window_start + static_cast<uint32_t>(curand(&state)) %
+                           static_cast<uint32_t>(window_size));
+    if (candidate == gid)
+      continue;
+    if (list_contains_id(filled_ids, filled, candidate))
+      continue;
+    filled_ids[filled++] = candidate;
+  }
+
+  // Phase 2: fill remaining slots from full range [0, n_inserted_instances).
+  // Duplicate-check covers window nodes already in filled_ids.
   while (filled < max_unique_fill) {
     const Index_t candidate =
         static_cast<Index_t>(curand(&state) % n_inserted_instances);
     if (candidate == gid)
       continue;
-    bool existed = list_contains_id(filled_ids, filled, candidate);
-    if (existed)
+    if (list_contains_id(filled_ids, filled, candidate))
       continue;
     filled_ids[filled++] = candidate;
   }
@@ -818,7 +842,8 @@ void run_insertion(
     uint32_t n_neighbors, uint32_t n_inserted_instances, uint32_t max_iter,
     size_t seed, cudaStream_t stream, std::vector<Idx_t> &affected_indices,
     std::vector<std::tuple<Idx_t, Idx_t, float, float, float>> &new_edges,
-    Data_t *embedding = nullptr, uint32_t n_components = 0) {
+    Data_t *embedding = nullptr, uint32_t n_components = 0,
+    uint32_t window_start = 0) {
   const uint32_t batch_size = static_cast<uint32_t>(batch_indices.size());
   if (batch_size == 0)
     return;
@@ -861,7 +886,7 @@ void run_insertion(
             graph_ptr + static_cast<size_t>(batch_start_offset) * MAX_NEIGHBORS,
             dists_ptr + static_cast<size_t>(batch_start_offset) * MAX_NEIGHBORS,
             MAX_NEIGHBORS, batch_size, batch_start_offset, n_inserted_instances,
-            seed);
+            window_start, seed);
     RAFT_CUDA_TRY(cudaGetLastError());
   }
 
