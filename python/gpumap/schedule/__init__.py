@@ -10,7 +10,7 @@ from .strategy import (
     BaseStrategy,
     clip_ops,
 )
-from .weighted import WeightedStrategy, FixedInsertionStrategy
+from .weighted import WeightedStrategy
 from .sequential import SequentialPriorityStrategy
 from .phase_based import PhaseSpec, DEFAULT_PHASE_SPECS, PhaseBasedStrategy
 
@@ -27,7 +27,6 @@ __all__ = [
     "clip_ops",
     # strategies
     "WeightedStrategy",
-    "FixedInsertionStrategy",
     "SequentialPriorityStrategy",
     "PhaseSpec",
     "DEFAULT_PHASE_SPECS",

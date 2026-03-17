@@ -12,7 +12,7 @@
 #include <vector>
 #include <vector_types.h>
 
-namespace gpumap::nndescent {
+namespace gpumap {
 
 constexpr int MAX_NEIGHBORS = 32;
 constexpr int MAX_CANDIDATES = 256;
@@ -288,9 +288,9 @@ template <typename Data_t, typename Index_t = int> struct NNDBuffers {
   raft::host_matrix<Data_t, size_t> h_dists;
 
   // Pinned buffer holding the "new" neighbor sample for the current iteration.
-  // Filled by sample_graph() / sample_graph_new() (up to NUM_SAMPLES entries
-  // per node). Passed directly to local_join_kernel as a kernel argument and
-  // to add_reverse_edges() to build h_rev_graph_new_. int2::x of
+  // Filled by sample_graph() (up to NUM_SAMPLES entries per node). Passed
+  // directly to local_join_kernel as a kernel argument and to
+  // add_reverse_edges() to build h_rev_graph_new_. int2::x of
   // h_list_sizes_new records the number of valid entries.
   raft::pinned_matrix<Index_t, size_t> h_graph_new;
   raft::pinned_vector<int2, size_t> h_list_sizes_new;
@@ -306,4 +306,4 @@ template <typename Data_t, typename Index_t = int> struct NNDBuffers {
   BloomFilter<Index_t> bloom_filter;
 };
 
-} // namespace gpumap::nndescent
+} // namespace gpumap

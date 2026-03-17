@@ -112,7 +112,9 @@ class GPUMAP:
 
         n_embedding_ops = min(
             allocation[2],
-            (self._inserted_instances + n_insertion_ops) * self._params.n_neighbors * 3,
+            (self._inserted_instances + n_insertion_ops)
+            * self._params.n_neighbors
+            * 210,
         )
 
         if n_insertion_ops > 0:

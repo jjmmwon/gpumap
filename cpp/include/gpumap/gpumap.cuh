@@ -3,7 +3,6 @@
 
 #include <cstdint>
 #include <memory>
-#include <vector>
 
 // Public return types (lightweight views)
 #include <raft/core/device_mdspan.hpp>
@@ -48,7 +47,7 @@ struct GPUMAPResult {
   size_t embedding_pending_edges;
   size_t insertion_queue_size;
   size_t update_queue_size;
-  std::vector<uint32_t> embedding_queue_level_sizes;
+  size_t embedding_queue_size;
 };
 
 // Public, non-template API (bind this from pybind).

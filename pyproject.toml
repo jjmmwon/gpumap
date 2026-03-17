@@ -10,9 +10,8 @@ dependencies = ["numpy"]
 
 [tool.scikit-build]
 cmake.version = ">=3.24"
-build-dir = "build/{wheel_tag}"
+build-dir = "build/dev"
 wheel.packages = ["python/gpumap"]
 
 [tool.scikit-build.cmake.define]
-CMAKE_CXX_COMPILER_LAUNCHER = "ccache"
-CMAKE_CUDA_COMPILER_LAUNCHER = "ccache"
+CMAKE_EXPORT_COMPILE_COMMANDS = "ON"

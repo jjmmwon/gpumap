@@ -33,7 +33,7 @@ class GPUMAPResult:
     embedding_pending_edges: int
     insertion_queue_size: int
     update_queue_size: int
-    embedding_queue_level_sizes: list[int]
+    embedding_queue_size: int
 
 GPUMAPIterationResult: TypeAlias = GPUMAPResult
 

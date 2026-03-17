@@ -96,6 +96,7 @@ using EdgeT = std::tuple<Idx_t, Idx_t, float, float, float>;
 
 using Edge = EdgeT<uint32_t>;
 
+
 // Multi-level embedding queue: divides [0, max_epoch] into N_LEVELS bins.
 // Edges are routed by their current_epoch so that pop_n drains lower-epoch
 // bins first, preserving temporal ordering across requeues.
@@ -129,7 +130,7 @@ struct MultiLevelEmbeddingQueue {
   }
 
   void push(const Edge &e) {
-    int level = get_level(std::get<2>(e)); // current_epoch is field 2
+    int level = get_level(std::get<2>(e));
     levels_[level].push(e);
     ++total_size_;
   }
@@ -140,11 +141,8 @@ struct MultiLevelEmbeddingQueue {
     }
   }
 
-  // Drains from the highest-epoch bin first.
-  // Each level receives an equal base quota of actual_n / N_LEVELS items.
-  // If a level has fewer items than its quota, the shortfall carries over to
-  // the next lower level. A final sweep collects any items missed due to
-  // integer-division remainder or carry that accumulated past level 0.
+  // Drains from the highest-epoch bin first, distributing quota evenly across
+  // levels and carrying unmet quota down to lower levels.
   std::vector<Edge> pop_n(size_t n, std::vector<Edge> &result) {
     size_t actual_n = std::min(n, total_size_);
     result.clear();
@@ -165,12 +163,9 @@ struct MultiLevelEmbeddingQueue {
         ++pulled;
       }
 
-      carry =
-          effective_quota - pulled; // unmet quota carries to next lower level
+      carry = effective_quota - pulled;
     }
 
-    // Collect items missed due to integer-division remainder or carry from
-    // level 0
     if (result.size() < actual_n) {
       size_t still_needed = actual_n - result.size();
       for (int lvl = N_LEVELS - 1; lvl >= 0 && still_needed > 0; --lvl) {

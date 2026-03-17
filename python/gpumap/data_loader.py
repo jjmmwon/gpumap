@@ -21,22 +21,15 @@ class DataLoader:
         return data_chunk
 
 
-def load_numpy_data(dataset_name: str):
-    file_dir_path = f"{os.path.dirname(os.path.realpath(__file__))}/data/{dataset_name}"
-    file_path = f"{file_dir_path}/{dataset_name}_X.npy"
-    y_path = f"{file_dir_path}/{dataset_name}_y.npy"
+def load_numpy_data(file_path: str) -> np.ndarray:
     if os.path.exists(file_path):
-        X = np.load(file_path)
-        if os.path.exists(y_path):
-            y = np.load(y_path)
-        else:
-            y = None
-        return X, y
+        data = np.load(file_path)
+        return data
     else:
-        raise ValueError(f"Unsupported dataset name: {dataset_name}")
+        raise ValueError(f"File not found: {file_path}")
 
 
-PRELOAD_DATASETS = ["mnist", "gist", "wine_reviews", "covertype"]
+PRELOAD_DATASETS = ["mnist", "fashion_mnist", "wine_reviews", "svhn"]
 
 
 class PreloadDataLoader(DataLoader):
@@ -44,7 +37,26 @@ class PreloadDataLoader(DataLoader):
         if dataset_name not in PRELOAD_DATASETS:
             raise ValueError(f"Unsupported dataset name: {dataset_name}")
 
-        self.X, self.y = load_numpy_data(dataset_name)
+        file_dir_path = (
+            f"{os.path.dirname(os.path.realpath(__file__))}/data/{dataset_name}"
+        )
+        X_path = f"{file_dir_path}/{dataset_name}_X.npy"
+        y_path = f"{file_dir_path}/{dataset_name}_y.npy"
+
+        self.X = load_numpy_data(X_path)
+        self.y = load_numpy_data(y_path) if os.path.exists(y_path) else None
+        self.n_instances = len(self.X)
+        self.n_features = self.X.shape[1]
+        self._current_index = 0
+
+
+class NumpyDataLoader(DataLoader):
+    def __init__(
+        self, dataset_name: str, npy_path: str, label_npy_path: str | None = None
+    ):
+        self.dataset_name = dataset_name
+        self.X = load_numpy_data(npy_path)
+        self.y = load_numpy_data(label_npy_path) if label_npy_path else None
         self.n_instances = len(self.X)
         self.n_features = self.X.shape[1]
         self._current_index = 0

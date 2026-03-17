@@ -5,7 +5,6 @@ from ._core import GPUMAPParams
 from .schedule import (
     BaseStrategy,
     WeightedStrategy,
-    FixedInsertionStrategy,
     SequentialPriorityStrategy,
     PhaseSpec,
     DEFAULT_PHASE_SPECS,
@@ -22,7 +21,6 @@ __all__ = [
     # strategies
     "BaseStrategy",
     "WeightedStrategy",
-    "FixedInsertionStrategy",
     "SequentialPriorityStrategy",
     "PhaseSpec",
     "DEFAULT_PHASE_SPECS",

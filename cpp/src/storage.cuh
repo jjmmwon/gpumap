@@ -1,6 +1,6 @@
 #pragma once
 
-#include "kernels/nndescent/buffers.cuh"
+#include "kernels/buffers.cuh"
 #include "raft/core/device_mdarray.hpp"
 #include "rmm/device_uvector.hpp"
 #include <cuda_runtime.h>
@@ -75,7 +75,7 @@ template <typename Data_t = float, typename Idx_t = uint32_t> struct Storage {
   raft::resources raft_res;
 
   // Buffers used during nndescent algorithm.
-  nndescent::NNDBuffers<Data_t, int> nnd_buffer;
+  NNDBuffers<Data_t, int> nnd_buffer;
 
   void allocate_matrices() {
     data_block_size = n_features + 1; // +1 for l2 norm

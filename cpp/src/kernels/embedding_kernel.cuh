@@ -1,6 +1,5 @@
 #pragma once
 
-// #include <__clang_cuda_runtime_wrapper.h>
 #include <cmath>
 #include <cstddef>
 #include <cstdio>
@@ -259,7 +258,6 @@ __global__ void update_embeddings_kernel(
   const Idx_t src = srcs[tid];
   const Idx_t dst = dsts[tid];
 
-  // TODO: skip if epoch < next_sample_epochs[tid] (UMAP-style sampling)
   if (src >= n_inserted_instances || dst >= n_inserted_instances) {
     return;
   }
@@ -267,7 +265,7 @@ __global__ void update_embeddings_kernel(
   const float next_sample_epoch = next_sample_epochs[tid];
   const float next_neg_epoch = next_neg_epochs[tid];
 
-  current_epochs[tid] = current_epoch + 2.0f;
+  current_epochs[tid] = current_epoch + 1.0f;
 
   if (current_epoch < next_sample_epoch) {
     return;
@@ -291,8 +289,6 @@ __global__ void update_embeddings_kernel(
     return;
   }
 
-  // TODO: weight 계산을 update sigma할때 한번에 하고 재사용하는 방식을 할지
-  // 고려
   const Data_t rho_i = src_dists[0];
   const Data_t rho_j = dst_dists[0];
   const Data_t sigma_i = src_dists[neighbor_dists_block_size - 1];
@@ -361,19 +357,17 @@ __global__ void update_embeddings_kernel(
     const Data_t gneg =
         (Data_t{2} * b) / ((Data_t{1} + a * nr2b) * (nr2 + Data_t{1e-3f}));
     // Linearly increase from 0 to 1 in the first 50% of epochs
-    float bypass_factor =
-        static_cast<float>(current_epoch) / static_cast<float>(max_epoch) > 0.2f
-            ? 1.0f
-            : 5.0f * static_cast<float>(current_epoch) /
-                  static_cast<float>(max_epoch);
+    float bypass_factor = 1.0f;
+    // static_cast<float>(current_epoch) / static_cast<float>(max_epoch) > 0.2f
+    //     ? 1.0f
+    //     : 5.0f * static_cast<float>(current_epoch) /
+    //           static_cast<float>(max_epoch);
 
     const Data_t grad_ndx = clip(gneg * ndx) * decayed_alpha * bypass_factor;
     const Data_t grad_ndy = clip(gneg * ndy) * decayed_alpha * bypass_factor;
 
     atomicAdd(&embedding[src_offset], grad_ndx);
     atomicAdd(&embedding[src_offset + 1], grad_ndy);
-    // atomicAdd(&embedding[neg_offset], -grad_ndx);
-    // atomicAdd(&embedding[neg_offset + 1], -grad_ndy);
   }
 
   next_sample_epochs[tid] += epoch_per_sample;

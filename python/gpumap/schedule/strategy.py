@@ -103,7 +103,7 @@ class BaseStrategy(ABC):
         self.set_ops_ranges()
 
     def set_ops_ranges(self) -> None:
-        max_emb = self._n_instances * self._n_neighbors * 200
+        max_emb = self._n_instances * self._n_neighbors * 210
 
         self.insertion_ops_range = (self.min_insertion_ops, self._n_instances)
         self.update_ops_range = (0, self._n_instances)
@@ -142,7 +142,7 @@ class BaseStrategy(ABC):
             else 0.0
         )
         embedding_pending_edges = result.embedding_pending_edges
-        embedding_remaining_edges = sum(result.embedding_queue_level_sizes)
+        embedding_remaining_edges = result.embedding_queue_size
         self.embedding_progress = (
             1.0 - (embedding_remaining_edges / embedding_pending_edges)
             if embedding_pending_edges > 0

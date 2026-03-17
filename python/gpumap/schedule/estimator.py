@@ -111,11 +111,14 @@ class DefaultLinearEstimator(Estimator):
         P(time <= budget) >= confidence
     """
 
-    def __init__(self, window_size: int = 20, min_samples: int = 3):
+    def __init__(self, window_size: int = 10, min_samples: int = 3):
         self.window_size = window_size
         self.min_samples = min_samples
+        self.cold_start_ops = [1000, 2000, 3000]
         self._samples: Deque[Tuple[int, float]] = deque(maxlen=window_size)
         self._fit: Optional[FitResult] = None
+
+        self.cold_cnt = 0
 
     def add_sample(self, ops: int, elapsed_sec: float):
         if ops <= 0 or elapsed_sec < 0:
@@ -123,13 +126,9 @@ class DefaultLinearEstimator(Estimator):
         self._samples.append((ops, elapsed_sec))
         self._fit = None
 
-    # def extend(self, samples: Iterable[Tuple[int, float]]):
-    #     for s in samples:
-    #         self.add_sample(*s)
-
-    def fit(self) -> FitResult:
+    def fit(self) -> Optional[FitResult]:
         if len(self._samples) < self.min_samples:
-            raise ValueError("Not enough samples.")
+            return None
 
         xs = [o for o, _ in self._samples]
         ys = [t for _, t in self._samples]
@@ -159,11 +158,20 @@ class DefaultLinearEstimator(Estimator):
         self._fit = FitResult(a, b, sigma, n)
         return self._fit
 
-    def fit_result(self) -> FitResult:
+    def fit_result(self) -> Optional[FitResult]:
         return self._fit if self._fit else self.fit()
 
     def estimate_ops(self, time_budget_sec: float, confidence: float = 0.95) -> int:
         fr = self.fit_result()
+
+        if fr is None:
+            if self.cold_cnt < len(self.cold_start_ops):
+                ops = self.cold_start_ops[self.cold_cnt]
+                self.cold_cnt += 1
+                return ops
+            else:
+                return self.cold_start_ops[-1]
+
         a, b, sigma = fr.slope_a, fr.intercept_b, fr.sigma
 
         if a <= 0:
@@ -173,13 +181,16 @@ class DefaultLinearEstimator(Estimator):
 
         safe_budget = time_budget_sec - b - z * sigma
         if safe_budget <= 0:
-            return 0
+            return self.cold_start_ops[-1]
 
         ops = safe_budget / a
-        return max(0, int(ops))
+
+        return int(ops) if ops > 0 else 0
 
     def predict_time(self, ops: int, quantile: float = 0.95) -> float:
         fr = self.fit_result()
+        if fr is None:
+            return float("inf")
         z = NormalDist().inv_cdf(quantile)
         return fr.slope_a * ops + fr.intercept_b + z * fr.sigma
 

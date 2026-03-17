@@ -38,47 +38,39 @@ class SequentialPriorityStrategy(BaseStrategy):
             confidence=confidence,
             min_insertion_ops=min_insertion_ops,
         )
+        self._update_counter = 0
 
     def allocate(self, target_latency: float) -> tuple[int, int, int]:
-        remaining = max(0.0, target_latency)
-        clipped_ins = 0
-        clipped_upd = 0
-        clipped_emb = 0
 
         if not self._insertion_done:
             n_ins = _estimate_or_fallback(
-                self.insertion_estimator, remaining, self.confidence, self.default_n_ops
+                self.insertion_estimator,
+                target_latency,
+                self.confidence,
+                self.default_n_ops,
             )
             clipped_ins = clip_ops(n_ins, self.insertion_ops_range)
-            try:
-                predicted_ins_time = self.insertion_estimator.predict_time(
-                    clipped_ins, self.confidence
-                )
-            except ValueError:
-                predicted_ins_time = 0.0
-            remaining = max(0.0, remaining - predicted_ins_time)
 
-        if self.update_progress < 1.0:
+            return (clipped_ins, 0, 0)
+
+        if self.update_progress < 0.97 and self._update_counter < 50:
             n_upd = _estimate_or_fallback(
-                self.update_estimator, remaining, self.confidence, self.default_n_ops
+                self.update_estimator,
+                target_latency,
+                self.confidence,
+                self.default_n_ops,
             )
             clipped_upd = clip_ops(n_upd, self.update_ops_range)
-            try:
-                predicted_upd_time = self.update_estimator.predict_time(
-                    clipped_upd, self.confidence
-                )
-            except ValueError:
-                predicted_upd_time = 0.0
-            remaining = max(0.0, remaining - predicted_upd_time)
+            self._update_counter += 1
 
-        if self.embedding_progress < 1.0:
-            # Guard against update eating the entire remaining budget: always
-            # give embedding at least 10 % of target_latency so the queue can
-            # drain even when the update estimator over-predicts.
-            emb_budget = remaining if remaining > 0 else target_latency * 0.1
-            n_emb = _estimate_or_fallback(
-                self.embedding_estimator, emb_budget, self.confidence, self.default_n_ops
-            )
-            clipped_emb = clip_ops(n_emb, self.embedding_ops_range)
+            return (0, clipped_upd, 0)
 
-        return (clipped_ins, clipped_upd, clipped_emb)
+        n_emb = _estimate_or_fallback(
+            self.embedding_estimator,
+            target_latency,
+            self.confidence,
+            self.default_n_ops,
+        )
+        clipped_emb = clip_ops(n_emb, self.embedding_ops_range)
+
+        return (0, 0, clipped_emb)

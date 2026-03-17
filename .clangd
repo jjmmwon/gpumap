@@ -1,19 +1,34 @@
 CompileFlags:
+  CompilationDatabase: build/dev
   Add:
     - "-x"
     - "cuda"
+    - "--cuda-host-only"
     - "--no-cuda-version-check"
     - "-Wno-unknown-cuda-version"
-    - "-Xclang=-fcuda-allow-variadic-functions"
-    - "-I/opt/conda/envs/proumap/include"
-
+    - "-Xclang"
+    - "-fcuda-allow-variadic-functions"
+    - "-DCCCL_DISABLE_PDL"
+    - "-DCUB_DISABLE_NAMESPACE_MAGIC"
+    - "-DCUB_IGNORE_NAMESPACE_MAGIC_ERROR"
+    - "-DCUVS_BUILD_CAGRA_HNSWLIB"
+    - "-DLIBCUDACXX_ENABLE_EXPERIMENTAL_MEMORY_RESOURCE"
+    - "-DRAFT_LOG_ACTIVE_LEVEL=RAPIDS_LOGGER_LOG_LEVEL_INFO"
+    - "-DRAFT_SYSTEM_LITTLE_ENDIAN=1"
+    - "-DTHRUST_DEVICE_SYSTEM=THRUST_DEVICE_SYSTEM_CUDA"
+    - "-DTHRUST_DISABLE_ABI_NAMESPACE"
+    - "-DTHRUST_HOST_SYSTEM=THRUST_HOST_SYSTEM_CPP"
+    - "-DTHRUST_IGNORE_ABI_NAMESPACE_ERROR"
+    - "-I/home/myeongwon/git/gpumap-seq/cpp/include"
+    - "-I/home/myeongwon/git/gpumap-seq/cpp/src"
+    - "-I/home/myeongwon/miniforge3/envs/gpumap/include"
+    - "-I/home/myeongwon/miniforge3/envs/gpumap/include/rapids"
+    - "-isystem"
+    - "/home/myeongwon/miniforge3/envs/gpumap/targets/x86_64-linux/include"
   Remove:
-    # remove gcc's -fcoroutines
-    - -fcoroutines
-    # remove nvc++ flags unknown to clang
+    - "-fcoroutines"
     - "-gpu=*"
     - "-stdpar*"
-    # remove nvcc flags unknown to clang
     - "-arch*"
     - "-gencode*"
     - "--generate-code*"
@@ -31,6 +46,14 @@ CompileFlags:
     - "--expt-relaxed-constexpr"
     - "-forward-unknown-to-host-compiler"
     - "-Werror=cross-execution-space-call"
-
-    # Ensure device code linkage is enabled
     - "-rdc=true"
+
+Diagnostics:
+  Suppress:
+    - "non_type_template_in_nested_name_specifier"
+    - "typecheck_decl_incomplete_type"
+    - "no_member_template"
+  UnusedIncludes: None
+
+Index:
+  Background: Build

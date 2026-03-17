@@ -44,8 +44,8 @@ PYBIND11_MODULE(_core, m) {
                     &gpumap::GPUMAPResult::insertion_queue_size)
       .def_readonly("update_queue_size",
                     &gpumap::GPUMAPResult::update_queue_size)
-      .def_readonly("embedding_queue_level_sizes",
-                    &gpumap::GPUMAPResult::embedding_queue_level_sizes);
+      .def_readonly("embedding_queue_size",
+                    &gpumap::GPUMAPResult::embedding_queue_size);
 
   py::class_<GPUMAPWrapper>(m, "GPUMAP")
       .def(py::init<const gpumap::GPUMAPParams &>(), py::arg("config"))

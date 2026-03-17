@@ -1,6 +1,10 @@
 #!/bin/bash
 set -euo pipefail
 
+# Usage examples:
+#   ./run_preprocess.sh mnist
+#   ./run_preprocess.sh mnist.npy
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 if [[ $# -lt 1 ]]; then
