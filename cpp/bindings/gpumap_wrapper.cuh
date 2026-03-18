@@ -39,8 +39,8 @@ public:
     model.append_data(v.ptr, static_cast<Idx_t>(v.n_rows));
   }
 
-  gpumap::GPUMAPResult run(size_t n_insertion_ops, size_t n_update_ops,
-                           size_t n_embedding_ops) {
+  gpumap::GPUMAPResult run(uint32_t n_insertion_ops, uint32_t n_update_ops,
+                           uint32_t n_embedding_ops) {
     return model.run(n_insertion_ops, n_update_ops, n_embedding_ops);
   }
 

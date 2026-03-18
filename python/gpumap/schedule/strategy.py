@@ -96,18 +96,13 @@ class BaseStrategy(ABC):
         self._n_neighbors = n_neighbors
         self.default_n_ops = default_n_ops
         self.confidence = confidence
+
         self.min_insertion_ops = min_insertion_ops or int(0.01 * n_instances)
-        self._insertion_done = False
+        self.max_uint32 = 2**32 - 1
+
         self._result_history: list[_core.GPUMAPResult] = []
 
-        self.set_ops_ranges()
-
-    def set_ops_ranges(self) -> None:
-        max_emb = self._n_instances * self._n_neighbors * 210
-
-        self.insertion_ops_range = (self.min_insertion_ops, self._n_instances)
-        self.update_ops_range = (0, self._n_instances)
-        self.embedding_ops_range = (0, max_emb)
+        self.completeness = [False, False, False]  # insertion, update, embedding
 
     @abstractmethod
     def allocate(self, target_latency: float) -> tuple[int, int, int]: ...
@@ -115,7 +110,7 @@ class BaseStrategy(ABC):
     def update(self, result: _core.GPUMAPResult) -> None:
         self._result_history.append(result)
 
-        if not self._insertion_done and result.n_insertion_ops > 0:
+        if not self.completeness[0] and result.n_insertion_ops > 0:
             self.insertion_estimator.add_sample(
                 result.n_insertion_ops, result.insertion_time
             )
@@ -127,9 +122,12 @@ class BaseStrategy(ABC):
             )
         self._track_progress(result)
 
-    def on_insertion_complete(self) -> None:
-        self._insertion_done = True
-        self._weights[0] = 0.0
+    def on_operation_complete(self, operation: str) -> None:
+        op_dict = {"insertion": 0, "update": 1, "embedding": 2}
+        if operation not in op_dict:
+            raise ValueError(f"Unknown operation: {operation}")
+        self.completeness[op_dict[operation]] = True
+        self._weights[op_dict[operation]] = 0.0
 
     def _track_progress(self, result: _core.GPUMAPResult) -> None:
         self._n_inserted = result.n_inserted_instances

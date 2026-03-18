@@ -100,6 +100,15 @@ class GPUMAP:
 
         res = self._impl.run(n_insertion_ops, n_update_ops, n_embedding_ops)
         self._inserted_instances = res.n_inserted_instances
+
+        self._strategy.update(res)
+        if res.insertion_completed:
+            self._strategy.on_operation_complete("insertion")
+        if res.update_completed:
+            self._strategy.on_operation_complete("update")
+        if res.embedding_completed:
+            self._strategy.on_operation_complete("embedding")
+
         return res
 
     def run(self, target_latency: float = 10.0) -> _core.GPUMAPIterationResult:
@@ -108,14 +117,9 @@ class GPUMAP:
             allocation[0],
             self.data_loader.n_instances - self._inserted_instances,
         )
-        n_update_ops = min(allocation[1], self._inserted_instances + n_insertion_ops)
+        n_update_ops = allocation[1]
 
-        n_embedding_ops = min(
-            allocation[2],
-            (self._inserted_instances + n_insertion_ops)
-            * self._params.n_neighbors
-            * 210,
-        )
+        n_embedding_ops = allocation[2]
 
         if n_insertion_ops > 0:
             data_chunk = self.data_loader.get_next_chunk(n_insertion_ops)
@@ -133,7 +137,11 @@ class GPUMAP:
 
         self._strategy.update(res)
         if res.insertion_completed:
-            self._strategy.on_insertion_complete()
+            self._strategy.on_operation_complete("insertion")
+        if res.update_completed:
+            self._strategy.on_operation_complete("update")
+        if res.embedding_completed:
+            self._strategy.on_operation_complete("embedding")
 
         return res
 

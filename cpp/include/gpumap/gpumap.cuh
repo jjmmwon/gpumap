@@ -33,15 +33,17 @@ struct GPUMAPParams {
 };
 
 struct GPUMAPResult {
-  size_t n_insertion_ops;
-  size_t n_update_ops;
-  size_t n_embedding_ops;
+  uint32_t n_insertion_ops;
+  uint32_t n_update_ops;
+  uint32_t n_embedding_ops;
 
   float insertion_time;
   float update_time;
   float embedding_time;
 
   bool insertion_completed;
+  bool update_completed;
+  bool embedding_completed;
   size_t n_inserted_instances;
   size_t n_update_changed_edges;
   size_t embedding_pending_edges;
@@ -77,8 +79,8 @@ public:
 
   void initialize(size_t n_instances, size_t n_features);
   void append_data(const float *ptr, size_t n_new_instances);
-  GPUMAPResult run(size_t n_insertion_ops, size_t n_update_ops,
-                   size_t n_embedding_ops);
+  GPUMAPResult run(uint32_t n_insertion_ops, uint32_t n_update_ops,
+                   uint32_t n_embedding_ops);
   void close();
 
   EmbedView get_embedding() const;

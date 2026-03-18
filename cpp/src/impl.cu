@@ -18,8 +18,8 @@ void GPUMAP::append_data(const float *ptr, size_t n_new_instances) {
   impl_->append_data(ptr, n_new_instances);
 }
 
-GPUMAPResult GPUMAP::run(size_t n_insertion_ops, size_t n_update_ops,
-                         size_t n_embedding_ops) {
+GPUMAPResult GPUMAP::run(uint32_t n_insertion_ops, uint32_t n_update_ops,
+                         uint32_t n_embedding_ops) {
   return impl_->run(n_insertion_ops, n_update_ops, n_embedding_ops);
 }
 
@@ -36,6 +36,5 @@ GPUMAP::NeighborIndicesView GPUMAP::get_neighbor_indices() const {
 GPUMAP::NeighborDistsView GPUMAP::get_neighbor_dists() const {
   return impl_->get_neighbor_dists();
 }
-
 
 } // namespace gpumap

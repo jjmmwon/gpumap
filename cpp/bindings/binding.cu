@@ -34,6 +34,9 @@ PYBIND11_MODULE(_core, m) {
       .def_readonly("embedding_time", &gpumap::GPUMAPResult::embedding_time)
       .def_readonly("insertion_completed",
                     &gpumap::GPUMAPResult::insertion_completed)
+      .def_readonly("update_completed", &gpumap::GPUMAPResult::update_completed)
+      .def_readonly("embedding_completed",
+                    &gpumap::GPUMAPResult::embedding_completed)
       .def_readonly("n_inserted_instances",
                     &gpumap::GPUMAPResult::n_inserted_instances)
       .def_readonly("n_update_changed_edges",

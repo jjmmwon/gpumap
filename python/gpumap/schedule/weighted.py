@@ -53,9 +53,9 @@ class WeightedStrategy(BaseStrategy):
         )
 
         return (
-            clip_ops(n_ins, self.insertion_ops_range),
-            clip_ops(n_upd, self.update_ops_range),
-            clip_ops(n_emb, self.embedding_ops_range),
+            clip_ops(n_ins, (self.min_insertion_ops, self.max_uint32)),
+            clip_ops(n_upd, (0, self.max_uint32)),
+            clip_ops(n_emb, (0, self.max_uint32)),
         )
 
 
@@ -91,7 +91,7 @@ class FocusedStrategy(WeightedStrategy):
             confidence=confidence,
             reserved=reserved,
         )
-        if not (0.0 < focus_rate < 1.0):
+        if not (0.0 < focus_rate and focus_rate < 1.0):
             raise ValueError("focus_rate must be in the range (0, 1)")
 
         focus_index = {"insertion": 0, "update": 1, "embedding": 2}[focus]

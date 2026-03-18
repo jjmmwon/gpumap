@@ -161,31 +161,61 @@ class DefaultLinearEstimator(Estimator):
     def fit_result(self) -> Optional[FitResult]:
         return self._fit if self._fit else self.fit()
 
+    def _next_cold_start_ops(self) -> int:
+        if self.cold_cnt < len(self.cold_start_ops):
+            ops = self.cold_start_ops[self.cold_cnt]
+            self.cold_cnt += 1
+            return ops
+        return self.cold_start_ops[-1]
+
+    def _fallback_ops_from_recent_rates(self, time_budget_sec: float) -> int:
+        if time_budget_sec <= 0:
+            return 0
+        if not self._samples:
+            return self._next_cold_start_ops()
+
+        # Tiny runs distort per-op latency badly. When the linear fit becomes
+        # unusably pessimistic, ignore very small runs and fall back to the
+        # slowest observed throughput among the larger recent samples.
+        max_ops = max(ops for ops, _ in self._samples)
+        min_focus_ops = max_ops * 0.01
+        focus = [
+            (ops, elapsed)
+            for ops, elapsed in self._samples
+            if ops >= min_focus_ops and ops > 0 and elapsed > 0
+        ]
+        rates = [elapsed / ops for ops, elapsed in focus if ops > 0 and elapsed > 0]
+        if not rates:
+            return self._next_cold_start_ops()
+
+        safe_rate = max(rates)
+        if safe_rate <= 0:
+            return self._next_cold_start_ops()
+
+        return max(1, int(time_budget_sec / safe_rate))
+
     def estimate_ops(self, time_budget_sec: float, confidence: float = 0.95) -> int:
         fr = self.fit_result()
 
         if fr is None:
-            if self.cold_cnt < len(self.cold_start_ops):
-                ops = self.cold_start_ops[self.cold_cnt]
-                self.cold_cnt += 1
-                return ops
-            else:
-                return self.cold_start_ops[-1]
+            return self._next_cold_start_ops()
 
         a, b, sigma = fr.slope_a, fr.intercept_b, fr.sigma
 
         if a <= 0:
-            return 0
+            return self._fallback_ops_from_recent_rates(time_budget_sec)
 
         z = NormalDist().inv_cdf(confidence)
 
         safe_budget = time_budget_sec - b - z * sigma
         if safe_budget <= 0:
-            return self.cold_start_ops[-1]
+            return self._fallback_ops_from_recent_rates(time_budget_sec)
 
         ops = safe_budget / a
 
-        return int(ops) if ops > 0 else 0
+        return int(ops) if ops > 0 else self._fallback_ops_from_recent_rates(
+            time_budget_sec
+        )
 
     def predict_time(self, ops: int, quantile: float = 0.95) -> float:
         fr = self.fit_result()

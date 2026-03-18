@@ -39,11 +39,11 @@ from gpumap import (  # noqa: E402
     GPUMAP,
     GPUMAPParams,
     DefaultLinearEstimator,
-    PhaseBasedStrategy,
     PersistentEstimator,
     SequentialPriorityStrategy,
     WeightedStrategy,
 )
+from gpumap.schedule.weighted import FocusedStrategy
 
 
 DEFAULT_DATA_ROOT = Path(__file__).resolve().parent / "data"
@@ -234,8 +234,12 @@ def build_strategy(
         return WeightedStrategy(**common_kwargs)
     if strategy_name == "sequential":
         return SequentialPriorityStrategy(**common_kwargs)
-    if strategy_name == "phase_based":
-        return PhaseBasedStrategy(**common_kwargs)
+    if strategy_name == "insertion_focused":
+        return FocusedStrategy(**common_kwargs, focus="insertion", focus_rate=0.5)
+    if strategy_name == "update_focused":
+        return FocusedStrategy(**common_kwargs, focus="update", focus_rate=0.5)
+    if strategy_name == "embedding_focused":
+        return FocusedStrategy(**common_kwargs, focus="embedding", focus_rate=0.5)
     raise ValueError(f"Unsupported strategy: {strategy_name}")
 
 
@@ -290,10 +294,8 @@ def plan_run(model: GPUMAP, target_latency: float) -> tuple[PlannedOps, Estimate
         int(allocation[0]),
         model.data_loader.n_instances - model.n_inserted_instances,
     )
-    n_update_ops = min(
-        int(allocation[1]),
-        model.n_inserted_instances + n_insertion_ops,
-    )
+    n_update_ops = int(allocation[1])
+
     n_embedding_ops = int(allocation[2])
 
     planned_ops = PlannedOps(
@@ -344,11 +346,7 @@ def close_estimator(estimator: Any) -> None:
 
 
 def is_finished(result: Any) -> bool:
-    return (
-        bool(result.insertion_completed)
-        and int(result.update_queue_size) == 0
-        and int(result.embedding_queue_size) == 0
-    )
+    return result.embedding_completed
 
 
 def parse_args() -> argparse.Namespace:
@@ -360,7 +358,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "strategy",
         type=str,
-        choices=["weighted", "sequential", "phase_based"],
+        choices=[
+            "weighted",
+            "sequential",
+            "insertion_focused",
+            "update_focused",
+            "embedding_focused",
+        ],
     )
     return parser.parse_args()
 
@@ -486,10 +490,6 @@ def main() -> None:
             )
             wall_time = time.perf_counter() - run_started_at
             cumulative_wall_time += wall_time
-
-            model._strategy.update(result)
-            if result.insertion_completed:
-                model._strategy.on_insertion_complete()
 
             embedding = to_numpy(model.get_embedding())
             nn_indices = to_numpy(model.get_neighbor_indices())
