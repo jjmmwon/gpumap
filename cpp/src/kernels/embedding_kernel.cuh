@@ -71,7 +71,7 @@ smooth_knn_sigma(const Data_t *dists, size_t n_neighbors, Data_t rho,
     for (size_t i = 0; i < n_neighbors; ++i) {
       const Data_t d = dists[i] - rho;
       if (d > 0) {
-        sum += expf(-static_cast<float>(d) / static_cast<float>(mid));
+        sum += __expf(-static_cast<float>(d) / static_cast<float>(mid));
       } else {
         sum += 1.0f;
       }
@@ -85,6 +85,8 @@ smooth_knn_sigma(const Data_t *dists, size_t n_neighbors, Data_t rho,
 
     if (isfinite(static_cast<float>(hi))) {
       mid = (lo + hi) * 0.5f;
+      if ((hi - lo) < 1e-5f * mid)
+        break;
     } else {
       mid *= 2.0f;
     }
@@ -303,7 +305,13 @@ __global__ void update_embeddings_kernel(
                : Data_t{0};
   const Data_t w_ij = Data_t{1} - (Data_t{1} - p_ij) * (Data_t{1} - p_ji);
 
-  atomicMaxFloat(max_w, w_ij);
+  // atomicMaxFloat(max_w, w_ij);
+  float w_max = static_cast<float>(w_ij);
+  const unsigned warp_mask = __activemask();
+  for (int offset = 16; offset > 0; offset >>= 1)
+    w_max = fmaxf(w_max, __shfl_down_sync(warp_mask, w_max, offset));
+  if ((threadIdx.x & 31) == 0)
+    atomicMaxFloat(max_w, w_max);
 
   const float epoch_per_sample =
       *max_w / w_ij + 1e-6f; // add small value to avoid division by zero
@@ -322,9 +330,9 @@ __global__ void update_embeddings_kernel(
   const Data_t dx = embedding[src_offset] - embedding[dst_offset];
   const Data_t dy = embedding[src_offset + 1] - embedding[dst_offset + 1];
   const Data_t r2 = dx * dx + dy * dy + Data_t{1e-6f};
-  const Data_t r2b = powf(r2, b);
-  const Data_t grad_coeff =
-      Data_t{2} * a * b * powf(r2, b - Data_t{1}) / (Data_t{1} + a * r2b);
+  const Data_t r2b = __powf(r2, b);
+  const Data_t grad_coeff = (Data_t{2} * a * b) * r2b /
+                            ((Data_t{1} + a * r2b) * (r2 + Data_t{1e-6f}));
   const Data_t decayed_alpha =
       (1.0f - current_epoch / static_cast<float>(max_epoch)) * alpha;
 
@@ -353,7 +361,7 @@ __global__ void update_embeddings_kernel(
     const Data_t ndx = embedding[src_offset] - embedding[neg_offset];
     const Data_t ndy = embedding[src_offset + 1] - embedding[neg_offset + 1];
     const Data_t nr2 = ndx * ndx + ndy * ndy + Data_t{1e-6f};
-    const Data_t nr2b = powf(nr2, b);
+    const Data_t nr2b = __powf(nr2, b);
     const Data_t gneg =
         (Data_t{2} * b) / ((Data_t{1} + a * nr2b) * (nr2 + Data_t{1e-3f}));
     // Linearly increase from 0 to 1 in the first 50% of epochs

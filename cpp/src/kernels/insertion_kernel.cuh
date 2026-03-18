@@ -214,12 +214,16 @@ __global__ void sample_forward_candidates_kernel(
 
 // compute distances ────────────────────────────────────────────────
 //
-// For each batch node, compute the squared L2 distance to every entry in its
-// candidate_buffer row and write results into candidate_dists_buffer at the
-// same (node, slot) position.  Slots that are invalid (candidate == -1, out of
-// range, self, or already a neighbor) receive a negative sentinel (-1) so the
-// update stage can skip them cheaply without re-checking.
+// One warp per (batch_node, candidate_slot) pair.
 //
+// Benefits over the previous 1-thread-per-batch-node design:
+//   • Feature dot product is parallelized across 32 lanes with stride-32 access
+//     → coalesced global loads within each warp.
+//   • Neighbor membership check uses warp-level __any_sync on the 32 neighbor
+//     IDs loaded cooperatively → also coalesced and O(1) instead of O(K).
+//   • Invalid slots receive a -1 sentinel (written by lane 0 only).
+//
+// Launch: blockDim = 256 (8 warps), gridDim = ceil(batch_size * MAX_CANDIDATES / 8).
 // Caller must allocate candidate_dists_buffer with shape
 //   [n_inserted_instances + batch_size] × MAX_CANDIDATES.
 template <typename Data_t, typename Idx_t, typename Index_t = int>
@@ -230,50 +234,65 @@ __global__ void compute_candidate_distances_kernel(
     uint32_t n_features, uint32_t data_block_size, uint32_t n_candidates,
     uint32_t n_inserted_instances) {
 
-  const size_t row_local =
-      static_cast<size_t>(blockIdx.x * blockDim.x + threadIdx.x);
+  constexpr int WARPS_PER_BLOCK = 8; // blockDim.x / warp_size = 256 / 32
+  const int warp_id = threadIdx.x / raft::warp_size();
+  const int lane_id = threadIdx.x % raft::warp_size();
+
+  // Map this warp to one (batch_node, candidate_slot) pair.
+  const size_t pair_id =
+      static_cast<size_t>(blockIdx.x) * WARPS_PER_BLOCK + warp_id;
+  const uint32_t row_local = static_cast<uint32_t>(pair_id / n_candidates);
+  const uint32_t slot = static_cast<uint32_t>(pair_id % n_candidates);
+
   if (row_local >= batch_size)
     return;
 
-  const Index_t gid = static_cast<Index_t>(batch_start_offset) + row_local;
+  const Index_t gid = static_cast<Index_t>(batch_start_offset + row_local);
+  const int candidate =
+      candidate_buffer[static_cast<size_t>(gid) * n_candidates + slot];
+  Data_t *my_dist_out =
+      candidate_dists_buffer + static_cast<size_t>(gid) * n_candidates + slot;
 
+  // Warp-cooperative neighbor membership check.
+  // All 32 lanes load one neighbor ID each (coalesced read of MAX_NEIGHBORS
+  // consecutive InternalID_t entries). __any_sync broadcasts the result.
   const InternalID_t *my_neighbors =
       graph_buffer + static_cast<size_t>(gid) * MAX_NEIGHBORS;
-  const int *my_candidates =
-      candidate_buffer + static_cast<size_t>(gid) * n_candidates;
-  Data_t *my_dists_out =
-      candidate_dists_buffer + static_cast<size_t>(gid) * n_candidates;
+  const int nb_id =
+      (lane_id < static_cast<int>(n_neighbors)) ? my_neighbors[lane_id].id()
+                                                : -1;
+  const bool is_existing_neighbor =
+      __any_sync(raft::warp_full_mask(), nb_id == candidate);
 
-  // Cache neighbor IDs in registers for fast membership checks.
-  Index_t neighbors_local[MAX_NEIGHBORS];
-  for (uint32_t i = 0; i < n_neighbors; ++i)
-    neighbors_local[i] = static_cast<Index_t>(my_neighbors[i].id());
+  const bool skip =
+      (candidate < 0 ||
+       static_cast<uint32_t>(candidate) >= n_inserted_instances ||
+       static_cast<Index_t>(candidate) == gid || is_existing_neighbor);
 
+  if (skip) {
+    if (lane_id == 0)
+      *my_dist_out = static_cast<Data_t>(-1);
+    return;
+  }
+
+  // Warp-parallel dot product: each lane handles stride-32 feature dimensions.
   const size_t offset1 = static_cast<size_t>(gid) * data_block_size;
+  const size_t offset2 = static_cast<size_t>(candidate) * data_block_size;
+  float dot = 0.0f;
+  for (uint32_t d = lane_id; d < n_features; d += raft::warp_size()) {
+    dot += static_cast<float>(input_data[offset1 + d]) *
+           static_cast<float>(input_data[offset2 + d]);
+  }
 
-  for (uint32_t i = 0; i < n_candidates; ++i) {
-    const int candidate = my_candidates[i];
+  // Warp reduce.
+  for (int off = raft::warp_size() >> 1; off > 0; off >>= 1)
+    dot += __shfl_down_sync(raft::warp_full_mask(), dot, off);
 
-    if (candidate < 0 ||
-        static_cast<uint32_t>(candidate) >= n_inserted_instances ||
-        static_cast<Index_t>(candidate) == gid ||
-        list_contains_id<Index_t>(neighbors_local,
-                                  static_cast<int>(n_neighbors),
-                                  static_cast<Index_t>(candidate))) {
-      my_dists_out[i] = static_cast<Data_t>(-1); // sentinel: skip in update
-      continue;
-    }
-
-    const size_t offset2 = static_cast<size_t>(candidate) * data_block_size;
-    float dot = 0.0f;
-    for (uint32_t d = 0; d < n_features; ++d) {
-      dot += static_cast<float>(input_data[offset1 + d]) *
-             static_cast<float>(input_data[offset2 + d]);
-    }
-    float dist_sq = static_cast<float>(input_data[offset1 + n_features]) +
-                    static_cast<float>(input_data[offset2 + n_features]) -
-                    2.0f * dot;
-    my_dists_out[i] = static_cast<Data_t>(dist_sq < 0.0f ? 0.0f : dist_sq);
+  if (lane_id == 0) {
+    const float l2_a = static_cast<float>(input_data[offset1 + n_features]);
+    const float l2_b = static_cast<float>(input_data[offset2 + n_features]);
+    const float dist2 = l2_a + l2_b - 2.0f * dot;
+    *my_dist_out = static_cast<Data_t>(dist2 < 0.0f ? 0.0f : dist2);
   }
 }
 
@@ -549,11 +568,15 @@ void compute_candidate_distances(
     return;
   const uint32_t batch_start_offset =
       static_cast<uint32_t>(batch_indices_.front());
-  const int threads_per_block = 256;
-  const int blocks = (n_rows + threads_per_block - 1) / threads_per_block;
+  // 1 warp per (batch_node, candidate_slot) pair; 8 warps per block.
+  constexpr int WARPS_PER_BLOCK = 8;
+  const int tpb = WARPS_PER_BLOCK * 32; // 256
+  const size_t n_pairs = static_cast<size_t>(n_rows) * MAX_CANDIDATES;
+  const int blocks =
+      static_cast<int>((n_pairs + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK);
 
   compute_candidate_distances_kernel<Data_t, Idx_t, Index_t>
-      <<<blocks, threads_per_block, 0, stream>>>(
+      <<<blocks, tpb, 0, stream>>>(
           input_data, graph_buffer_, candidate_buffer_, candidate_dists_buffer_,
           n_rows, batch_start_offset, n_neighbors, n_features, data_block_size,
           MAX_CANDIDATES, n_inserted_instances);
@@ -591,6 +614,8 @@ void update_forward_neighbors(std::vector<Idx_t> &batch_indices_,
 // Pipeline:
 //   1. scatter_reverse_candidates_kernel — scatter (i→j, dist) pairs by j
 //   2. update_reverse_neighbors_kernel   — sort + insert for each node j
+// Pre-allocated reverse_cand_ids/dists/counts are passed in from NNDBuffers
+// to avoid per-call cudaMallocAsync inside the iteration loop.
 template <typename Data_t, typename Idx_t, typename Index_t = int>
 void update_reverse_neighbors(std::vector<Idx_t> &batch_indices_,
                               uint32_t n_neighbors,
@@ -599,30 +624,22 @@ void update_reverse_neighbors(std::vector<Idx_t> &batch_indices_,
                               Data_t *distance_buffer_,
                               const int *candidate_buffer_,
                               const Data_t *candidate_dists_buffer_,
-                              int *d_dirty_flags_, cudaStream_t stream) {
+                              int *d_dirty_flags_,
+                              int *reverse_cand_ids,
+                              Data_t *reverse_cand_dists,
+                              int *reverse_cand_counts,
+                              cudaStream_t stream) {
   const uint32_t n_rows = static_cast<uint32_t>(batch_indices_.size());
   if (n_rows == 0)
     return;
   const uint32_t batch_start_offset =
       static_cast<uint32_t>(batch_indices_.front());
 
-  // Allocate reverse buffers.
+  // Reset pre-allocated buffers for this call.
   const size_t rev_ids_size =
       static_cast<size_t>(n_inserted_instances) * MAX_NEIGHBORS * sizeof(int);
-  const size_t rev_dists_size = static_cast<size_t>(n_inserted_instances) *
-                                MAX_NEIGHBORS * sizeof(Data_t);
   const size_t rev_counts_size =
       static_cast<size_t>(n_inserted_instances) * sizeof(int);
-
-  int *reverse_cand_ids;
-  Data_t *reverse_cand_dists;
-  int *reverse_cand_counts;
-
-  RAFT_CUDA_TRY(cudaMallocAsync(&reverse_cand_ids, rev_ids_size, stream));
-  RAFT_CUDA_TRY(cudaMallocAsync(&reverse_cand_dists, rev_dists_size, stream));
-  RAFT_CUDA_TRY(cudaMallocAsync(&reverse_cand_counts, rev_counts_size, stream));
-
-  // Initialize: counts = 0, ids/dists = -1 sentinel.
   RAFT_CUDA_TRY(
       cudaMemsetAsync(reverse_cand_counts, 0, rev_counts_size, stream));
   RAFT_CUDA_TRY(cudaMemsetAsync(reverse_cand_ids, 0xFF, rev_ids_size, stream));
@@ -655,10 +672,6 @@ void update_reverse_neighbors(std::vector<Idx_t> &batch_indices_,
                                      n_inserted_instances);
     RAFT_CUDA_TRY(cudaGetLastError());
   }
-
-  RAFT_CUDA_TRY(cudaFreeAsync(reverse_cand_ids, stream));
-  RAFT_CUDA_TRY(cudaFreeAsync(reverse_cand_dists, stream));
-  RAFT_CUDA_TRY(cudaFreeAsync(reverse_cand_counts, stream));
 }
 
 // ── Embedding initialisation kernels ──────────────────────────────────────
@@ -897,7 +910,10 @@ void run_insertion(
     if (batch_start_offset > 0) {
       update_reverse_neighbors<Data_t, Idx_t, Index_t>(
           batch_indices, n_neighbors, batch_start_offset, graph_ptr, dists_ptr,
-          cand_ptr, cand_dists_ptr, dirty_ptr, stream);
+          cand_ptr, cand_dists_ptr, dirty_ptr,
+          buffers.reverse_cand_ids_.data_handle(),
+          buffers.reverse_cand_dists_.data_handle(),
+          buffers.reverse_cand_counts_.data_handle(), stream);
     }
   }
 

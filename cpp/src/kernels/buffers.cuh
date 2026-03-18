@@ -221,7 +221,15 @@ template <typename Data_t, typename Index_t = int> struct NNDBuffers {
         h_graph_old{raft::make_pinned_matrix<Index_t, size_t, raft::row_major>(
             res, n_instances, NUM_SAMPLES)},
         h_list_sizes_old{
-            raft::make_pinned_vector<int2, size_t>(res, n_instances)} {}
+            raft::make_pinned_vector<int2, size_t>(res, n_instances)},
+
+        reverse_cand_ids_{raft::make_device_matrix<int, size_t, raft::row_major>(
+            res, n_instances, MAX_NEIGHBORS)},
+        reverse_cand_dists_{
+            raft::make_device_matrix<Data_t, size_t, raft::row_major>(
+                res, n_instances, MAX_NEIGHBORS)},
+        reverse_cand_counts_{
+            raft::make_device_vector<int, size_t>(res, n_instances)} {}
 
   raft::resources const &res;
   uint32_t n_instances;
@@ -302,6 +310,13 @@ template <typename Data_t, typename Index_t = int> struct NNDBuffers {
   // next iteration in parallel with the running GPU kernel.
   raft::pinned_matrix<Index_t, size_t> h_graph_old;
   raft::pinned_vector<int2, size_t> h_list_sizes_old;
+
+  // Pre-allocated scratch buffers for update_reverse_neighbors, sized
+  // [n_instances × MAX_NEIGHBORS] and [n_instances], to avoid per-call
+  // cudaMallocAsync inside the insertion iteration loop.
+  raft::device_matrix<int, size_t, raft::row_major> reverse_cand_ids_;
+  raft::device_matrix<Data_t, size_t, raft::row_major> reverse_cand_dists_;
+  raft::device_vector<int, size_t> reverse_cand_counts_;
 
   BloomFilter<Index_t> bloom_filter;
 };
