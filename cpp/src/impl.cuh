@@ -12,6 +12,7 @@
 #include "utils/matrix_utils.cuh"
 #include <algorithm>
 #include <csignal>
+#include <cstddef>
 #include <cstdio>
 #include <deque>
 #include <numeric>
@@ -36,14 +37,14 @@ struct GPUMAP::Impl {
   InsertionQueue insertion_queue;
   UpdateQueue update_queue;
 
-  // First Option: (1, 2, 3)
-  static constexpr float FIRST_MAX_EPOCH = 35.f;
-  static constexpr float SECOND_MAX_EPOCH = 70.f;
-  static constexpr float LAST_MAX_EPOCH = 105.f;
+  static constexpr size_t EMBEDDING_MAX_EPOCH = 200;
 
-  Queue<Edge> first_embed_queue;
-  Queue<Edge> second_embed_queue;
-  Queue<Edge> last_embed_queue;
+  // Sequential cursor-based embedding state
+  // Stores the id of the last processed instance; next run starts from
+  // cursor+1. Initialized to SIZE_MAX so that (cursor+1)%n == 0 on the first
+  // call.
+  size_t embedding_cursor_ = SIZE_MAX;
+  size_t embedding_sweeps_done_ = 0;
 
   // Recent-window tracking for initialize_random_neighbors.
   static constexpr int WINDOW_N_BATCHES = 3;
@@ -139,11 +140,11 @@ struct GPUMAP::Impl {
           std::chrono::duration<float>(end - start).count());
     }
 
-    result.embedding_pending_edges = first_embed_queue.size() +
-                                     second_embed_queue.size() +
-                                     last_embed_queue.size();
-    log("[GPUMAP] embedding queue size=%zu\n", result.embedding_pending_edges);
-    if (n_embedding_ops == 0 || result.embedding_pending_edges == 0) {
+    result.embedding_pending_edges = storage.n_inserted_instances;
+    log("[GPUMAP] embedding instances=%zu cursor=%zu\n",
+        storage.n_inserted_instances, embedding_cursor_);
+    if (n_embedding_ops == 0 || storage.n_inserted_instances == 0 ||
+        storage.embedding_completed) {
       result.n_embedding_ops = 0;
       result.embedding_time = 0.0f;
     } else {
@@ -156,13 +157,6 @@ struct GPUMAP::Impl {
           result.n_embedding_ops,
           std::chrono::duration<float>(end - start).count());
     }
-
-    // embedding_completed: all data inserted, KNN converged, no pending edges.
-    storage.embedding_completed =
-        storage.insertion_completed && storage.update_completed &&
-        (first_embed_queue.size() + second_embed_queue.size() +
-             last_embed_queue.size() ==
-         0);
 
     result.n_inserted_instances = storage.n_inserted_instances;
     result.insertion_queue_size = insertion_queue.size();
@@ -199,7 +193,6 @@ struct GPUMAP::Impl {
         window_start);
 
     update_queue.push_batch(affected_indices);
-    first_embed_queue.push_batch(new_edges);
 
     return static_cast<uint32_t>(batch_indices.size());
   }
@@ -261,7 +254,6 @@ struct GPUMAP::Impl {
           storage.n_inserted_instances);
 
       n_changed_edges_out += new_edges.size();
-      first_embed_queue.push_batch(new_edges);
       left_ops -= batch_indices.size();
 
       // Always propagate affected nodes and their 1-hop neighbors into the
@@ -298,187 +290,87 @@ struct GPUMAP::Impl {
     return n_ops - left_ops;
   }
 
-  uint32_t embed_stage(uint32_t n_ops, Queue<Edge> &src_queue,
-                       float stage_max_epoch, Queue<Edge> *dst_queue) {
-    if (n_ops == 0 || src_queue.empty())
-      return 0;
-
-    // ── 1. Drain entire queue
-    // ─────────────────────────────────────────────────
-    std::vector<gpumap::Edge> all_edges = src_queue.pop_n(src_queue.size());
-    const size_t n_all = all_edges.size();
-
-    std::vector<Idx_t> h_srcs(n_all), h_dsts(n_all), h_indices(n_all);
-    std::vector<float> h_ce(n_all), h_nse(n_all), h_nne(n_all);
-    for (size_t i = 0; i < n_all; ++i) {
-      h_srcs[i] = std::get<0>(all_edges[i]);
-      h_dsts[i] = std::get<1>(all_edges[i]);
-      h_indices[i] = static_cast<Idx_t>(i);
-      h_ce[i] = std::get<2>(all_edges[i]);
-      h_nse[i] = std::get<3>(all_edges[i]);
-      h_nne[i] = std::get<4>(all_edges[i]);
-    }
-
-    // ── 2. Upload and filter all edges once
-    // ───────────────────────────────────
-    rmm::device_uvector<Idx_t> d_srcs(n_all, embedding_stream),
-        d_dsts(n_all, embedding_stream), d_indices(n_all, embedding_stream);
-    rmm::device_uvector<Idx_t> d_out_srcs(n_all, embedding_stream),
-        d_out_dsts(n_all, embedding_stream),
-        d_out_indices(n_all, embedding_stream);
-    rmm::device_scalar<unsigned long long> d_out_count(embedding_stream);
-
-    cudaMemcpyAsync(d_srcs.data(), h_srcs.data(), n_all * sizeof(Idx_t),
-                    cudaMemcpyHostToDevice, embedding_stream);
-    cudaMemcpyAsync(d_dsts.data(), h_dsts.data(), n_all * sizeof(Idx_t),
-                    cudaMemcpyHostToDevice, embedding_stream);
-    cudaMemcpyAsync(d_indices.data(), h_indices.data(), n_all * sizeof(Idx_t),
-                    cudaMemcpyHostToDevice, embedding_stream);
-
-    filter_edges_by_neighbors<Idx_t, Idx_t>(
-        d_srcs.data(), d_dsts.data(), d_indices.data(), d_out_srcs.data(),
-        d_out_dsts.data(), d_out_indices.data(), n_all,
-        storage.neighbor_indices.data(), storage.neighbor_indices_block_size,
-        storage.n_neighbors, d_out_count.data(), embedding_stream);
-
-    unsigned long long h_out_count = 0;
-    cudaMemcpyAsync(&h_out_count, d_out_count.data(),
-                    sizeof(unsigned long long), cudaMemcpyDeviceToHost,
-                    embedding_stream);
-    cudaStreamSynchronize(embedding_stream);
-
-    if (h_out_count == 0)
-      return 0;
-
-    std::vector<Idx_t> h_out_srcs(h_out_count), h_out_dsts(h_out_count),
-        h_out_indices(h_out_count);
-    cudaMemcpyAsync(h_out_srcs.data(), d_out_srcs.data(),
-                    h_out_count * sizeof(Idx_t), cudaMemcpyDeviceToHost,
-                    embedding_stream);
-    cudaMemcpyAsync(h_out_dsts.data(), d_out_dsts.data(),
-                    h_out_count * sizeof(Idx_t), cudaMemcpyDeviceToHost,
-                    embedding_stream);
-    cudaMemcpyAsync(h_out_indices.data(), d_out_indices.data(),
-                    h_out_count * sizeof(Idx_t), cudaMemcpyDeviceToHost,
-                    embedding_stream);
-    cudaStreamSynchronize(embedding_stream);
-
-    // Restore epoch state for filtered edges.
-    const size_t n_valid = static_cast<size_t>(h_out_count);
-    std::vector<float> h_out_ce(n_valid), h_out_nse(n_valid),
-        h_out_nne(n_valid);
-    for (size_t i = 0; i < n_valid; ++i) {
-      const Idx_t idx = h_out_indices[i];
-      h_out_ce[i] = h_ce[idx];
-      h_out_nse[i] = h_nse[idx];
-      h_out_nne[i] = h_nne[idx];
-    }
-
-    // ── 3. Water-fill alloc: find target_epoch so all edges reach the same
-    // level.
-    //    Pass 1 — find min/max current epoch and total cost to reach max.
-    size_t total_ops = 0;
-    size_t target_epoch = 0;
-
-    size_t ce_min = static_cast<size_t>(h_out_ce[0]);
-    size_t ce_max = ce_min;
-    size_t sum_ce = 0;
-
-    const size_t hard_max = static_cast<size_t>(stage_max_epoch) + 1;
-    {
-      for (size_t i = 0; i < n_valid; ++i) {
-        const size_t ce = static_cast<size_t>(h_out_ce[i]);
-        ce_min = std::min(ce_min, ce);
-        ce_max = std::max(ce_max, ce);
-        sum_ce += ce;
-      }
-
-      // Cost to bring every edge up to ce_max.
-      const size_t cost_to_max = n_valid * ce_max - sum_ce;
-
-      // Remaining ops after alignment; extra full epochs above ce_max.
-      size_t extra = 0;
-      if (static_cast<size_t>(n_ops) > cost_to_max) {
-        const size_t remaining = static_cast<size_t>(n_ops) - cost_to_max;
-        // ceil(remaining / n_valid) so total_alloc >= n_ops.
-        extra = (remaining + n_valid - 1) / n_valid;
-      }
-      target_epoch = std::min(ce_max + extra, hard_max);
-      // Recompute actual total_ops from the final capped target_epoch.
-      total_ops = n_valid * target_epoch - sum_ce;
-    }
-
-    const size_t global_min_epoch = ce_min;
-    const size_t global_max_epoch = target_epoch;
-
-    // ── 4. Upload edge data to GPU
-    // ──────────────────────────────────────────
-    rmm::device_uvector<Idx_t> d_p_srcs(n_valid, embedding_stream),
-        d_p_dsts(n_valid, embedding_stream);
-    rmm::device_uvector<float> d_p_ce(n_valid, embedding_stream),
-        d_p_nse(n_valid, embedding_stream), d_p_nne(n_valid, embedding_stream);
-
-    cudaMemcpyAsync(d_p_srcs.data(), h_out_srcs.data(), n_valid * sizeof(Idx_t),
-                    cudaMemcpyHostToDevice, embedding_stream);
-    cudaMemcpyAsync(d_p_dsts.data(), h_out_dsts.data(), n_valid * sizeof(Idx_t),
-                    cudaMemcpyHostToDevice, embedding_stream);
-    cudaMemcpyAsync(d_p_ce.data(), h_out_ce.data(), n_valid * sizeof(float),
-                    cudaMemcpyHostToDevice, embedding_stream);
-    cudaMemcpyAsync(d_p_nse.data(), h_out_nse.data(), n_valid * sizeof(float),
-                    cudaMemcpyHostToDevice, embedding_stream);
-    cudaMemcpyAsync(d_p_nne.data(), h_out_nne.data(), n_valid * sizeof(float),
-                    cudaMemcpyHostToDevice, embedding_stream);
-
-    // ── 5. Host epoch loop — call update_embeddings once per epoch tick
-    // ──────
-    for (size_t epoch = global_min_epoch; epoch < global_max_epoch; ++epoch) {
-      update_embeddings<Data_t, Idx_t>(
-          d_p_srcs.data(), d_p_dsts.data(), d_p_ce.data(), d_p_nse.data(),
-          d_p_nne.data(), n_valid, storage.embedding.data(),
-          params.n_components, storage.n_inserted_instances,
-          storage.neighbor_indices.data(), storage.neighbor_indices_block_size,
-          storage.neighbor_dists.data(), storage.neighbor_dists_block_size,
-          storage.n_neighbors, storage.max_w.data(), params.a, params.b,
-          params.alpha, static_cast<size_t>(stage_max_epoch),
-          params.negative_sample_rate, embedding_stream);
-    }
-
-    raft::copy(h_out_ce.data(), d_p_ce.data(), n_valid, embedding_stream);
-    raft::copy(h_out_nse.data(), d_p_nse.data(), n_valid, embedding_stream);
-    raft::copy(h_out_nne.data(), d_p_nne.data(), n_valid, embedding_stream);
-    cudaStreamSynchronize(embedding_stream);
-
-    // ── 6. Requeue / promote
-    // ──────────────────────────────────────────────────
-    std::vector<gpumap::Edge> requeue_edges, promote_edges;
-    for (size_t i = 0; i < n_valid; ++i) {
-      if (h_out_ce[i] <= stage_max_epoch) {
-        requeue_edges.emplace_back(h_out_srcs[i], h_out_dsts[i], h_out_ce[i],
-                                   h_out_nse[i], h_out_nne[i]);
-      } else if (dst_queue != nullptr) {
-        promote_edges.emplace_back(h_out_srcs[i], h_out_dsts[i], h_out_ce[i],
-                                   h_out_nse[i], h_out_nne[i]);
-      }
-      // else: exceeded last stage max, drop
-    }
-
-    if (!requeue_edges.empty())
-      src_queue.push_batch(requeue_edges);
-    if (!promote_edges.empty())
-      dst_queue->push_batch(promote_edges);
-
-    return total_ops;
-  }
-
   uint32_t embed(uint32_t n_ops) {
-    // Precompute sigma for all dirty nodes and global max_w from full KNN
-    // graph. This replaces the per-batch update_sigma_for_dirty calls in
-    // embed_stage.
+    if (storage.n_inserted_instances == 0 || n_ops == 0)
+      return 0;
+
+    const size_t n = storage.n_inserted_instances;
+    const size_t n_ops_sz = static_cast<size_t>(n_ops);
+
+    // Determine the two (possibly one) sequential ranges to embed.
+    // Full sweep if n_ops >= n_inserted_instances.
+    size_t range1_start, range1_end, range2_end;
+    if (n_ops_sz >= n) {
+      range1_start = 0;
+      range1_end = n;
+      range2_end = 0;
+      embedding_cursor_ = n - 1;
+      embedding_sweeps_done_++;
+      if (storage.update_completed) {
+        if (embedding_sweeps_done_ > 5) {
+          storage.embedding_completed = true;
+        }
+      }
+    } else {
+      const size_t start = (embedding_cursor_ + 1) % n;
+      range1_start = start;
+      range1_end = std::min(start + n_ops_sz, n);
+      size_t wrap = n_ops_sz - (range1_end - range1_start);
+      if (storage.update_completed) {
+        if (embedding_sweeps_done_ > 5) {
+          wrap = 0;
+          storage.embedding_completed = true;
+        }
+      }
+      range2_end = wrap;
+      if (range1_end == n) {
+        embedding_cursor_ = (wrap > 0) ? wrap - 1 : n - 1;
+        embedding_sweeps_done_++;
+      } else {
+        embedding_cursor_ = range1_end - 1;
+      }
+    }
+
+    const size_t sel_count =
+        (range1_end - range1_start) + range2_end; // range2: [0, range2_end)
+
+    // Build srcs/dsts on host from NND graph (kernel handles invalid indices).
+    const auto *h_graph = storage.nnd_buffer.h_graph.data_handle();
+    const size_t max_edges = sel_count * storage.n_neighbors;
+    std::vector<Idx_t> h_srcs, h_dsts;
+    h_srcs.reserve(max_edges);
+    h_dsts.reserve(max_edges);
+    auto fill_edges = [&](size_t inst_start, size_t inst_end) {
+      for (size_t inst = inst_start; inst < inst_end; ++inst) {
+        const auto *nbrs = h_graph + inst * storage.n_neighbors;
+        for (uint32_t j = 0; j < storage.n_neighbors; ++j) {
+          int nid = nbrs[j].id();
+          if (nid < 0)
+            continue;
+          h_srcs.push_back(static_cast<Idx_t>(inst));
+          h_dsts.push_back(static_cast<Idx_t>(nid));
+        }
+      }
+    };
+    fill_edges(range1_start, range1_end);
+    fill_edges(0, range2_end);
+
+    const size_t n_edges = h_srcs.size();
+    if (n_edges == 0)
+      return static_cast<uint32_t>(sel_count);
+
+    rmm::device_uvector<Idx_t> d_srcs(n_edges, embedding_stream),
+        d_dsts(n_edges, embedding_stream);
+    cudaMemcpyAsync(d_srcs.data(), h_srcs.data(), n_edges * sizeof(Idx_t),
+                    cudaMemcpyHostToDevice, embedding_stream);
+    cudaMemcpyAsync(d_dsts.data(), h_dsts.data(), n_edges * sizeof(Idx_t),
+                    cudaMemcpyHostToDevice, embedding_stream);
+
+    // Precompute sigma and max_w for the full graph.
     update_sigma_all<Data_t, Idx_t>(
         storage.neighbor_indices.data(), storage.neighbor_indices_block_size,
         storage.neighbor_dists.data(), storage.neighbor_dists_block_size,
         storage.n_neighbors, storage.n_inserted_instances, embedding_stream);
-
     cudaMemsetAsync(storage.max_w.data(), 0, sizeof(float), embedding_stream);
     compute_max_w_from_knn<Data_t, Idx_t>(
         storage.neighbor_indices.data(), storage.neighbor_indices_block_size,
@@ -487,14 +379,25 @@ struct GPUMAP::Impl {
         embedding_stream);
     cudaStreamSynchronize(embedding_stream);
 
-    uint32_t done = 0;
-    done += embed_stage(n_ops - done, first_embed_queue, FIRST_MAX_EPOCH,
-                        &second_embed_queue);
-    done += embed_stage(n_ops - done, second_embed_queue, SECOND_MAX_EPOCH,
-                        &last_embed_queue);
-    done +=
-        embed_stage(n_ops - done, last_embed_queue, LAST_MAX_EPOCH, nullptr);
-    return done;
+    // Initialize epoch state to zero; run all epochs in one loop.
+    rmm::device_uvector<float> d_ce(n_edges, embedding_stream),
+        d_nse(n_edges, embedding_stream), d_nne(n_edges, embedding_stream);
+    cudaMemsetAsync(d_ce.data(), 0, n_edges * sizeof(float), embedding_stream);
+    cudaMemsetAsync(d_nse.data(), 0, n_edges * sizeof(float), embedding_stream);
+    cudaMemsetAsync(d_nne.data(), 0, n_edges * sizeof(float), embedding_stream);
+
+    for (size_t epoch = 0; epoch < EMBEDDING_MAX_EPOCH; ++epoch) {
+      update_embeddings<Data_t, Idx_t>(
+          d_srcs.data(), d_dsts.data(), d_ce.data(), d_nse.data(), d_nne.data(),
+          n_edges, storage.embedding.data(), params.n_components,
+          storage.n_inserted_instances, storage.neighbor_indices.data(),
+          storage.neighbor_indices_block_size, storage.neighbor_dists.data(),
+          storage.neighbor_dists_block_size, storage.n_neighbors,
+          storage.max_w.data(), params.a, params.b, params.alpha,
+          EMBEDDING_MAX_EPOCH, params.negative_sample_rate, embedding_stream);
+    }
+
+    return static_cast<uint32_t>(sel_count);
   }
 
   void close() {
