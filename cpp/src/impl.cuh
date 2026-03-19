@@ -374,43 +374,49 @@ struct GPUMAP::Impl {
       h_out_nne[i] = h_nne[idx];
     }
 
-    // ── 3. Compute per-edge allocations (uniform) with overflow cascade
-    // ─────── Base: floor(n_ops / n_valid), first (n_ops % n_valid) edges get
-    // +1. Cascade: if alloc[i] > stage_max_epoch - current_epoch[i], transfer
-    // surplus to the next edge so no ops are wasted on an edge already near
-    // its stage boundary.
-    std::vector<size_t> h_alloc(n_valid);
+    // ── 3. Water-fill alloc: find target_epoch so all edges reach the same
+    // level.
+    //    Pass 1 — find min/max current epoch and total cost to reach max.
+    size_t total_ops = 0;
+    size_t target_epoch = 0;
+
+    size_t ce_min = static_cast<size_t>(h_out_ce[0]);
+    size_t ce_max = ce_min;
+    size_t sum_ce = 0;
+
+    const size_t hard_max = static_cast<size_t>(stage_max_epoch) + 1;
     {
-      const size_t base = n_ops / n_valid;
-      const size_t extra = n_ops % n_valid;
-      for (size_t i = 0; i < n_valid; ++i)
-        h_alloc[i] = base + (i < extra ? 1 : 0);
-
       for (size_t i = 0; i < n_valid; ++i) {
-        const float remaining = stage_max_epoch - h_out_ce[i];
-        // budget: ops needed to reach (but not necessarily cross) the boundary
-        // +1 guarantees the edge can eventually be promoted.
-        const size_t budget =
-            remaining > 0.0f ? static_cast<size_t>(remaining) + 1u : 0u;
-        if (h_alloc[i] > budget) {
-          const size_t surplus = h_alloc[i] - budget;
-          h_alloc[i] = budget;
-          if (i + 1 < n_valid)
-            h_alloc[i + 1] += surplus;
-        }
+        const size_t ce = static_cast<size_t>(h_out_ce[i]);
+        ce_min = std::min(ce_min, ce);
+        ce_max = std::max(ce_max, ce);
+        sum_ce += ce;
       }
-    }
-    // After cascade all values are bounded by budget ≤ LAST_MAX_EPOCH+1 ≤ 106,
-    // so the cast to uint32_t is safe.
-    std::vector<uint32_t> h_alloc_u32(h_alloc.begin(), h_alloc.end());
 
-    // ── 4. Upload edge data + per-edge allocations to GPU
-    // ─────────────────────
+      // Cost to bring every edge up to ce_max.
+      const size_t cost_to_max = n_valid * ce_max - sum_ce;
+
+      // Remaining ops after alignment; extra full epochs above ce_max.
+      size_t extra = 0;
+      if (static_cast<size_t>(n_ops) > cost_to_max) {
+        const size_t remaining = static_cast<size_t>(n_ops) - cost_to_max;
+        // ceil(remaining / n_valid) so total_alloc >= n_ops.
+        extra = (remaining + n_valid - 1) / n_valid;
+      }
+      target_epoch = std::min(ce_max + extra, hard_max);
+      // Recompute actual total_ops from the final capped target_epoch.
+      total_ops = n_valid * target_epoch - sum_ce;
+    }
+
+    const size_t global_min_epoch = ce_min;
+    const size_t global_max_epoch = target_epoch;
+
+    // ── 4. Upload edge data to GPU
+    // ──────────────────────────────────────────
     rmm::device_uvector<Idx_t> d_p_srcs(n_valid, embedding_stream),
         d_p_dsts(n_valid, embedding_stream);
     rmm::device_uvector<float> d_p_ce(n_valid, embedding_stream),
         d_p_nse(n_valid, embedding_stream), d_p_nne(n_valid, embedding_stream);
-    rmm::device_uvector<uint32_t> d_alloc(n_valid, embedding_stream);
 
     cudaMemcpyAsync(d_p_srcs.data(), h_out_srcs.data(), n_valid * sizeof(Idx_t),
                     cudaMemcpyHostToDevice, embedding_stream);
@@ -422,21 +428,20 @@ struct GPUMAP::Impl {
                     cudaMemcpyHostToDevice, embedding_stream);
     cudaMemcpyAsync(d_p_nne.data(), h_out_nne.data(), n_valid * sizeof(float),
                     cudaMemcpyHostToDevice, embedding_stream);
-    cudaMemcpyAsync(d_alloc.data(), h_alloc_u32.data(),
-                    n_valid * sizeof(uint32_t), cudaMemcpyHostToDevice,
-                    embedding_stream);
 
-    // ── 5. Multi-epoch SGD — each thread runs its own alloc[i] advances
-    // ───────
-    update_embeddings_multi<Data_t, Idx_t>(
-        d_p_srcs.data(), d_p_dsts.data(), d_p_ce.data(), d_p_nse.data(),
-        d_p_nne.data(), d_alloc.data(), n_valid, storage.embedding.data(),
-        params.n_components, storage.n_inserted_instances,
-        storage.neighbor_indices.data(), storage.neighbor_indices_block_size,
-        storage.neighbor_dists.data(), storage.neighbor_dists_block_size,
-        storage.n_neighbors, storage.max_w.data(), params.a, params.b,
-        params.alpha, static_cast<size_t>(stage_max_epoch),
-        params.negative_sample_rate, embedding_stream);
+    // ── 5. Host epoch loop — call update_embeddings once per epoch tick
+    // ──────
+    for (size_t epoch = global_min_epoch; epoch < global_max_epoch; ++epoch) {
+      update_embeddings<Data_t, Idx_t>(
+          d_p_srcs.data(), d_p_dsts.data(), d_p_ce.data(), d_p_nse.data(),
+          d_p_nne.data(), n_valid, storage.embedding.data(),
+          params.n_components, storage.n_inserted_instances,
+          storage.neighbor_indices.data(), storage.neighbor_indices_block_size,
+          storage.neighbor_dists.data(), storage.neighbor_dists_block_size,
+          storage.n_neighbors, storage.max_w.data(), params.a, params.b,
+          params.alpha, static_cast<size_t>(stage_max_epoch),
+          params.negative_sample_rate, embedding_stream);
+    }
 
     raft::copy(h_out_ce.data(), d_p_ce.data(), n_valid, embedding_stream);
     raft::copy(h_out_nse.data(), d_p_nse.data(), n_valid, embedding_stream);
@@ -462,10 +467,6 @@ struct GPUMAP::Impl {
     if (!promote_edges.empty())
       dst_queue->push_batch(promote_edges);
 
-    // Return total ops executed (sum of per-edge allocations).
-    uint32_t total_ops = 0;
-    for (auto v : h_alloc)
-      total_ops += static_cast<uint32_t>(v);
     return total_ops;
   }
 

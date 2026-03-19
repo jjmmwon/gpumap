@@ -400,10 +400,11 @@ void update_embeddings(
           negative_sample_rate, seed);
 }
 
-// ── update_embeddings_multi ───────────────────────────────────────────────────
-// Each thread runs its own per-edge epoch loop (n_advances[tid] iterations).
-// Neighbor distances and edge weights are computed once outside the loop;
-// SGD + negative sampling run inside.
+// ── update_embeddings_multi
+// ─────────────────────────────────────────────────── Each thread runs its own
+// per-edge epoch loop (n_advances[tid] iterations). Neighbor distances and edge
+// weights are computed once outside the loop; SGD + negative sampling run
+// inside.
 template <typename Data_t, typename Idx_t>
 __global__ void update_embeddings_multi_kernel(
     const Idx_t *__restrict__ srcs, const Idx_t *__restrict__ dsts,
@@ -418,14 +419,17 @@ __global__ void update_embeddings_multi_kernel(
     size_t max_epoch, size_t negative_sample_rate, unsigned long long seed) {
 
   const size_t tid = static_cast<size_t>(blockIdx.x * blockDim.x + threadIdx.x);
-  if (tid >= n_edges) return;
+  if (tid >= n_edges)
+    return;
 
   const uint32_t my_advances = n_advances[tid];
-  if (my_advances == 0) return;
+  if (my_advances == 0)
+    return;
 
   const Idx_t src = srcs[tid];
   const Idx_t dst = dsts[tid];
-  if (src >= n_inserted_instances || dst >= n_inserted_instances) return;
+  if (src >= n_inserted_instances || dst >= n_inserted_instances)
+    return;
 
   const Idx_t *src_neighbors =
       neighbor_indices + src * neighbor_indices_block_size;
@@ -477,11 +481,11 @@ __global__ void update_embeddings_multi_kernel(
     const float old_epoch = current_epoch;
     current_epoch += 1.0f;
 
-    if (old_epoch < next_sample_epoch) continue;
+    if (old_epoch < next_sample_epoch)
+      continue;
 
     // First call: initialise sampling schedules, skip SGD this step.
-    if (old_epoch < 1.0f || next_sample_epoch < 0.0f ||
-        next_neg_epoch < 0.0f) {
+    if (old_epoch < 1.0f || next_sample_epoch < 0.0f || next_neg_epoch < 0.0f) {
       next_sample_epoch = epoch_per_sample;
       next_neg_epoch = epoch_per_neg_sample;
       continue;
@@ -496,12 +500,10 @@ __global__ void update_embeddings_multi_kernel(
                               ((Data_t{1} + a * r2b) * (r2 + Data_t{1e-6f}));
     const Data_t decayed_alpha =
         (1.0f - old_epoch / static_cast<float>(max_epoch)) * alpha;
-    atomicAdd(&embedding[src_offset],
-              -clip(grad_coeff * dx) * decayed_alpha);
+    atomicAdd(&embedding[src_offset], -clip(grad_coeff * dx) * decayed_alpha);
     atomicAdd(&embedding[src_offset + 1],
               -clip(grad_coeff * dy) * decayed_alpha);
-    atomicAdd(&embedding[dst_offset],
-              clip(grad_coeff * dx) * decayed_alpha);
+    atomicAdd(&embedding[dst_offset], clip(grad_coeff * dx) * decayed_alpha);
     atomicAdd(&embedding[dst_offset + 1],
               clip(grad_coeff * dy) * decayed_alpha);
 
@@ -509,10 +511,9 @@ __global__ void update_embeddings_multi_kernel(
     const int n_neg =
         static_cast<int>((old_epoch - next_neg_epoch) / epoch_per_neg_sample);
     for (int n = 0; n < n_neg; ++n) {
-      Idx_t neg =
-          static_cast<Idx_t>(curand(&rng_state) % n_inserted_instances);
+      Idx_t neg = static_cast<Idx_t>(curand(&rng_state) % n_inserted_instances);
       if (neg == src || neg == dst)
-        neg = (neg + 1) % n_inserted_instances;
+        continue;
       const size_t neg_offset = static_cast<size_t>(neg) * n_components;
       const Data_t ndx = embedding[src_offset] - embedding[neg_offset];
       const Data_t ndy = embedding[src_offset + 1] - embedding[neg_offset + 1];
@@ -520,10 +521,8 @@ __global__ void update_embeddings_multi_kernel(
       const Data_t nr2b = __powf(nr2, b);
       const Data_t gneg =
           (Data_t{2} * b) / ((Data_t{1} + a * nr2b) * (nr2 + Data_t{1e-3f}));
-      atomicAdd(&embedding[src_offset],
-                clip(gneg * ndx) * decayed_alpha);
-      atomicAdd(&embedding[src_offset + 1],
-                clip(gneg * ndy) * decayed_alpha);
+      atomicAdd(&embedding[src_offset], clip(gneg * ndx) * decayed_alpha);
+      atomicAdd(&embedding[src_offset + 1], clip(gneg * ndy) * decayed_alpha);
     }
 
     next_sample_epoch += epoch_per_sample;
@@ -545,7 +544,8 @@ void update_embeddings_multi(
     const Data_t *neighbor_dists, size_t neighbor_dists_block_size,
     size_t n_neighbors, const float *max_w, float a, float b, float alpha,
     size_t max_epoch, size_t negative_sample_rate, cudaStream_t stream) {
-  if (n_edges == 0) return;
+  if (n_edges == 0)
+    return;
   const int threads_per_block = 256;
   const int blocks =
       static_cast<int>((n_edges + threads_per_block - 1) / threads_per_block);
@@ -558,23 +558,27 @@ void update_embeddings_multi(
           negative_sample_rate, 42ULL);
 }
 
-// ── update_sigma_all ──────────────────────────────────────────────────────────
-// Recomputes sigma for every node that has its dirty flag set.
-// One thread per node; clean nodes exit immediately.
+// ── update_sigma_all
+// ────────────────────────────────────────────────────────── Recomputes sigma
+// for every node that has its dirty flag set. One thread per node; clean nodes
+// exit immediately.
 template <typename Data_t, typename Idx_t>
-__global__ void update_sigma_all_kernel(
-    Idx_t *__restrict__ neighbor_indices, size_t neighbor_indices_block_size,
-    Data_t *__restrict__ neighbor_dists, size_t neighbor_dists_block_size,
-    size_t n_neighbors, size_t n_nodes) {
+__global__ void update_sigma_all_kernel(Idx_t *__restrict__ neighbor_indices,
+                                        size_t neighbor_indices_block_size,
+                                        Data_t *__restrict__ neighbor_dists,
+                                        size_t neighbor_dists_block_size,
+                                        size_t n_neighbors, size_t n_nodes) {
 
   const size_t tid = static_cast<size_t>(blockIdx.x * blockDim.x + threadIdx.x);
-  if (tid >= n_nodes) return;
+  if (tid >= n_nodes)
+    return;
 
   Idx_t *my_neighbors = neighbor_indices + tid * neighbor_indices_block_size;
   Data_t *my_dists = neighbor_dists + tid * neighbor_dists_block_size;
 
   const size_t dirty_idx = neighbor_indices_block_size - 1;
-  if (!my_neighbors[dirty_idx]) return;
+  if (!my_neighbors[dirty_idx])
+    return;
 
   const Data_t rho = my_dists[0];
   const Data_t sigma = smooth_knn_sigma(my_dists, n_neighbors, rho);
@@ -586,9 +590,9 @@ template <typename Data_t, typename Idx_t>
 void update_sigma_all(Idx_t *neighbor_indices,
                       size_t neighbor_indices_block_size,
                       Data_t *neighbor_dists, size_t neighbor_dists_block_size,
-                      size_t n_neighbors, size_t n_nodes,
-                      cudaStream_t stream) {
-  if (n_nodes == 0) return;
+                      size_t n_neighbors, size_t n_nodes, cudaStream_t stream) {
+  if (n_nodes == 0)
+    return;
   const int threads_per_block = 256;
   const int blocks =
       static_cast<int>((n_nodes + threads_per_block - 1) / threads_per_block);
@@ -598,20 +602,22 @@ void update_sigma_all(Idx_t *neighbor_indices,
           neighbor_dists_block_size, n_neighbors, n_nodes);
 }
 
-// ── compute_max_w_from_knn ────────────────────────────────────────────────────
-// Computes the global max edge weight over all KNN edges in storage.
-// One thread per (node, neighbor) pair.
+// ── compute_max_w_from_knn
+// ──────────────────────────────────────────────────── Computes the global max
+// edge weight over all KNN edges in storage. One thread per (node, neighbor)
+// pair.
 template <typename Data_t, typename Idx_t>
-__global__ void compute_max_w_kernel(
-    const Idx_t *__restrict__ neighbor_indices,
-    size_t neighbor_indices_block_size,
-    const Data_t *__restrict__ neighbor_dists,
-    size_t neighbor_dists_block_size, size_t n_neighbors, size_t n_nodes,
-    float *__restrict__ max_w) {
+__global__ void compute_max_w_kernel(const Idx_t *__restrict__ neighbor_indices,
+                                     size_t neighbor_indices_block_size,
+                                     const Data_t *__restrict__ neighbor_dists,
+                                     size_t neighbor_dists_block_size,
+                                     size_t n_neighbors, size_t n_nodes,
+                                     float *__restrict__ max_w) {
 
   const size_t tid = static_cast<size_t>(blockIdx.x * blockDim.x + threadIdx.x);
   const size_t n_total = n_nodes * n_neighbors;
-  if (tid >= n_total) return;
+  if (tid >= n_total)
+    return;
 
   const Idx_t src = static_cast<Idx_t>(tid / n_neighbors);
   const size_t k = tid % n_neighbors;
@@ -621,7 +627,8 @@ __global__ void compute_max_w_kernel(
   const Data_t *src_dists = neighbor_dists + src * neighbor_dists_block_size;
 
   const Idx_t dst = src_neighbors[k];
-  if (dst >= static_cast<Idx_t>(n_nodes)) return;
+  if (dst >= static_cast<Idx_t>(n_nodes))
+    return;
 
   const Idx_t *dst_neighbors =
       neighbor_indices + dst * neighbor_indices_block_size;
@@ -644,9 +651,9 @@ __global__ void compute_max_w_kernel(
     const Data_t rho_j = dst_dists[0];
     const Data_t sigma_j = dst_dists[neighbor_dists_block_size - 1];
     const Data_t denom_j = sigma_j > Data_t{1e-6f} ? sigma_j : Data_t{1e-6f};
-    p_ji =
-        __expf(-static_cast<float>(fmaxf(0.f, static_cast<float>(d_ji - rho_j))) /
-               static_cast<float>(denom_j));
+    p_ji = __expf(
+        -static_cast<float>(fmaxf(0.f, static_cast<float>(d_ji - rho_j))) /
+        static_cast<float>(denom_j));
   }
 
   const float w_ij =
@@ -662,20 +669,20 @@ __global__ void compute_max_w_kernel(
 
 template <typename Data_t, typename Idx_t>
 void compute_max_w_from_knn(const Idx_t *neighbor_indices,
-                             size_t neighbor_indices_block_size,
-                             const Data_t *neighbor_dists,
-                             size_t neighbor_dists_block_size,
-                             size_t n_neighbors, size_t n_nodes, float *max_w,
-                             cudaStream_t stream) {
+                            size_t neighbor_indices_block_size,
+                            const Data_t *neighbor_dists,
+                            size_t neighbor_dists_block_size,
+                            size_t n_neighbors, size_t n_nodes, float *max_w,
+                            cudaStream_t stream) {
   const size_t n_total = n_nodes * n_neighbors;
-  if (n_total == 0) return;
+  if (n_total == 0)
+    return;
   const int threads_per_block = 256;
   const int blocks =
       static_cast<int>((n_total + threads_per_block - 1) / threads_per_block);
-  compute_max_w_kernel<Data_t, Idx_t>
-      <<<blocks, threads_per_block, 0, stream>>>(
-          neighbor_indices, neighbor_indices_block_size, neighbor_dists,
-          neighbor_dists_block_size, n_neighbors, n_nodes, max_w);
+  compute_max_w_kernel<Data_t, Idx_t><<<blocks, threads_per_block, 0, stream>>>(
+      neighbor_indices, neighbor_indices_block_size, neighbor_dists,
+      neighbor_dists_block_size, n_neighbors, n_nodes, max_w);
 }
 
 } // namespace gpumap
