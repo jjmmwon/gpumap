@@ -35,6 +35,7 @@ struct GPUMAP::Impl {
   cudaStream_t insertion_stream, update_stream, embedding_stream;
 
   InsertionQueue insertion_queue;
+  InsertionQueue embedding_new_queue;
   UpdateQueue update_queue;
 
   static constexpr size_t EMBEDDING_MAX_EPOCH = 200;
@@ -74,6 +75,8 @@ struct GPUMAP::Impl {
   }
 
   void append_data(const Data_t *ptr, Idx_t n_new_instances) {
+    if (n_new_instances == 0)
+      return;
 
     if (storage.n_inserted_instances + n_new_instances > storage.n_instances) {
       throw std::runtime_error("Exceeding maximum number of rows in storage");
@@ -94,6 +97,7 @@ struct GPUMAP::Impl {
     std::vector<Idx_t> new_indices(n_new_instances);
     std::iota(new_indices.begin(), new_indices.end(), old_count);
     insertion_queue.push_batch(new_indices);
+    embedding_new_queue.push_batch(new_indices);
   }
 
   GPUMAPResult run(uint32_t n_insertion_ops, uint32_t n_update_ops,
@@ -141,8 +145,9 @@ struct GPUMAP::Impl {
     }
 
     result.embedding_pending_edges = storage.n_inserted_instances;
-    log("[GPUMAP] embedding instances=%zu cursor=%zu\n",
-        storage.n_inserted_instances, embedding_cursor_);
+    log("[GPUMAP] embedding instances=%zu cursor=%zu new_queue=%zu\n",
+        storage.n_inserted_instances, embedding_cursor_,
+        embedding_new_queue.size());
     if (n_embedding_ops == 0 || storage.n_inserted_instances == 0 ||
         storage.embedding_completed) {
       result.n_embedding_ops = 0;
@@ -296,43 +301,70 @@ struct GPUMAP::Impl {
 
     const size_t n = storage.n_inserted_instances;
     const size_t n_ops_sz = static_cast<size_t>(n_ops);
+    const size_t pending_new = embedding_new_queue.size();
+    const size_t old_n = n - pending_new;
+    auto maybe_finalize_embedding = [&]() {
+      if (storage.update_completed && embedding_sweeps_done_ > 5) {
+        storage.embedding_completed = true;
+      }
+    };
 
-    // Determine the two (possibly one) sequential ranges to embed.
-    // Full sweep if n_ops >= n_inserted_instances.
-    size_t range1_start, range1_end, range2_end;
-    if (n_ops_sz >= n) {
+    std::vector<Idx_t> priority_indices;
+    priority_indices.reserve(std::min(n_ops_sz, embedding_new_queue.size()));
+
+    size_t range1_start = 0;
+    size_t range1_end = 0;
+    size_t range2_end = 0;
+
+    if (n_ops_sz > n) {
+      embedding_new_queue.pop_n(pending_new);
       range1_start = 0;
       range1_end = n;
-      range2_end = 0;
       embedding_cursor_ = n - 1;
       embedding_sweeps_done_++;
-      if (storage.update_completed) {
-        if (embedding_sweeps_done_ > 5) {
-          storage.embedding_completed = true;
-        }
-      }
+      maybe_finalize_embedding();
     } else {
-      const size_t start = (embedding_cursor_ + 1) % n;
-      range1_start = start;
-      range1_end = std::min(start + n_ops_sz, n);
-      size_t wrap = n_ops_sz - (range1_end - range1_start);
-      if (storage.update_completed) {
-        if (embedding_sweeps_done_ > 5) {
-          wrap = 0;
-          storage.embedding_completed = true;
-        }
+      size_t left_ops = n_ops_sz;
+      const bool stop_after_wrap =
+          storage.update_completed && embedding_sweeps_done_ > 5;
+      if (stop_after_wrap)
+        storage.embedding_completed = true;
+
+      if (pending_new > 0) {
+        const size_t n_new = std::min(left_ops, pending_new);
+        priority_indices = embedding_new_queue.pop_n(n_new);
+        left_ops -= priority_indices.size();
       }
-      range2_end = wrap;
-      if (range1_end == n) {
-        embedding_cursor_ = (wrap > 0) ? wrap - 1 : n - 1;
-        embedding_sweeps_done_++;
-      } else {
-        embedding_cursor_ = range1_end - 1;
+
+      if (left_ops > 0 && old_n > 0) {
+        const size_t start = (embedding_cursor_ + 1) % old_n;
+        const size_t first_count = std::min(left_ops, old_n - start);
+        range1_start = start;
+        range1_end = start + first_count;
+        left_ops -= first_count;
+
+        if (!stop_after_wrap && left_ops > 0) {
+          range2_end = std::min(left_ops, start);
+        }
+
+        const bool reached_boundary = (range1_end == old_n);
+        const bool wrapped = (range2_end > 0);
+        if (wrapped) {
+          embedding_cursor_ = range2_end - 1;
+        } else if (range1_end > range1_start) {
+          embedding_cursor_ = range1_end - 1;
+        }
+
+        if (reached_boundary) {
+          embedding_sweeps_done_++;
+          maybe_finalize_embedding();
+        }
       }
     }
 
-    const size_t sel_count =
-        (range1_end - range1_start) + range2_end; // range2: [0, range2_end)
+    const size_t sel_count = priority_indices.size() +
+                             (range1_end - range1_start) +
+                             range2_end; // range2: [0, range2_end)
 
     // Build srcs/dsts on host from NND graph (kernel handles invalid indices).
     const auto *h_graph = storage.nnd_buffer.h_graph.data_handle();
@@ -340,18 +372,24 @@ struct GPUMAP::Impl {
     std::vector<Idx_t> h_srcs, h_dsts;
     h_srcs.reserve(max_edges);
     h_dsts.reserve(max_edges);
-    auto fill_edges = [&](size_t inst_start, size_t inst_end) {
-      for (size_t inst = inst_start; inst < inst_end; ++inst) {
-        const auto *nbrs = h_graph + inst * storage.n_neighbors;
-        for (uint32_t j = 0; j < storage.n_neighbors; ++j) {
-          int nid = nbrs[j].id();
-          if (nid < 0)
-            continue;
-          h_srcs.push_back(static_cast<Idx_t>(inst));
-          h_dsts.push_back(static_cast<Idx_t>(nid));
-        }
+    auto append_edges = [&](size_t inst) {
+      const auto *nbrs = h_graph + inst * storage.n_neighbors;
+      for (uint32_t j = 0; j < storage.n_neighbors; ++j) {
+        int nid = nbrs[j].id();
+        if (nid < 0)
+          continue;
+        h_srcs.push_back(static_cast<Idx_t>(inst));
+        h_dsts.push_back(static_cast<Idx_t>(nid));
       }
     };
+    auto fill_edges = [&](size_t inst_start, size_t inst_end) {
+      for (size_t inst = inst_start; inst < inst_end; ++inst) {
+        append_edges(inst);
+      }
+    };
+    for (Idx_t inst : priority_indices) {
+      append_edges(inst);
+    }
     fill_edges(range1_start, range1_end);
     fill_edges(0, range2_end);
 
