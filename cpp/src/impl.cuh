@@ -199,6 +199,22 @@ struct GPUMAP::Impl {
 
     update_queue.push_batch(affected_indices);
 
+    // Run one round of update_kernel on the newly inserted instances and
+    // propagate any changed neighbours into the update queue.
+    std::vector<Idx_t> update_affected_indices;
+    std::vector<gpumap::Edge> update_new_edges;
+    update_kernel<Data_t, Idx_t>(
+        storage.nnd_buffer, batch_indices, update_affected_indices,
+        update_new_edges, insertion_stream,
+
+        storage.data.data(), storage.neighbor_indices.data(),
+        storage.neighbor_dists.data(), storage.data_block_size,
+        storage.neighbor_indices_block_size, storage.neighbor_dists_block_size,
+
+        storage.n_features, storage.n_neighbors, storage.n_inserted_instances);
+
+    update_queue.push_batch(update_affected_indices);
+
     return static_cast<uint32_t>(batch_indices.size());
   }
 
@@ -210,7 +226,7 @@ struct GPUMAP::Impl {
 
     constexpr float termination_sigma = 0.001f;
     const size_t convergence_threshold = static_cast<size_t>(
-        termination_sigma * static_cast<float>(storage.n_instances));
+        termination_sigma * static_cast<float>(storage.n_inserted_instances));
 
     uint32_t left_ops = n_ops;
 
@@ -282,14 +298,25 @@ struct GPUMAP::Impl {
 
       // Convergence: KNN changes dropped below threshold AND all instances
       // have been inserted (no more data will arrive to disturb the graph).
-      if (update_queue.size() < convergence_threshold &&
-          storage.n_inserted_instances == storage.n_instances) {
-        log("[GPUMAP] update done: n_changed=%zu < threshold=%zu, "
-            "all %zu instances inserted\n",
-            n_changed, convergence_threshold, storage.n_instances);
-        storage.update_completed = true;
+      bool converged = (update_queue.size() < convergence_threshold);
+
+      if (converged) {
+        log("[GPUMAP] update convergence check: n_changed=%zu < threshold=%zu, "
+            "queue_size=%zu\n",
+            n_changed, convergence_threshold, update_queue.size());
+        storage.update_completed =
+            (storage.n_inserted_instances == storage.n_instances);
         break;
       }
+
+      // if (update_queue.size() < convergence_threshold &&
+      //     storage.n_inserted_instances == storage.n_instances) {
+      //   log("[GPUMAP] update done: n_changed=%zu < threshold=%zu, "
+      //       "all %zu instances inserted\n",
+      //       n_changed, convergence_threshold, storage.n_instances);
+      //   storage.update_completed = true;
+      //   break;
+      // }
     }
 
     return n_ops - left_ops;
@@ -304,7 +331,7 @@ struct GPUMAP::Impl {
     const size_t pending_new = embedding_new_queue.size();
     const size_t old_n = n - pending_new;
     auto maybe_finalize_embedding = [&]() {
-      if (storage.update_completed && embedding_sweeps_done_ > 5) {
+      if (storage.update_completed && embedding_sweeps_done_ > 2) {
         storage.embedding_completed = true;
       }
     };
@@ -321,12 +348,13 @@ struct GPUMAP::Impl {
       range1_start = 0;
       range1_end = n;
       embedding_cursor_ = n - 1;
-      embedding_sweeps_done_++;
+      embedding_sweeps_done_ =
+          n == storage.n_instances ? embedding_sweeps_done_ + 1 : 0;
       maybe_finalize_embedding();
     } else {
       size_t left_ops = n_ops_sz;
       const bool stop_after_wrap =
-          storage.update_completed && embedding_sweeps_done_ > 5;
+          storage.update_completed && embedding_sweeps_done_ > 2;
       if (stop_after_wrap)
         storage.embedding_completed = true;
 
@@ -347,7 +375,7 @@ struct GPUMAP::Impl {
           range2_end = std::min(left_ops, start);
         }
 
-        const bool reached_boundary = (range1_end == old_n);
+        const bool reached_boundary = (range1_end == storage.n_instances);
         const bool wrapped = (range2_end > 0);
         if (wrapped) {
           embedding_cursor_ = range2_end - 1;
@@ -360,6 +388,14 @@ struct GPUMAP::Impl {
           maybe_finalize_embedding();
         }
       }
+    }
+
+    if (storage.embedding_completed) {
+      // Run all instances in one batch for a final embedding refinement pass.
+      range1_start = 0;
+      range1_end = storage.n_instances;
+      range2_end = 0;
+      priority_indices.clear();
     }
 
     const size_t sel_count = priority_indices.size() +
@@ -424,6 +460,34 @@ struct GPUMAP::Impl {
     cudaMemsetAsync(d_nse.data(), 0, n_edges * sizeof(float), embedding_stream);
     cudaMemsetAsync(d_nne.data(), 0, n_edges * sizeof(float), embedding_stream);
 
+    // Add Gaussian noise before the SGD loop to prevent clusters from
+    // collapsing too tightly across progressive runs.
+    float noise_scale = storage.embedding_completed ? 0.1f : 0.01f;
+
+    if (noise_scale > 0.0f) {
+      std::vector<Idx_t> all_selected;
+      all_selected.reserve(sel_count);
+      for (Idx_t inst : priority_indices)
+        all_selected.push_back(inst);
+      for (size_t i = range1_start; i < range1_end; ++i)
+        all_selected.push_back(static_cast<Idx_t>(i));
+      for (size_t i = 0; i < range2_end; ++i)
+        all_selected.push_back(static_cast<Idx_t>(i));
+
+      rmm::device_uvector<Idx_t> d_selected(all_selected.size(),
+                                            embedding_stream);
+      cudaMemcpyAsync(d_selected.data(), all_selected.data(),
+                      all_selected.size() * sizeof(Idx_t),
+                      cudaMemcpyHostToDevice, embedding_stream);
+
+      const unsigned long long noise_seed =
+          42ULL ^ static_cast<unsigned long long>(embedding_sweeps_done_);
+      add_embedding_noise(storage.embedding.data(), d_selected.data(),
+                          all_selected.size(), params.n_components, noise_scale,
+                          noise_seed, embedding_stream);
+    }
+
+    const bool update_dst = (embedding_sweeps_done_ < 1);
     for (size_t epoch = 0; epoch < EMBEDDING_MAX_EPOCH; ++epoch) {
       update_embeddings<Data_t, Idx_t>(
           d_srcs.data(), d_dsts.data(), d_ce.data(), d_nse.data(), d_nne.data(),
@@ -432,7 +496,8 @@ struct GPUMAP::Impl {
           storage.neighbor_indices_block_size, storage.neighbor_dists.data(),
           storage.neighbor_dists_block_size, storage.n_neighbors,
           storage.max_w.data(), params.a, params.b, params.alpha,
-          EMBEDDING_MAX_EPOCH, params.negative_sample_rate, embedding_stream);
+          EMBEDDING_MAX_EPOCH, params.negative_sample_rate, embedding_stream,
+          update_dst);
     }
 
     return static_cast<uint32_t>(sel_count);

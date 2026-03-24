@@ -154,6 +154,10 @@ public:
     if (id_ >= 0)
       id_ = -id_ - 1;
   }
+  inline __host__ __device__ void mark_new() {
+    if (id_ < 0)
+      id_ = -id_ - 1;
+  }
   inline __host__ __device__ bool operator==(const InternalID_t &other) const {
     return id() == other.id();
   }

@@ -55,6 +55,90 @@ preprocess_l2_norms_kernel(Data_t *input_data, uint32_t batch_size,
   }
 }
 
+// Pre-screening initializer: samples MAX_CANDIDATES candidates using the same
+// 50/50 window/full-range strategy, writes them into candidate_buffer, and
+// initializes graph_buffer + distance_buffer to sentinel.  After this kernel,
+// compute_candidate_distances + update_forward_neighbors select the best k
+// candidates as the actual initial neighbors (no dedup array needed because
+// compute_candidate_distances skips sentinel graph slots and
+// update_forward_neighbors discards duplicates during sorted insertion).
+template <typename Data_t, typename Idx_t, typename Index_t = int>
+__global__ __forceinline__ void sample_prescreened_candidates_kernel(
+    InternalID_t *graph_buffer, Data_t *distance_buffer, int *candidate_buffer,
+    int candidate_width, uint32_t batch_size, uint32_t batch_start_offset,
+    uint32_t n_inserted_instances, uint32_t window_start, size_t seed) {
+
+  size_t row_local = blockIdx.x * blockDim.x + threadIdx.x;
+  if (row_local >= batch_size)
+    return;
+
+  const Index_t gid = static_cast<Index_t>(batch_start_offset + row_local);
+
+  curandStatePhilox4_32_10_t state;
+  curand_init(seed, gid, 0, &state);
+
+  // Initialize graph_buffer row to sentinel so compute_candidate_distances
+  // treats every candidate as a non-neighbor and evaluates all of them.
+  InternalID_t *my_neighbors =
+      graph_buffer + static_cast<size_t>(gid) * MAX_NEIGHBORS;
+  Data_t *my_distances =
+      distance_buffer + static_cast<size_t>(gid) * MAX_NEIGHBORS;
+  const int id_sentinel = std::numeric_limits<int>::max();
+  const Data_t dist_sentinel = std::numeric_limits<Data_t>::max();
+  for (int i = 0; i < MAX_NEIGHBORS; ++i) {
+    my_neighbors[i].id_with_flag() = id_sentinel;
+    my_distances[i] = dist_sentinel;
+  }
+
+  int *my_candidates =
+      candidate_buffer + static_cast<size_t>(gid) * candidate_width;
+
+  if (n_inserted_instances <= 1) {
+    for (int i = 0; i < candidate_width; ++i)
+      my_candidates[i] = -1;
+    return;
+  }
+
+  const int window_size =
+      static_cast<int>(n_inserted_instances) - static_cast<int>(window_start);
+  const int window_quota = min(candidate_width / 2, max(0, window_size - 1));
+
+  int filled = 0;
+
+  // Phase 1: sample from recent window [window_start, n_inserted).
+  // No large dedup array (register pressure); rejection against self only.
+  // Duplicates in the candidate list are harmless: compute_candidate_distances
+  // computes the same distance twice and update_forward_neighbors discards
+  // them.
+  int attempts = 0;
+  const int max_attempts = window_quota * 16;
+  while (filled < window_quota && attempts < max_attempts) {
+    ++attempts;
+    const Index_t candidate = static_cast<Index_t>(
+        window_start + static_cast<uint32_t>(curand(&state)) %
+                           static_cast<uint32_t>(window_size));
+    if (candidate == gid)
+      continue;
+    my_candidates[filled++] = static_cast<int>(candidate);
+  }
+
+  // Phase 2: fill remaining slots from full range [0, n_inserted).
+  attempts = 0;
+  const int max_attempts2 = (candidate_width - filled) * 8;
+  while (filled < candidate_width && attempts < max_attempts2) {
+    ++attempts;
+    const Index_t candidate =
+        static_cast<Index_t>(curand(&state) % n_inserted_instances);
+    if (candidate == gid)
+      continue;
+    my_candidates[filled++] = static_cast<int>(candidate);
+  }
+
+  // Fill unused tail with -1 sentinel.
+  for (int i = filled; i < candidate_width; ++i)
+    my_candidates[i] = -1;
+}
+
 // Sampling strategy: 50% from recent window [window_start, n_inserted),
 // 50% from full range [0, n_inserted). If the window has fewer unique
 // candidates than its quota, the shortfall is filled from the full range.
@@ -171,27 +255,26 @@ __global__ void sample_forward_candidates_kernel(
 
   int candidate_count = 0;
 
-  for (uint32_t j = 0; j < n_neighbors && candidate_count < candidate_width;
-       ++j) {
-    InternalID_t neighbor_id_raw = my_neighbors[j];
-    const Index_t neighbor_id = static_cast<Index_t>(neighbor_id_raw.id());
-
-    // Cache the 2-hop neighbor IDs in registers to avoid repeated global reads
-    // inside the inner k-loop. InternalID_t has no default constructor, so
-    // we store the decoded int id directly.
-    const InternalID_t *neigh2 =
-        graph_buffer + static_cast<size_t>(neighbor_id) * graph_width;
-    int neigh2_ids[MAX_NEIGHBORS];
-    for (uint32_t k = 0; k < n_neighbors; ++k) {
-      neigh2_ids[k] = neigh2[k].id();
-    }
-
-    for (uint32_t k = 0; k < n_neighbors && candidate_count < candidate_width;
-         ++k) {
-      if (static_cast<uint32_t>(neigh2_ids[k]) >= n_inserted_instances)
+  // Round-robin fill: for each k-th slot, iterate over all j initial neighbors
+  // before moving to k+1. This ensures all n_neighbors initial neighbors
+  // contribute candidates equally, instead of the first ~(MAX_CANDIDATES/k)
+  // neighbors monopolizing the candidate buffer.
+  for (uint32_t k = 0; k < n_neighbors && candidate_count < candidate_width;
+       ++k) {
+    for (uint32_t j = 0; j < n_neighbors && candidate_count < candidate_width;
+         ++j) {
+      const Index_t neighbor_id = my_neighbors_l[j];
+      if (neighbor_id == std::numeric_limits<Index_t>::max())
         continue;
 
-      const Index_t candidate_id = static_cast<Index_t>(neigh2_ids[k]);
+      const InternalID_t *neigh2 =
+          graph_buffer + static_cast<size_t>(neighbor_id) * graph_width;
+      const int cid_raw = neigh2[k].id();
+
+      if (static_cast<uint32_t>(cid_raw) >= n_inserted_instances)
+        continue;
+
+      const Index_t candidate_id = static_cast<Index_t>(cid_raw);
 
       if (candidate_id == gid)
         continue;
@@ -223,8 +306,8 @@ __global__ void sample_forward_candidates_kernel(
 //     IDs loaded cooperatively → also coalesced and O(1) instead of O(K).
 //   • Invalid slots receive a -1 sentinel (written by lane 0 only).
 //
-// Launch: blockDim = 256 (8 warps), gridDim = ceil(batch_size * MAX_CANDIDATES / 8).
-// Caller must allocate candidate_dists_buffer with shape
+// Launch: blockDim = 256 (8 warps), gridDim = ceil(batch_size * MAX_CANDIDATES
+// / 8). Caller must allocate candidate_dists_buffer with shape
 //   [n_inserted_instances + batch_size] × MAX_CANDIDATES.
 template <typename Data_t, typename Idx_t, typename Index_t = int>
 __global__ void compute_candidate_distances_kernel(
@@ -258,9 +341,9 @@ __global__ void compute_candidate_distances_kernel(
   // consecutive InternalID_t entries). __any_sync broadcasts the result.
   const InternalID_t *my_neighbors =
       graph_buffer + static_cast<size_t>(gid) * MAX_NEIGHBORS;
-  const int nb_id =
-      (lane_id < static_cast<int>(n_neighbors)) ? my_neighbors[lane_id].id()
-                                                : -1;
+  const int nb_id = (lane_id < static_cast<int>(n_neighbors))
+                        ? my_neighbors[lane_id].id()
+                        : -1;
   const bool is_existing_neighbor =
       __any_sync(raft::warp_full_mask(), nb_id == candidate);
 
@@ -617,18 +700,13 @@ void update_forward_neighbors(std::vector<Idx_t> &batch_indices_,
 // Pre-allocated reverse_cand_ids/dists/counts are passed in from NNDBuffers
 // to avoid per-call cudaMallocAsync inside the iteration loop.
 template <typename Data_t, typename Idx_t, typename Index_t = int>
-void update_reverse_neighbors(std::vector<Idx_t> &batch_indices_,
-                              uint32_t n_neighbors,
-                              uint32_t n_inserted_instances,
-                              InternalID_t *graph_buffer_,
-                              Data_t *distance_buffer_,
-                              const int *candidate_buffer_,
-                              const Data_t *candidate_dists_buffer_,
-                              int *d_dirty_flags_,
-                              int *reverse_cand_ids,
-                              Data_t *reverse_cand_dists,
-                              int *reverse_cand_counts,
-                              cudaStream_t stream) {
+void update_reverse_neighbors(
+    std::vector<Idx_t> &batch_indices_, uint32_t n_neighbors,
+    uint32_t n_inserted_instances, InternalID_t *graph_buffer_,
+    Data_t *distance_buffer_, const int *candidate_buffer_,
+    const Data_t *candidate_dists_buffer_, int *d_dirty_flags_,
+    int *reverse_cand_ids, Data_t *reverse_cand_dists, int *reverse_cand_counts,
+    cudaStream_t stream) {
   const uint32_t n_rows = static_cast<uint32_t>(batch_indices_.size());
   if (n_rows == 0)
     return;
@@ -864,21 +942,6 @@ void run_insertion(
     RAFT_CUDA_TRY(cudaGetLastError());
   }
 
-  // ── Step 3: Random-initialize KNN lists for batch nodes ──────────────────
-  // initialize_random_neighbors_kernel uses local row index; pass batch-slice
-  // pointers.  n_inserted_instances includes the batch, so random sampling
-  // may also draw other batch nodes as initial neighbors.
-  {
-    const int blocks = (static_cast<int>(batch_size) + tpb - 1) / tpb;
-    initialize_random_neighbors_kernel<Data_t, Idx_t, Index_t>
-        <<<blocks, tpb, 0, stream>>>(
-            graph_ptr + static_cast<size_t>(batch_start_offset) * MAX_NEIGHBORS,
-            dists_ptr + static_cast<size_t>(batch_start_offset) * MAX_NEIGHBORS,
-            MAX_NEIGHBORS, batch_size, batch_start_offset, n_inserted_instances,
-            window_start, seed);
-    RAFT_CUDA_TRY(cudaGetLastError());
-  }
-
   // Candidate-distance scratch buffer (batch_size rows).  Pointer shifted back
   // by batch_start_offset rows so global gid-based indexing maps into it.
   Data_t *cand_dists_storage;
@@ -889,6 +952,18 @@ void run_insertion(
   Data_t *cand_dists_ptr =
       cand_dists_storage -
       static_cast<ptrdiff_t>(batch_start_offset) * MAX_CANDIDATES;
+
+  // ── Step 3: Initialize batch nodes with random neighbors ─────────────────
+  {
+    const int blocks = (static_cast<int>(batch_size) + tpb - 1) / tpb;
+    initialize_random_neighbors_kernel<Data_t, Idx_t, Index_t>
+        <<<blocks, tpb, 0, stream>>>(
+            graph_ptr + static_cast<size_t>(batch_start_offset) * MAX_NEIGHBORS,
+            dists_ptr + static_cast<size_t>(batch_start_offset) * MAX_NEIGHBORS,
+            MAX_NEIGHBORS, batch_size, batch_start_offset, n_inserted_instances,
+            window_start, seed);
+    RAFT_CUDA_TRY(cudaGetLastError());
+  }
 
   // ── Step 4: NND iteration loop ───────────────────────────────────────────
   for (uint32_t iter = 0; iter < max_iter; ++iter) {

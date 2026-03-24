@@ -250,7 +250,8 @@ __global__ void update_embeddings_kernel(
     size_t neighbor_indices_block_size,
     const Data_t *__restrict__ neighbor_dists, size_t neighbor_dists_block_size,
     size_t n_neighbors, float *max_w, float a, float b, float alpha,
-    size_t max_epoch, size_t negative_sample_rate, unsigned long long seed) {
+    size_t max_epoch, size_t negative_sample_rate, unsigned long long seed,
+    bool update_dst) {
 
   const size_t tid = static_cast<size_t>(blockIdx.x * blockDim.x + threadIdx.x);
   if (tid >= n_edges) {
@@ -382,7 +383,8 @@ void update_embeddings(
     const Idx_t *neighbor_indices, size_t neighbor_indices_block_size,
     const Data_t *neighbor_dists, size_t neighbor_dists_block_size,
     size_t n_neighbors, float *max_w, float a, float b, float alpha,
-    size_t max_epoch, size_t negative_sample_rate, cudaStream_t stream) {
+    size_t max_epoch, size_t negative_sample_rate, cudaStream_t stream,
+    bool update_dst = true) {
 
   if (n_edges == 0) {
     return;
@@ -397,7 +399,7 @@ void update_embeddings(
           n_edges, embedding, n_components, n_inserted_instances,
           neighbor_indices, neighbor_indices_block_size, neighbor_dists,
           neighbor_dists_block_size, n_neighbors, max_w, a, b, alpha, max_epoch,
-          negative_sample_rate, seed);
+          negative_sample_rate, seed, update_dst);
 }
 
 // ── update_embeddings_multi
@@ -683,6 +685,49 @@ void compute_max_w_from_knn(const Idx_t *neighbor_indices,
   compute_max_w_kernel<Data_t, Idx_t><<<blocks, threads_per_block, 0, stream>>>(
       neighbor_indices, neighbor_indices_block_size, neighbor_dists,
       neighbor_dists_block_size, n_neighbors, n_nodes, max_w);
+}
+
+// ── add_embedding_noise
+// ──────────────────────────────────────────────────── Adds Gaussian noise to
+// the embedding coordinates of selected nodes before the SGD epoch loop, to
+// prevent clusters from collapsing too tightly across progressive runs.
+template <typename Data_t, typename Idx_t>
+__global__ void add_embedding_noise_kernel(
+    Data_t *__restrict__ embedding, const Idx_t *__restrict__ indices,
+    size_t n_indices, int n_components, float noise_scale,
+    unsigned long long seed) {
+
+  const size_t tid = static_cast<size_t>(blockIdx.x * blockDim.x + threadIdx.x);
+  if (tid >= n_indices * static_cast<size_t>(n_components))
+    return;
+
+  const size_t node_local = tid / static_cast<size_t>(n_components);
+  const int comp = static_cast<int>(tid % static_cast<size_t>(n_components));
+  const size_t node = static_cast<size_t>(indices[node_local]);
+
+  curandStatePhilox4_32_10_t rng;
+  curand_init(seed ^ tid, 0, 0, &rng);
+
+  embedding[node * static_cast<size_t>(n_components) + comp] +=
+      static_cast<Data_t>(curand_normal(&rng) * noise_scale);
+}
+
+template <typename Data_t, typename Idx_t>
+void add_embedding_noise(Data_t *embedding, const Idx_t *indices,
+                         size_t n_indices, int n_components, float noise_scale,
+                         unsigned long long seed, cudaStream_t stream) {
+  if (n_indices == 0 || noise_scale == 0.0f)
+    return;
+
+  const size_t n_total = n_indices * static_cast<size_t>(n_components);
+  const int threads_per_block = 256;
+  const int blocks =
+      static_cast<int>((n_total + threads_per_block - 1) / threads_per_block);
+
+  add_embedding_noise_kernel<Data_t, Idx_t>
+      <<<blocks, threads_per_block, 0, stream>>>(embedding, indices, n_indices,
+                                                 n_components, noise_scale,
+                                                 seed);
 }
 
 } // namespace gpumap
