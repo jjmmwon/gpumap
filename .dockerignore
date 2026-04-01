@@ -1,8 +1,0 @@
-.cache
-__pycache__
-build
-.git
-.gitignore
-.vscode
-.env
-*.log
