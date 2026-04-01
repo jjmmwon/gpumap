@@ -12,7 +12,6 @@ from .strategy import (
 )
 from .weighted import WeightedStrategy
 from .sequential import SequentialPriorityStrategy
-from .phase_based import PhaseSpec, DEFAULT_PHASE_SPECS, PhaseBasedStrategy
 
 __all__ = [
     # estimator
@@ -28,7 +27,4 @@ __all__ = [
     # strategies
     "WeightedStrategy",
     "SequentialPriorityStrategy",
-    "PhaseSpec",
-    "DEFAULT_PHASE_SPECS",
-    "PhaseBasedStrategy",
 ]

@@ -99,8 +99,8 @@ checkpoints/
 results/
 evaluation/*results/
 evaluation/*data/
-
-
+evaluation
+tests
 # -----------------------------
 # Test files
 # -----------------------------

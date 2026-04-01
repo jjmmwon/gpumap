@@ -38,38 +38,15 @@ class SequentialPriorityStrategy(BaseStrategy):
             confidence=confidence,
             min_insertion_ops=min_insertion_ops,
         )
+        self._update_counter = 0
 
     def allocate(self, target_latency: float) -> tuple[int, int, int]:
 
         if not self.completeness[0]:  # insertion not complete
-            n_ins = _estimate_or_fallback(
-                self.insertion_estimator,
-                target_latency,
-                self.confidence,
-                self.default_n_ops,
-            )
-            clipped_ins = clip_ops(n_ins, (self.min_insertion_ops, self.max_uint32))
-
-            return (clipped_ins, 0, 0)
+            return (self.max_uint32, 0, 0)
 
         if not self.completeness[1]:  # update not complete
-            n_upd = _estimate_or_fallback(
-                self.update_estimator,
-                target_latency,
-                self.confidence,
-                self.default_n_ops,
-            )
-            clipped_upd = min(n_upd, self.max_uint32)
-            self._update_counter += 1
 
-            return (0, clipped_upd, 0)
+            return (0, self.max_uint32, 0)
 
-        n_emb = _estimate_or_fallback(
-            self.embedding_estimator,
-            target_latency,
-            self.confidence,
-            self.default_n_ops,
-        )
-        clipped_emb = min(n_emb, self.max_uint32)
-
-        return (0, 0, clipped_emb)
+        return (0, 0, self.max_uint32)

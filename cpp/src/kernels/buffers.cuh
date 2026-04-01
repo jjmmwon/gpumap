@@ -227,8 +227,9 @@ template <typename Data_t, typename Index_t = int> struct NNDBuffers {
         h_list_sizes_old{
             raft::make_pinned_vector<int2, size_t>(res, n_instances)},
 
-        reverse_cand_ids_{raft::make_device_matrix<int, size_t, raft::row_major>(
-            res, n_instances, MAX_NEIGHBORS)},
+        reverse_cand_ids_{
+            raft::make_device_matrix<int, size_t, raft::row_major>(
+                res, n_instances, MAX_NEIGHBORS)},
         reverse_cand_dists_{
             raft::make_device_matrix<Data_t, size_t, raft::row_major>(
                 res, n_instances, MAX_NEIGHBORS)},

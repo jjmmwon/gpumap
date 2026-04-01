@@ -96,7 +96,6 @@ using EdgeT = std::tuple<Idx_t, Idx_t, float, float, float>;
 
 using Edge = EdgeT<uint32_t>;
 
-
 // Multi-level embedding queue: divides [0, max_epoch] into N_LEVELS bins.
 // Edges are routed by their current_epoch so that pop_n drains lower-epoch
 // bins first, preserving temporal ordering across requeues.

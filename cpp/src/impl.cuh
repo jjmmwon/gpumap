@@ -15,10 +15,12 @@
 #include <cstddef>
 #include <cstdio>
 #include <deque>
+#include <limits>
 #include <numeric>
 #include <random>
 #include <rmm/cuda_stream_view.hpp>
 #include <rmm/device_scalar.hpp>
+#include <vector>
 
 namespace gpumap {
 
@@ -98,6 +100,58 @@ struct GPUMAP::Impl {
     std::iota(new_indices.begin(), new_indices.end(), old_count);
     insertion_queue.push_batch(new_indices);
     embedding_new_queue.push_batch(new_indices);
+  }
+
+  void sync_knn_rows_to_device(const std::vector<Idx_t> &rows,
+                               cudaStream_t stream) {
+    if (rows.empty())
+      return;
+
+    std::vector<Idx_t> unique_rows(rows.begin(), rows.end());
+    std::sort(unique_rows.begin(), unique_rows.end());
+    unique_rows.erase(std::unique(unique_rows.begin(), unique_rows.end()),
+                      unique_rows.end());
+
+    std::vector<Idx_t> h_neighbor_row(storage.n_neighbors);
+    std::vector<Data_t> h_dist_row(storage.n_neighbors);
+    const Idx_t dirty_flag_zero = 0;
+    const Idx_t dirty_flag_one = 1;
+
+    for (Idx_t row_id : unique_rows) {
+      const size_t row = static_cast<size_t>(row_id);
+      auto row_graph =
+          storage.nnd_buffer.h_graph.data_handle() + row * storage.n_neighbors;
+      auto row_dists =
+          storage.nnd_buffer.h_dists.data_handle() + row * storage.n_neighbors;
+
+      bool valid_row = false;
+      for (size_t j = 0; j < storage.n_neighbors; ++j) {
+        const int id = row_graph[j].id();
+        const bool valid_id =
+            (id >= 0 &&
+             static_cast<size_t>(id) < storage.n_inserted_instances &&
+             static_cast<size_t>(id) != row);
+        valid_row = valid_row || valid_id;
+
+        h_neighbor_row[j] = valid_id ? static_cast<Idx_t>(id)
+                                     : std::numeric_limits<Idx_t>::max();
+        h_dist_row[j] =
+            valid_id ? row_dists[j] : std::numeric_limits<Data_t>::max();
+      }
+
+      raft::copy(storage.neighbor_indices.data() +
+                     row * storage.neighbor_indices_block_size,
+                 h_neighbor_row.data(), storage.n_neighbors, stream);
+      raft::copy(storage.neighbor_dists.data() +
+                     row * storage.neighbor_dists_block_size,
+                 h_dist_row.data(), storage.n_neighbors, stream);
+
+      const Idx_t dirty_flag = valid_row ? dirty_flag_one : dirty_flag_zero;
+      raft::copy(storage.neighbor_indices.data() +
+                     row * storage.neighbor_indices_block_size +
+                     (storage.neighbor_indices_block_size - 1),
+                 &dirty_flag, 1, stream);
+    }
   }
 
   GPUMAPResult run(uint32_t n_insertion_ops, uint32_t n_update_ops,
@@ -189,31 +243,22 @@ struct GPUMAP::Impl {
       batch_start_history_.pop_front();
     const uint32_t window_start = batch_start_history_.front();
 
+    int seed = n_ops * 9973 + storage.n_inserted_instances * 7919;
+
     run_insertion<Data_t, Idx_t>(
         storage.nnd_buffer, batch_indices, storage.data.data(),
         storage.data_block_size, storage.n_features, storage.n_neighbors,
         storage.n_inserted_instances,
-        /*max_iter=*/5, /*seed=*/42, insertion_stream, affected_indices,
+        /*max_iter=*/10, /*seed=*/seed, insertion_stream, affected_indices,
         new_edges, storage.embedding.data(), storage.n_components,
         window_start);
 
+    // Embedding reads storage.neighbor_indices immediately after insertion.
+    // Sync the authoritative host-side KNN rows now so new batch rows do not
+    // look like all-zero neighbors until a later update pass touches them.
+    sync_knn_rows_to_device(affected_indices, insertion_stream);
+
     update_queue.push_batch(affected_indices);
-
-    // Run one round of update_kernel on the newly inserted instances and
-    // propagate any changed neighbours into the update queue.
-    std::vector<Idx_t> update_affected_indices;
-    std::vector<gpumap::Edge> update_new_edges;
-    update_kernel<Data_t, Idx_t>(
-        storage.nnd_buffer, batch_indices, update_affected_indices,
-        update_new_edges, insertion_stream,
-
-        storage.data.data(), storage.neighbor_indices.data(),
-        storage.neighbor_dists.data(), storage.data_block_size,
-        storage.neighbor_indices_block_size, storage.neighbor_dists_block_size,
-
-        storage.n_features, storage.n_neighbors, storage.n_inserted_instances);
-
-    update_queue.push_batch(update_affected_indices);
 
     return static_cast<uint32_t>(batch_indices.size());
   }
@@ -224,7 +269,7 @@ struct GPUMAP::Impl {
         storage.n_inserted_instances == 0)
       return 0;
 
-    constexpr float termination_sigma = 0.001f;
+    constexpr float termination_sigma = 0.0001f;
     const size_t convergence_threshold = static_cast<size_t>(
         termination_sigma * static_cast<float>(storage.n_inserted_instances));
 
@@ -281,21 +326,6 @@ struct GPUMAP::Impl {
       // update queue regardless of convergence.
       update_queue.push_batch(affected_indices);
 
-      const auto *h_graph = storage.nnd_buffer.h_graph.data_handle();
-      std::vector<Idx_t> cascade_indices;
-      cascade_indices.reserve(affected_indices.size() * storage.n_neighbors);
-      for (auto idx : affected_indices) {
-        const auto *nbrs =
-            h_graph + static_cast<size_t>(idx) * storage.n_neighbors;
-        for (uint32_t j = 0; j < storage.n_neighbors; ++j) {
-          int nid = nbrs[j].id();
-          if (nid >= 0 &&
-              static_cast<size_t>(nid) < storage.n_inserted_instances)
-            cascade_indices.push_back(static_cast<Idx_t>(nid));
-        }
-      }
-      update_queue.push_batch(cascade_indices);
-
       // Convergence: KNN changes dropped below threshold AND all instances
       // have been inserted (no more data will arrive to disturb the graph).
       bool converged = (update_queue.size() < convergence_threshold);
@@ -308,199 +338,160 @@ struct GPUMAP::Impl {
             (storage.n_inserted_instances == storage.n_instances);
         break;
       }
-
-      // if (update_queue.size() < convergence_threshold &&
-      //     storage.n_inserted_instances == storage.n_instances) {
-      //   log("[GPUMAP] update done: n_changed=%zu < threshold=%zu, "
-      //       "all %zu instances inserted\n",
-      //       n_changed, convergence_threshold, storage.n_instances);
-      //   storage.update_completed = true;
-      //   break;
-      // }
     }
 
     return n_ops - left_ops;
   }
 
   uint32_t embed(uint32_t n_ops) {
-    if (storage.n_inserted_instances == 0 || n_ops == 0)
+    if (n_ops == 0 || storage.n_inserted_instances == 0)
       return 0;
 
     const size_t n = storage.n_inserted_instances;
-    const size_t n_ops_sz = static_cast<size_t>(n_ops);
-    const size_t pending_new = embedding_new_queue.size();
-    const size_t old_n = n - pending_new;
-    auto maybe_finalize_embedding = [&]() {
-      if (storage.update_completed && embedding_sweeps_done_ > 2) {
-        storage.embedding_completed = true;
-      }
-    };
 
-    std::vector<Idx_t> priority_indices;
-    priority_indices.reserve(std::min(n_ops_sz, embedding_new_queue.size()));
-
-    size_t range1_start = 0;
-    size_t range1_end = 0;
-    size_t range2_end = 0;
-
-    if (n_ops_sz > n) {
-      embedding_new_queue.pop_n(pending_new);
-      range1_start = 0;
-      range1_end = n;
+    // ── Build batch_indices (no duplicates) ──────────────────────────────
+    const size_t total_n = static_cast<size_t>(storage.n_instances);
+    std::vector<Idx_t> batch_indices;
+    if (static_cast<size_t>(n_ops) >= n) {
+      // Full sweep: drain queue entirely, then [0, n) in order
+      embedding_new_queue.pop_n(embedding_new_queue.size());
+      batch_indices.resize(n);
+      std::iota(batch_indices.begin(), batch_indices.end(), Idx_t{0});
       embedding_cursor_ = n - 1;
-      embedding_sweeps_done_ =
-          n == storage.n_instances ? embedding_sweeps_done_ + 1 : 0;
-      maybe_finalize_embedding();
+      if (embedding_cursor_ == total_n - 1 && storage.update_completed)
+        ++embedding_sweeps_done_;
     } else {
-      size_t left_ops = n_ops_sz;
-      const bool stop_after_wrap =
-          storage.update_completed && embedding_sweeps_done_ > 2;
-      if (stop_after_wrap)
-        storage.embedding_completed = true;
-
-      if (pending_new > 0) {
-        const size_t n_new = std::min(left_ops, pending_new);
-        priority_indices = embedding_new_queue.pop_n(n_new);
-        left_ops -= priority_indices.size();
+      // Step 1: drain new_queue entirely (may exceed n_ops)
+      if (embedding_new_queue.size() > 0) {
+        auto new_items = embedding_new_queue.pop_n(embedding_new_queue.size());
+        batch_indices.insert(batch_indices.end(), new_items.begin(),
+                             new_items.end());
       }
 
-      if (left_ops > 0 && old_n > 0) {
-        const size_t start = (embedding_cursor_ + 1) % old_n;
-        const size_t first_count = std::min(left_ops, old_n - start);
-        range1_start = start;
-        range1_end = start + first_count;
-        left_ops -= first_count;
-
-        if (!stop_after_wrap && left_ops > 0) {
-          range2_end = std::min(left_ops, start);
-        }
-
-        const bool reached_boundary = (range1_end == storage.n_instances);
-        const bool wrapped = (range2_end > 0);
-        if (wrapped) {
-          embedding_cursor_ = range2_end - 1;
-        } else if (range1_end > range1_start) {
-          embedding_cursor_ = range1_end - 1;
-        }
-
-        if (reached_boundary) {
-          embedding_sweeps_done_++;
-          maybe_finalize_embedding();
+      // Step 2: fill remaining budget with cursor sweep, skipping duplicates
+      size_t left_ops = (batch_indices.size() >= static_cast<size_t>(n_ops))
+                            ? 0
+                            : static_cast<size_t>(n_ops) - batch_indices.size();
+      if (left_ops > 0) {
+        std::unordered_set<Idx_t> seen(batch_indices.begin(),
+                                       batch_indices.end());
+        size_t cursor =
+            (embedding_cursor_ == SIZE_MAX) ? 0 : (embedding_cursor_ + 1) % n;
+        for (size_t checked = 0; left_ops > 0 && checked < n; ++checked) {
+          if (seen.insert(static_cast<Idx_t>(cursor)).second) {
+            batch_indices.push_back(static_cast<Idx_t>(cursor));
+            embedding_cursor_ = cursor;
+            if (embedding_cursor_ == total_n - 1 && storage.update_completed)
+              ++embedding_sweeps_done_;
+            --left_ops;
+          }
+          cursor = (cursor + 1) % n;
         }
       }
     }
 
-    if (storage.embedding_completed) {
-      // Run all instances in one batch for a final embedding refinement pass.
-      range1_start = 0;
-      range1_end = storage.n_instances;
-      range2_end = 0;
-      priority_indices.clear();
+    log("[GPUMAP] embed batch_size=%zu new_queue=%zu cursor=%zu\n",
+        batch_indices.size(), embedding_new_queue.size(), embedding_cursor_);
+
+    const int n_int = static_cast<int>(n);
+    const int k = static_cast<int>(storage.n_neighbors);
+    const int n_batch = static_cast<int>(batch_indices.size());
+    // ── Upload batch_indices to GPU ───────────────────────────────────────
+    rmm::device_uvector<Idx_t> d_batch(n_batch, embedding_stream);
+    cudaMemcpyAsync(d_batch.data(), batch_indices.data(),
+                    n_batch * sizeof(Idx_t), cudaMemcpyHostToDevice,
+                    embedding_stream);
+
+    // ── Build embed-time KNN with self prepended at col 0 ────────────────
+    // Traditional UMAP: knn_indices[i][0]=i, knn_dists[i][0]=0.
+    // Self is inserted at col 0; original neighbors shifted to 1..k-1,
+    // dropping the k-th (last) neighbor so total column count stays k.
+    rmm::device_uvector<Idx_t> d_embed_indices(static_cast<size_t>(n_int) * k,
+                                               embedding_stream);
+    rmm::device_uvector<float> d_embed_dists(static_cast<size_t>(n_int) * k,
+                                             embedding_stream);
+    {
+      const int total = n_int * k;
+      const int tpb = 256;
+      const int blks = (total + tpb - 1) / tpb;
+      prepend_self_knn_kernel<Idx_t><<<blks, tpb, 0, embedding_stream>>>(
+          storage.neighbor_indices.data(),
+          static_cast<int>(storage.neighbor_indices_block_size),
+          storage.neighbor_dists.data(),
+          static_cast<int>(storage.neighbor_dists_block_size),
+          d_embed_indices.data(), d_embed_dists.data(), n_int, k);
     }
 
-    const size_t sel_count = priority_indices.size() +
-                             (range1_end - range1_start) +
-                             range2_end; // range2: [0, range2_end)
+    // ── Allocate COO (2*n_batch*k: first half directed, second half extras) ──
+    const int max_nnz = 2 * n_batch * k;
+    rmm::device_uvector<int> coo_rows(max_nnz, embedding_stream);
+    rmm::device_uvector<int> coo_cols(max_nnz, embedding_stream);
+    rmm::device_uvector<float> coo_vals(max_nnz, embedding_stream);
 
-    // Build srcs/dsts on host from NND graph (kernel handles invalid indices).
-    const auto *h_graph = storage.nnd_buffer.h_graph.data_handle();
-    const size_t max_edges = sel_count * storage.n_neighbors;
-    std::vector<Idx_t> h_srcs, h_dsts;
-    h_srcs.reserve(max_edges);
-    h_dsts.reserve(max_edges);
-    auto append_edges = [&](size_t inst) {
-      const auto *nbrs = h_graph + inst * storage.n_neighbors;
-      for (uint32_t j = 0; j < storage.n_neighbors; ++j) {
-        int nid = nbrs[j].id();
-        if (nid < 0)
-          continue;
-        h_srcs.push_back(static_cast<Idx_t>(inst));
-        h_dsts.push_back(static_cast<Idx_t>(nid));
-      }
-    };
-    auto fill_edges = [&](size_t inst_start, size_t inst_end) {
-      for (size_t inst = inst_start; inst < inst_end; ++inst) {
-        append_edges(inst);
-      }
-    };
-    for (Idx_t inst : priority_indices) {
-      append_edges(inst);
+    // ── Build fuzzy simplicial set graph ─────────────────────────────────
+    // sigma/rho computed for all n; COO built only for batch rows.
+    // Returns actual nnz (directed + asymmetric reverse entries).
+    const int actual_nnz = compute_fuzzy_graph<Idx_t>(
+        d_embed_indices.data(), k, d_embed_dists.data(), k, n_int, k,
+        d_batch.data(), n_batch, coo_rows.data(), coo_cols.data(),
+        coo_vals.data(), embedding_stream);
+
+    if (embedding_sweeps_done_ > 2) {
+      storage.embedding_completed = storage.update_completed;
     }
-    fill_edges(range1_start, range1_end);
-    fill_edges(0, range2_end);
 
-    const size_t n_edges = h_srcs.size();
-    if (n_edges == 0)
-      return static_cast<uint32_t>(sel_count);
-
-    rmm::device_uvector<Idx_t> d_srcs(n_edges, embedding_stream),
-        d_dsts(n_edges, embedding_stream);
-    cudaMemcpyAsync(d_srcs.data(), h_srcs.data(), n_edges * sizeof(Idx_t),
-                    cudaMemcpyHostToDevice, embedding_stream);
-    cudaMemcpyAsync(d_dsts.data(), h_dsts.data(), n_edges * sizeof(Idx_t),
-                    cudaMemcpyHostToDevice, embedding_stream);
-
-    // Precompute sigma and max_w for the full graph.
-    update_sigma_all<Data_t, Idx_t>(
-        storage.neighbor_indices.data(), storage.neighbor_indices_block_size,
-        storage.neighbor_dists.data(), storage.neighbor_dists_block_size,
-        storage.n_neighbors, storage.n_inserted_instances, embedding_stream);
-    cudaMemsetAsync(storage.max_w.data(), 0, sizeof(float), embedding_stream);
-    compute_max_w_from_knn<Data_t, Idx_t>(
-        storage.neighbor_indices.data(), storage.neighbor_indices_block_size,
-        storage.neighbor_dists.data(), storage.neighbor_dists_block_size,
-        storage.n_neighbors, storage.n_inserted_instances, storage.max_w.data(),
-        embedding_stream);
-    cudaStreamSynchronize(embedding_stream);
-
-    // Initialize epoch state to zero; run all epochs in one loop.
-    rmm::device_uvector<float> d_ce(n_edges, embedding_stream),
-        d_nse(n_edges, embedding_stream), d_nne(n_edges, embedding_stream);
-    cudaMemsetAsync(d_ce.data(), 0, n_edges * sizeof(float), embedding_stream);
-    cudaMemsetAsync(d_nse.data(), 0, n_edges * sizeof(float), embedding_stream);
-    cudaMemsetAsync(d_nne.data(), 0, n_edges * sizeof(float), embedding_stream);
-
-    // Add Gaussian noise before the SGD loop to prevent clusters from
-    // collapsing too tightly across progressive runs.
-    float noise_scale = storage.embedding_completed ? 0.1f : 0.01f;
+    float noise_scale = 0.001f;
 
     if (noise_scale > 0.0f) {
-      std::vector<Idx_t> all_selected;
-      all_selected.reserve(sel_count);
-      for (Idx_t inst : priority_indices)
-        all_selected.push_back(inst);
-      for (size_t i = range1_start; i < range1_end; ++i)
-        all_selected.push_back(static_cast<Idx_t>(i));
-      for (size_t i = 0; i < range2_end; ++i)
-        all_selected.push_back(static_cast<Idx_t>(i));
-
-      rmm::device_uvector<Idx_t> d_selected(all_selected.size(),
+      rmm::device_uvector<Idx_t> d_selected(batch_indices.size(),
                                             embedding_stream);
-      cudaMemcpyAsync(d_selected.data(), all_selected.data(),
-                      all_selected.size() * sizeof(Idx_t),
+      cudaMemcpyAsync(d_selected.data(), batch_indices.data(),
+                      batch_indices.size() * sizeof(Idx_t),
                       cudaMemcpyHostToDevice, embedding_stream);
 
       const unsigned long long noise_seed =
           42ULL ^ static_cast<unsigned long long>(embedding_sweeps_done_);
       add_embedding_noise(storage.embedding.data(), d_selected.data(),
-                          all_selected.size(), params.n_components, noise_scale,
-                          noise_seed, embedding_stream);
+                          batch_indices.size(), params.n_components, n_int,
+                          noise_scale, noise_seed, embedding_stream);
     }
 
-    const bool update_dst = (embedding_sweeps_done_ < 1);
-    for (size_t epoch = 0; epoch < EMBEDDING_MAX_EPOCH; ++epoch) {
-      update_embeddings<Data_t, Idx_t>(
-          d_srcs.data(), d_dsts.data(), d_ce.data(), d_nse.data(), d_nne.data(),
-          n_edges, storage.embedding.data(), params.n_components,
-          storage.n_inserted_instances, storage.neighbor_indices.data(),
-          storage.neighbor_indices_block_size, storage.neighbor_dists.data(),
-          storage.neighbor_dists_block_size, storage.n_neighbors,
-          storage.max_w.data(), params.a, params.b, params.alpha,
-          EMBEDDING_MAX_EPOCH, params.negative_sample_rate, embedding_stream,
-          update_dst);
-    }
+    // ── Optimize layout (optimize_layout equivalent) ──────────────────────
+    run_optimize_layout(storage.embedding.data(), n_int, coo_rows.data(),
+                        coo_cols.data(), coo_vals.data(), actual_nnz,
+                        params.alpha, // initial_alpha
+                        1.0f,         // gamma (repulsion_strength)
+                        params.a, params.b,
+                        static_cast<int>(EMBEDDING_MAX_EPOCH),
+                        static_cast<int>(params.negative_sample_rate),
+                        42ULL, // seed
+                        embedding_stream);
 
-    return static_cast<uint32_t>(sel_count);
+    // ── Debug: print point-0 neighbors, distances, embedding ─────────────
+    if (n > 0) {
+      cudaStreamSynchronize(embedding_stream);
+
+      // Neighbors and distances (raw storage, stride = block_size)
+      const int bs_idx = static_cast<int>(storage.neighbor_indices_block_size);
+      const int bs_dst = static_cast<int>(storage.neighbor_dists_block_size);
+      const int k_print = std::min(k, 10); // cap at 10 for readability
+
+      std::vector<Idx_t> h_idx(bs_idx);
+      std::vector<float> h_dst(bs_dst);
+      cudaMemcpy(h_idx.data(), storage.neighbor_indices.data(),
+                 bs_idx * sizeof(Idx_t), cudaMemcpyDeviceToHost);
+      cudaMemcpy(h_dst.data(), storage.neighbor_dists.data(),
+                 bs_dst * sizeof(float), cudaMemcpyDeviceToHost);
+
+      // Embedding (n_components per row, row 0)
+      const int nc = static_cast<int>(params.n_components);
+      std::vector<float> h_emb(nc);
+      cudaMemcpy(h_emb.data(), storage.embedding.data(), nc * sizeof(float),
+                 cudaMemcpyDeviceToHost);
+    }
+    // ─────────────────────────────────────────────────────────────────────
+
+    return static_cast<uint32_t>(batch_indices.size());
   }
 
   void close() {

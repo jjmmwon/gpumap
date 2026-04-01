@@ -213,8 +213,10 @@ class DefaultLinearEstimator(Estimator):
 
         ops = safe_budget / a
 
-        return int(ops) if ops > 0 else self._fallback_ops_from_recent_rates(
-            time_budget_sec
+        return (
+            int(ops)
+            if ops > 0
+            else self._fallback_ops_from_recent_rates(time_budget_sec)
         )
 
     def predict_time(self, ops: int, quantile: float = 0.95) -> float:

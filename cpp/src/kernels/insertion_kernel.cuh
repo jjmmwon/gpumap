@@ -1037,8 +1037,7 @@ void run_insertion(
     }
   }
 
-  for (uint32_t node = 0; node < n_inserted_instances - batch_start_offset;
-       ++node) {
+  for (uint32_t node = 0; node < batch_start_offset; ++node) {
     if (!dirty[node])
       continue;
 

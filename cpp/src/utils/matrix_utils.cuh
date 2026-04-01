@@ -41,7 +41,7 @@ void append_device(T *dst_device, T const *src_device, Idx_t n_new_instances,
   RAFT_CUDA_TRY(cudaGetLastError());
 }
 
-// Append host data to matrix (일반 버전)
+// Append host data to matrix (general version)
 template <typename T, typename Idx_t>
 void append_host(T *dst_device, T const *src_host, Idx_t n_new_instances,
                  Idx_t n_features, Idx_t data_block_size,

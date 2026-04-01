@@ -75,7 +75,7 @@ class BaseStrategy(ABC):
     def __init__(
         self,
         weights: tuple[float, float, float] = (1.0, 1.0, 1.0),
-        reserved: float = 0.1,
+        reserved: float = 0.2,
         insertion_estimator: Optional[Estimator] = None,
         update_estimator: Optional[Estimator] = None,
         embedding_estimator: Optional[Estimator] = None,
@@ -151,7 +151,9 @@ class BaseStrategy(ABC):
         return (self.insertion_progress, self.update_progress, self.embedding_progress)
 
     def _split(self, total: float) -> tuple[float, float, float]:
-        denom = sum(self._weights) + self._reserved
+        weight_sum = sum(self._weights)
+        denom = weight_sum * (1 + self._reserved)
+        # denom = sum(self._weights) + self._reserved
         if denom <= 0:
             return (0.0, 0.0, 0.0)
         a, b, c = (total * w / denom for w in self._weights)

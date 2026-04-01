@@ -17,7 +17,7 @@ class WeightedStrategy(BaseStrategy):
         self,
         n_instances: int,
         n_neighbors: int = 15,
-        weights: tuple[float, float, float] = (1.0, 1.0, 1.0),
+        weights: tuple[float, float, float] = (1.0, 12.0, 1.0),
         reserved: float = 0.1,
         insertion_estimator: Optional[Estimator] = None,
         update_estimator: Optional[Estimator] = None,
@@ -57,45 +57,3 @@ class WeightedStrategy(BaseStrategy):
             clip_ops(n_upd, (0, self.max_uint32)),
             clip_ops(n_emb, (0, self.max_uint32)),
         )
-
-
-class FocusedStrategy(WeightedStrategy):
-    """
-    Allocates a fixed fraction of the budget to one phase, with the remainder
-    split among the other two phases by their relative weights.
-
-    `focus` selects the prioritized phase: "insertion", "update", or "embedding".
-    `focus_rate` sets what fraction of total time goes to that phase (0 < focus_rate < 1).
-    """
-
-    def __init__(
-        self,
-        n_instances: int,
-        n_neighbors: int = 15,
-        insertion_estimator: Optional[Estimator] = None,
-        update_estimator: Optional[Estimator] = None,
-        embedding_estimator: Optional[Estimator] = None,
-        default_n_ops: int = 100,
-        confidence: float = 0.95,
-        focus: Literal["insertion", "update", "embedding"] = "insertion",
-        focus_rate: float = 0.5,
-        reserved: float = 0.1,
-    ):
-        super().__init__(
-            insertion_estimator=insertion_estimator or MeanRateEstimator(),
-            update_estimator=update_estimator or MeanRateEstimator(),
-            embedding_estimator=embedding_estimator or MeanRateEstimator(),
-            n_instances=n_instances,
-            n_neighbors=n_neighbors,
-            default_n_ops=default_n_ops,
-            confidence=confidence,
-            reserved=reserved,
-        )
-        if not (0.0 < focus_rate and focus_rate < 1.0):
-            raise ValueError("focus_rate must be in the range (0, 1)")
-
-        focus_index = {"insertion": 0, "update": 1, "embedding": 2}[focus]
-        other_weight = (1.0 - focus_rate) / 2
-
-        self._weights = [other_weight] * 3
-        self._weights[focus_index] = focus_rate
