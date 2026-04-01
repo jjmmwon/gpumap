@@ -5,7 +5,7 @@ GPU-accelerated progressive dimensionality reduction based on UMAP, implemented 
 ## Directory Structure
 
 ```
-gpumap-algo/
+gpumap/
 ├── env.yml                # conda environment (CUDA 12.6, RAPIDS 26.02, pybind11, …)
 ├── CMakeLists.txt         # top-level CMake
 ├── pyproject.toml         # scikit-build-core config
