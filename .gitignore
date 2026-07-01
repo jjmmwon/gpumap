@@ -97,9 +97,9 @@ data/
 outputs/
 checkpoints/
 results/
-evaluation/*results/
-evaluation/*data/
-evaluation
+evaluation/preprocess_results
+evaluation/progressive_results
+evaluation/data
 tests
 # -----------------------------
 # Test files

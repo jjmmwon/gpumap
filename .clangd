@@ -19,8 +19,8 @@ CompileFlags:
     - "-DTHRUST_DISABLE_ABI_NAMESPACE"
     - "-DTHRUST_HOST_SYSTEM=THRUST_HOST_SYSTEM_CPP"
     - "-DTHRUST_IGNORE_ABI_NAMESPACE_ERROR"
-    - "-I/home/myeongwon/git/gpumap-seq/cpp/include"
-    - "-I/home/myeongwon/git/gpumap-seq/cpp/src"
+    - "-I/home/myeongwon/git/gpumap/core/cpp/include"
+    - "-I/home/myeongwon/git/gpumap/core/cpp/src"
     - "-I/home/myeongwon/miniforge3/envs/gpumap/include"
     - "-I/home/myeongwon/miniforge3/envs/gpumap/include/rapids"
     - "-isystem"
@@ -53,6 +53,7 @@ Diagnostics:
     - "non_type_template_in_nested_name_specifier"
     - "typecheck_decl_incomplete_type"
     - "no_member_template"
+    - deduction_guide_target_attr
   UnusedIncludes: None
 
 Index:
