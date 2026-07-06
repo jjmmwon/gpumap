@@ -104,6 +104,9 @@ struct GPUMAP::Impl {
 
   void sync_knn_rows_to_device(const std::vector<Idx_t> &rows,
                                cudaStream_t stream) {
+    static_assert(std::is_same<Idx_t, uint32_t>::value,
+                 "sync_knn_rows_to_device scatter path assumes Idx_t == "
+                 "uint32_t");
     if (rows.empty())
       return;
 
@@ -112,20 +115,27 @@ struct GPUMAP::Impl {
     unique_rows.erase(std::unique(unique_rows.begin(), unique_rows.end()),
                       unique_rows.end());
 
-    std::vector<Idx_t> h_neighbor_row(storage.n_neighbors);
-    std::vector<Data_t> h_dist_row(storage.n_neighbors);
-    const Idx_t dirty_flag_zero = 0;
-    const Idx_t dirty_flag_one = 1;
+    const size_t n = unique_rows.size();
+    const size_t k = storage.n_neighbors;
+    // Stage all rows contiguously on the host, then scatter to their
+    // (arbitrary, non-contiguous) device rows in 3 kernel launches total
+    // instead of 3 tiny H2D copies per row.
+    std::vector<uint32_t> stg_idx(n * k);
+    std::vector<Data_t> stg_dist(n * k);
+    std::vector<uint32_t> stg_dirty(n);
 
-    for (Idx_t row_id : unique_rows) {
-      const size_t row = static_cast<size_t>(row_id);
+#pragma omp parallel for
+    for (size_t i = 0; i < n; ++i) {
+      const size_t row = static_cast<size_t>(unique_rows[i]);
       auto row_graph =
-          storage.nnd_buffer.h_graph.data_handle() + row * storage.n_neighbors;
+          storage.nnd_buffer.h_graph.data_handle() + row * k;
       auto row_dists =
-          storage.nnd_buffer.h_dists.data_handle() + row * storage.n_neighbors;
+          storage.nnd_buffer.h_dists.data_handle() + row * k;
 
+      uint32_t *dst_idx = stg_idx.data() + i * k;
+      Data_t *dst_dist = stg_dist.data() + i * k;
       bool valid_row = false;
-      for (size_t j = 0; j < storage.n_neighbors; ++j) {
+      for (size_t j = 0; j < k; ++j) {
         const int id = row_graph[j].id();
         const bool valid_id =
             (id >= 0 &&
@@ -133,25 +143,35 @@ struct GPUMAP::Impl {
              static_cast<size_t>(id) != row);
         valid_row = valid_row || valid_id;
 
-        h_neighbor_row[j] = valid_id ? static_cast<Idx_t>(id)
-                                     : std::numeric_limits<Idx_t>::max();
-        h_dist_row[j] =
+        dst_idx[j] = valid_id ? static_cast<uint32_t>(id)
+                             : std::numeric_limits<uint32_t>::max();
+        dst_dist[j] =
             valid_id ? row_dists[j] : std::numeric_limits<Data_t>::max();
       }
-
-      raft::copy(storage.neighbor_indices.data() +
-                     row * storage.neighbor_indices_block_size,
-                 h_neighbor_row.data(), storage.n_neighbors, stream);
-      raft::copy(storage.neighbor_dists.data() +
-                     row * storage.neighbor_dists_block_size,
-                 h_dist_row.data(), storage.n_neighbors, stream);
-
-      const Idx_t dirty_flag = valid_row ? dirty_flag_one : dirty_flag_zero;
-      raft::copy(storage.neighbor_indices.data() +
-                     row * storage.neighbor_indices_block_size +
-                     (storage.neighbor_indices_block_size - 1),
-                 &dirty_flag, 1, stream);
+      stg_dirty[i] = valid_row ? 1u : 0u;
     }
+
+    auto &scratch = storage.nnd_buffer;
+    utils::scatter_rows_host<uint32_t, uint32_t>(
+        reinterpret_cast<uint32_t *>(storage.neighbor_indices.data()),
+        storage.neighbor_indices_block_size,
+        reinterpret_cast<uint32_t *>(unique_rows.data()), stg_idx.data(), k,
+        static_cast<uint32_t>(n), scratch.sync_row_ids_scratch_.data_handle(),
+        scratch.sync_idx_scratch_.data_handle(),
+        rmm::cuda_stream_view(stream));
+    utils::scatter_rows_host<Data_t, uint32_t>(
+        storage.neighbor_dists.data(), storage.neighbor_dists_block_size,
+        reinterpret_cast<uint32_t *>(unique_rows.data()), stg_dist.data(), k,
+        static_cast<uint32_t>(n), scratch.sync_row_ids_scratch_.data_handle(),
+        scratch.sync_dist_scratch_.data_handle(),
+        rmm::cuda_stream_view(stream));
+    utils::scatter_rows_host<uint32_t, uint32_t>(
+        reinterpret_cast<uint32_t *>(storage.neighbor_indices.data()) + k,
+        storage.neighbor_indices_block_size,
+        reinterpret_cast<uint32_t *>(unique_rows.data()), stg_dirty.data(), 1,
+        static_cast<uint32_t>(n), scratch.sync_row_ids_scratch_.data_handle(),
+        scratch.sync_idx_scratch_.data_handle(),
+        rmm::cuda_stream_view(stream));
   }
 
   GPUMAPResult run(uint32_t n_insertion_ops, uint32_t n_update_ops,

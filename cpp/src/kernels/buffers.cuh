@@ -234,7 +234,14 @@ template <typename Data_t, typename Index_t = int> struct NNDBuffers {
             raft::make_device_matrix<Data_t, size_t, raft::row_major>(
                 res, n_instances, MAX_NEIGHBORS)},
         reverse_cand_counts_{
-            raft::make_device_vector<int, size_t>(res, n_instances)} {}
+            raft::make_device_vector<int, size_t>(res, n_instances)},
+
+        sync_row_ids_scratch_{
+            raft::make_device_vector<uint32_t, size_t>(res, n_instances)},
+        sync_idx_scratch_{raft::make_device_vector<uint32_t, size_t>(
+            res, static_cast<size_t>(n_instances) * n_neighbors)},
+        sync_dist_scratch_{raft::make_device_vector<Data_t, size_t>(
+            res, static_cast<size_t>(n_instances) * n_neighbors)} {}
 
   raft::resources const &res;
   uint32_t n_instances;
@@ -322,6 +329,14 @@ template <typename Data_t, typename Index_t = int> struct NNDBuffers {
   raft::device_matrix<int, size_t, raft::row_major> reverse_cand_ids_;
   raft::device_matrix<Data_t, size_t, raft::row_major> reverse_cand_dists_;
   raft::device_vector<int, size_t> reverse_cand_counts_;
+
+  // Scratch buffers for utils::scatter_rows_host(), used to batch the many
+  // small per-row H2D copies in sync_knn_rows_to_device() / UpdateAlgo::run()
+  // into a single kernel launch. Sized for the worst case (every instance
+  // touched in one call).
+  raft::device_vector<uint32_t, size_t> sync_row_ids_scratch_;
+  raft::device_vector<uint32_t, size_t> sync_idx_scratch_;
+  raft::device_vector<Data_t, size_t> sync_dist_scratch_;
 
   BloomFilter<Index_t> bloom_filter;
 };

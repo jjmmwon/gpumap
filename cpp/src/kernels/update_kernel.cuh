@@ -1,5 +1,6 @@
 #pragma once
 
+#include "../utils/matrix_utils.cuh"
 #include "buffers.cuh"
 
 #if defined(__clang__) && defined(__CUDA__)
@@ -8,8 +9,10 @@
 #endif
 
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <cuda_runtime.h>
 #include <driver_types.h>
@@ -20,6 +23,7 @@
 #include <raft/matrix/init.cuh>
 #include <raft/util/cudart_utils.hpp>
 #include <tuple>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -909,6 +913,17 @@ template <typename Data_t, typename Idx_t, typename Index_t>
 size_t UpdateAlgo<Data_t, Idx_t, Index_t>::run(
     cudaStream_t stream, std::vector<Idx_t> &affected_indices,
     std::vector<std::tuple<Idx_t, Idx_t, float, float, float>> &new_edges) {
+  static const bool kProfile = std::getenv("GPUMAP_PROFILE_UPDATE") != nullptr;
+  auto t0 = std::chrono::high_resolution_clock::now();
+  auto lap = [&](const char *label) {
+    if (!kProfile)
+      return;
+    cudaStreamSynchronize(stream);
+    auto t1 = std::chrono::high_resolution_clock::now();
+    fprintf(stderr, "[UPD] %-16s %8.3f ms\n", label,
+            std::chrono::duration<double, std::milli>(t1 - t0).count());
+    t0 = t1;
+  };
 
   cudaMemsetAsync(buffers_.d_locks_.data_handle(), 0,
                   n_inserted_instances_ * sizeof(int), stream);
@@ -922,8 +937,10 @@ size_t UpdateAlgo<Data_t, Idx_t, Index_t>::run(
   raft::copy(buffers_.d_dirty_flags_.data_handle(),
              buffers_.h_dirty_flags_.data_handle(), n_inserted_instances_,
              stream);
+  lap("init");
 
   sample_graph(true);
+  lap("sample_graph");
   raft::copy(buffers_.d_list_sizes_new_.data_handle(),
              buffers_.h_list_sizes_new.data_handle(), n_inserted_instances_,
              stream);
@@ -935,6 +952,7 @@ size_t UpdateAlgo<Data_t, Idx_t, Index_t>::run(
              stream);
 
   cudaStreamSynchronize(stream);
+  lap("copy_sizes");
 
   add_reverse_edges(buffers_.h_graph_new.data_handle(),
                     buffers_.h_rev_graph_new_.data_handle(),
@@ -944,8 +962,10 @@ size_t UpdateAlgo<Data_t, Idx_t, Index_t>::run(
                     buffers_.h_rev_graph_old_.data_handle(),
                     buffers_.d_rev_graph_buffer_.data_handle(),
                     buffers_.d_list_sizes_old_.data_handle(), stream);
+  lap("reverse_edges");
 
   local_join(stream);
+  lap("local_join");
 
   raft::copy(buffers_.graph_host_buffer_.data_handle(),
              buffers_.graph_buffer_.data_handle(),
@@ -954,11 +974,14 @@ size_t UpdateAlgo<Data_t, Idx_t, Index_t>::run(
              buffers_.dists_buffer_.data_handle(),
              n_inserted_instances_ * MAX_NEIGHBORS, stream);
   cudaStreamSynchronize(stream);
+  lap("copy_graph_d2h");
 
   update_graph(new_edges);
+  lap("update_graph");
   raft::copy(d_dirty_flags_host.data(), buffers_.d_dirty_flags_.data_handle(),
              n_inserted_instances_, stream);
   cudaStreamSynchronize(stream);
+  lap("copy_dirty");
 
   for (size_t i = 0; i < n_inserted_instances_; ++i) {
     if (d_dirty_flags_host[i] > buffers_.h_dirty_flags_.data_handle()[i]) {
@@ -968,46 +991,99 @@ size_t UpdateAlgo<Data_t, Idx_t, Index_t>::run(
       neighbor_changed_indices.push_back(static_cast<Idx_t>(i));
     }
   }
+  lap("scan_dirty");
 
   sort_lists();
+  lap("sort_lists");
+  if (kProfile) {
+    fprintf(stderr, "[UPD] batch=%zu changed=%zu n=%u\n",
+            batch_indices_.size(), neighbor_changed_indices.size(),
+            n_inserted_instances_);
+  }
 
   if (neighbor_indices != nullptr && neighbor_distances != nullptr) {
-    std::vector<Idx_t> h_neighbor_row(n_neighbors_);
-    std::vector<Data_t> h_dist_row(n_neighbors_);
-    const Idx_t dirty_flag_one = static_cast<Idx_t>(1);
-    for (auto row_id : neighbor_changed_indices) {
+    // scatter_rows_host()/the sync_*_scratch_ buffers below are fixed at
+    // uint32_t; NNDBuffers has no Idx_t template parameter of its own, and
+    // every instantiation in this codebase uses Idx_t = uint32_t.
+    static_assert(std::is_same<Idx_t, uint32_t>::value,
+                 "sync_knn_rows scatter path assumes Idx_t == uint32_t");
+    const size_t n_changed = neighbor_changed_indices.size();
+    // Stage every changed row's (indices, dists) contiguously on the host,
+    // then scatter them to their (arbitrary, non-contiguous) device rows in
+    // one kernel launch each, instead of issuing 2-3 tiny H2D copies per row.
+    std::vector<uint32_t> stg_row_ids(n_changed);
+    std::vector<uint32_t> stg_idx(n_changed * n_neighbors_);
+    std::vector<Data_t> stg_dist(n_changed * n_neighbors_);
+
+#pragma omp parallel for
+    for (size_t k = 0; k < n_changed; ++k) {
+      const Idx_t row_id = neighbor_changed_indices[k];
       const size_t row = static_cast<size_t>(row_id);
       auto row_graph = buffers_.h_graph.data_handle() + row * n_neighbors_;
       auto row_dists = buffers_.h_dists.data_handle() + row * n_neighbors_;
 
-      bool valid_row = false;
+      stg_row_ids[k] = static_cast<uint32_t>(row_id);
+      uint32_t *dst_idx = stg_idx.data() + k * n_neighbors_;
+      Data_t *dst_dist = stg_dist.data() + k * n_neighbors_;
       for (size_t j = 0; j < n_neighbors_; ++j) {
         const int id = row_graph[j].id();
         const bool valid_id =
             (id >= 0 && static_cast<size_t>(id) < n_inserted_instances_) &&
             (static_cast<size_t>(id) != row);
-        valid_row = valid_row || valid_id;
 
-        h_neighbor_row[j] = valid_id ? static_cast<Idx_t>(id)
-                                     : std::numeric_limits<Idx_t>::max();
-        h_dist_row[j] =
+        dst_idx[j] = valid_id ? static_cast<uint32_t>(id)
+                             : std::numeric_limits<uint32_t>::max();
+        dst_dist[j] =
             valid_id ? row_dists[j] : std::numeric_limits<Data_t>::max();
       }
+    }
 
-      raft::copy(neighbor_indices + row * neighbor_indices_block_size_,
-                 h_neighbor_row.data(), n_neighbors_, stream);
-      raft::copy(neighbor_distances + row * neighbor_dists_block_size_,
-                 h_dist_row.data(), n_neighbors_, stream);
+    utils::scatter_rows_host<uint32_t, uint32_t>(
+        reinterpret_cast<uint32_t *>(neighbor_indices),
+        neighbor_indices_block_size_, stg_row_ids.data(), stg_idx.data(),
+        n_neighbors_, static_cast<uint32_t>(n_changed),
+        buffers_.sync_row_ids_scratch_.data_handle(),
+        buffers_.sync_idx_scratch_.data_handle(),
+        rmm::cuda_stream_view(stream));
+    utils::scatter_rows_host<Data_t, uint32_t>(
+        neighbor_distances, neighbor_dists_block_size_, stg_row_ids.data(),
+        stg_dist.data(), n_neighbors_, static_cast<uint32_t>(n_changed),
+        buffers_.sync_row_ids_scratch_.data_handle(),
+        buffers_.sync_dist_scratch_.data_handle(),
+        rmm::cuda_stream_view(stream));
 
+    // valid_row (any real, non-self neighbor survived filtering above) is
+    // exactly "the sentinel wasn't written to every slot of the row".
+    affected_indices.reserve(affected_indices.size() + n_changed);
+    std::vector<uint32_t> stg_dirty_row_ids;
+    stg_dirty_row_ids.reserve(n_changed);
+    for (size_t k = 0; k < n_changed; ++k) {
+      const uint32_t *row_idx = stg_idx.data() + k * n_neighbors_;
+      bool valid_row = false;
+      for (size_t j = 0; j < n_neighbors_; ++j) {
+        if (row_idx[j] != std::numeric_limits<uint32_t>::max()) {
+          valid_row = true;
+          break;
+        }
+      }
       if (valid_row) {
-        raft::copy(neighbor_indices + row * neighbor_indices_block_size_ +
-                       (neighbor_indices_block_size_ - 1),
-                   &dirty_flag_one, 1, stream);
-        affected_indices.push_back(row_id);
+        stg_dirty_row_ids.push_back(stg_row_ids[k]);
+        affected_indices.push_back(neighbor_changed_indices[k]);
       }
     }
+
+    const std::vector<uint32_t> stg_dirty_ones(stg_dirty_row_ids.size(), 1u);
+    utils::scatter_rows_host<uint32_t, uint32_t>(
+        reinterpret_cast<uint32_t *>(neighbor_indices) + n_neighbors_,
+        neighbor_indices_block_size_, stg_dirty_row_ids.data(),
+        stg_dirty_ones.data(), 1, static_cast<uint32_t>(stg_dirty_row_ids.size()),
+        buffers_.sync_row_ids_scratch_.data_handle(),
+        buffers_.sync_idx_scratch_.data_handle(),
+        rmm::cuda_stream_view(stream));
+
     cudaStreamSynchronize(stream);
   }
+  lap("sync_knn_rows");
 
   return static_cast<size_t>(new_edges.size());
 }
