@@ -191,21 +191,24 @@ def compare_e2e(base: dict, opt: dict, base_path: str, opt_path: str) -> None:
     row_time("model cumul wall time (s)",
              base.get("cumulative_model_wall_time_sec"),
              opt.get("cumulative_model_wall_time_sec"))
-    print(f"  {'  total runs':<30} {str(base.get('total_runs', 'n/a')):>13}  "
-          f"{str(opt.get('total_runs', 'n/a')):>13}")
+    # n_runs (new format) or total_runs (old format)
+    bn_runs = base.get("n_runs") or base.get("total_runs", "n/a")
+    on_runs = opt.get("n_runs") or opt.get("total_runs", "n/a")
+    print(f"  {'  total runs':<30} {str(bn_runs):>13}  {str(on_runs):>13}")
     print(f"  {'  stop reason':<30} {str(base.get('stop_reason', 'n/a')):>13}  "
           f"{str(opt.get('stop_reason', 'n/a')):>13}")
 
     _section("PHASE TIMES (cumulative seconds)")
     for ph in ("insertion", "update", "embedding"):
-        bv = base.get("phase_times_sec", {}).get(ph)
-        ov = opt.get("phase_times_sec", {}).get(ph)
+        # new format: summary.phase_times_sec; old format: phase_times_sec
+        bv = (base.get("summary") or base).get("phase_times_sec", {}).get(ph)
+        ov = (opt.get("summary") or opt).get("phase_times_sec", {}).get(ph)
         row_time(f"  {ph}", bv, ov)
 
     _section("PHASE FRACTIONS")
     for ph in ("insertion", "update", "embedding"):
-        bv = base.get("phase_fractions", {}).get(ph)
-        ov = opt.get("phase_fractions", {}).get(ph)
+        bv = (base.get("summary") or base).get("phase_fractions", {}).get(ph)
+        ov = (opt.get("summary") or opt).get("phase_fractions", {}).get(ph)
         bvp = bv * 100 if bv is not None else None
         ovp = ov * 100 if ov is not None else None
         bs, os_, _ = _delta(bvp, ovp)
@@ -213,20 +216,15 @@ def compare_e2e(base: dict, opt: dict, base_path: str, opt_path: str) -> None:
 
     _section("THROUGHPUT (pts/s, higher is better)")
     for ph in ("insertion", "update", "embedding"):
-        bv = base.get("throughput_per_sec", {}).get(ph)
-        ov = opt.get("throughput_per_sec", {}).get(ph)
+        bv = (base.get("summary") or base).get("throughput_per_sec", {}).get(ph)
+        ov = (opt.get("summary") or opt).get("throughput_per_sec", {}).get(ph)
         row_tp(f"  {ph}", bv, ov)
 
-    _section("QUALITY")
-    bq = base.get("quality", {})
-    oq = opt.get("quality", {})
+    _section("FINAL QUALITY")
+    # new format: final_quality; old format: quality
+    bq = base.get("final_quality") or base.get("quality") or {}
+    oq = opt.get("final_quality") or opt.get("quality") or {}
     row_qual("  NNG recall", bq.get("nng_recall"), oq.get("nng_recall"), higher_is_better=True)
-    if bq.get("nng_recall_baseline_mean") or oq.get("nng_recall_baseline_mean"):
-        print(f"  {'  vs NND baseline (Δ)':<30} "
-              f"{_fmt(bq.get('nng_recall_vs_baseline'))}  "
-              f"{_fmt(oq.get('nng_recall_vs_baseline'))}")
-    print(f"  {'  recall method':<30} {str(bq.get('method', 'n/a')):>13}  "
-          f"{str(oq.get('method', 'n/a')):>13}")
     if bq.get("fidelity") is not None or oq.get("fidelity") is not None:
         row_qual("  Fidelity", bq.get("fidelity"), oq.get("fidelity"), higher_is_better=True)
         if bq.get("fidelity_baseline_mean") or oq.get("fidelity_baseline_mean"):

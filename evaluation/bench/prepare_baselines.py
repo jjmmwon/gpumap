@@ -1,23 +1,27 @@
 """
-prepare_baselines.py — Build baseline data for fidelity and NNG recall evaluation.
+prepare_baselines.py — Build baseline data for benchmark evaluation.
 
 Outputs saved to data/{dataset}/baselines/:
-  original_nn_infos.npz       — brute-force KNN in original feature space
+  original_nn_infos.npz       — brute-force exact KNN in original feature space
+  nng_recall_baseline.json    — NNDescent ANN recall vs exact KNN (n_trials runs, individual + mean + std)
   ground_truth_neighbors.npz  — KNN union from repeated UMAP runs (fidelity ground truth)
-  nng_recall_baseline.json    — NNDescent graph recall vs brute-force (n_trials runs)
-  umap_fidelity_baseline.json — UMAP fidelity vs ground truth (n_fidelity_runs runs)
+  umap_fidelity_baseline.json — UMAP fidelity vs ground truth (n_fidelity_runs runs, individual + mean + std)
   params.json                 — parameters used to generate these files
 
 Phases (run all by default, or select via --phases):
   knn           → original_nn_infos.npz
-  nng_recall    → nng_recall_baseline.json  (requires knn)
+  nng_recall    → nng_recall_baseline.json   (requires knn)
   ground_truth  → ground_truth_neighbors.npz (requires knn)
   fidelity      → umap_fidelity_baseline.json (requires knn + ground_truth)
 
+Ground truth convergence criterion (SMA of h/k):
+  h/k = mean fraction of neighbors that are new additions to the union per run.
+  Stops when SMA(h/k, window=5) <= threshold (default 0.2) or --gt-max-runs reached.
+
 Usage (from core/):
     python -m evaluation.bench.prepare_baselines --dataset mnist
-    python -m evaluation.bench.prepare_baselines --dataset mnist --n-umap-runs 50 --n-trials 5
-    python -m evaluation.bench.prepare_baselines --dataset mnist --phases ground_truth fidelity
+    python -m evaluation.bench.prepare_baselines --dataset mnist --n-trials 5 --gt-max-runs 300
+    python -m evaluation.bench.prepare_baselines --dataset mnist --phases nng_recall
     python -m evaluation.bench.prepare_baselines --dataset mnist --force
 """
 
@@ -26,9 +30,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-import os
 import sys
-import tempfile
 import time
 from pathlib import Path
 from typing import Any
@@ -41,26 +43,55 @@ for _p in (str(REPO_ROOT), str(PYTHON_DIR)):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from gpumap import GPUMAP, GPUMAPParams  # noqa: E402
-from gpumap.gpumap import find_ab_params  # noqa: E402
-from gpumap.data_loader import NumpyDataLoader  # noqa: E402
-from gpumap.schedule import WeightedStrategy, DefaultLinearEstimator  # noqa: E402
-from evaluation.run_progressive_gpumap import (  # noqa: E402
+import cupy as cp  # noqa: E402
+from cuvs.neighbors import nn_descent  # noqa: E402
+from evaluation.runner import (  # noqa: E402
     resolve_dataset_path,
-    to_numpy,
     DEFAULT_DATA_ROOT,
 )
-from evaluation.utils import (  # noqa: E402
-    compute_knn_indices_and_distances,
-    compute_umap_embedding,
-    compute_ground_truth_neighbors,
-)
+from evaluation.utils import compute_knn_indices_and_distances  # noqa: E402
 from evaluation.evaluate_emb_certainty import eval_emb_certainty  # noqa: E402
 
 LOG = logging.getLogger("bench.prepare_baselines")
 
 ALL_PHASES = ["knn", "nng_recall", "ground_truth", "fidelity"]
-RECALL_SUBSAMPLE = 10_000   # rows used for NNG recall (brute-force is O(n²))
+
+
+def _build_umap_runner(data: np.ndarray, n_neighbors: int, n_components: int = 2):
+    """
+    Build a UMAP runner with no precomputed KNN, so each call fits its own
+    fresh approximate KNN graph internally (in addition to a fresh random
+    init). This intentionally does NOT reuse a fixed feature-space KNN graph
+    across repeated runs: ground truth / fidelity-baseline diversity must
+    come from both KNN-graph and init variance, not init variance alone,
+    otherwise the resulting neighbor union is an artificially narrow target.
+    """
+    try:
+        data_gpu = cp.asarray(data, dtype=cp.float32)
+        from cuml.manifold import UMAP as CuUMAP
+
+        def run_umap() -> np.ndarray:
+            emb = CuUMAP(
+                n_neighbors=n_neighbors, n_components=n_components, init="random"
+            ).fit_transform(data_gpu)
+            return cp.asnumpy(emb).astype(np.float32)
+
+        return run_umap
+    except Exception as exc:
+        LOG.warning("cuML UMAP unavailable (%s); falling back to umap-learn", exc)
+        import umap
+
+        def run_umap() -> np.ndarray:
+            return (
+                umap.UMAP(
+                    n_neighbors=n_neighbors, n_components=n_components, init="random"
+                )
+                .fit_transform(data)
+                .astype(np.float32)
+            )
+
+        return run_umap
+RECALL_SUBSAMPLE = 10_000
 
 
 def _setup_logger(output_dir: Path) -> None:
@@ -68,30 +99,6 @@ def _setup_logger(output_dir: Path) -> None:
     fh = logging.FileHandler(output_dir / "prepare_baselines.log", encoding="utf-8")
     fh.setFormatter(fmt)
     LOG.addHandler(fh)
-
-
-def _build_gpumap_model(data: np.ndarray, n_neighbors: int) -> GPUMAP:
-    tmp = tempfile.NamedTemporaryFile(suffix=".npy", delete=False)
-    np.save(tmp.name, data)
-    tmp.close()
-
-    loader = NumpyDataLoader("baselines", tmp.name)
-    os.unlink(tmp.name)
-
-    params = GPUMAPParams()
-    params.n_instances = loader.n_instances
-    params.n_features = loader.n_features
-    params.n_neighbors = n_neighbors
-    params.a, params.b = find_ab_params(1.0, params.min_dist)
-
-    strategy = WeightedStrategy(
-        n_instances=loader.n_instances,
-        n_neighbors=n_neighbors,
-        insertion_estimator=DefaultLinearEstimator(),
-        update_estimator=DefaultLinearEstimator(),
-        embedding_estimator=DefaultLinearEstimator(),
-    )
-    return GPUMAP(data_loader=loader, params=params, strategy=strategy)
 
 
 # ── Phase: brute-force KNN ─────────────────────────────────────────────────────
@@ -119,7 +126,7 @@ def phase_original_knn(
     return indices, distances
 
 
-# ── Phase: NNDescent recall baseline ──────────────────────────────────────────
+# ── Phase: NNDescent recall ───────────────────────────────────────────────────
 
 
 def phase_nng_recall(
@@ -131,8 +138,9 @@ def phase_nng_recall(
     force: bool = False,
 ) -> dict[str, Any]:
     """
-    Run GPUMAP's insertion phase n_trials times on the full dataset and compute
-    recall of the resulting NNDescent graph against brute-force exact KNN.
+    Build NNDescent graph n_trials times using cuvs.neighbors.nn_descent.
+    Each run: compute recall of the ANN graph vs brute-force exact KNN.
+    Saves individual recall values + mean + std.
     """
     out_path = output_dir / "nng_recall_baseline.json"
     if out_path.exists() and not force:
@@ -141,25 +149,28 @@ def phase_nng_recall(
             return json.load(f)
 
     n = len(data)
+    k = n_neighbors
     n_check = min(RECALL_SUBSAMPLE, n)
-    exact_sub = exact_indices[:n_check]  # (n_check, k)
-    k = exact_sub.shape[1]
+    exact_sub = exact_indices[:n_check, :k].astype(np.int32)
 
     LOG.info(
-        "NNDescent recall baseline: %d trials  n=%d  k=%d  subsample=%d",
+        "NNDescent recall (cuvs): %d trials  n=%d  k=%d  subsample=%d",
         n_trials, n, k, n_check,
+    )
+
+    data_gpu = cp.asarray(np.ascontiguousarray(data, dtype=np.float32))
+    index_params = nn_descent.IndexParams(
+        graph_degree=k,
+        intermediate_graph_degree=2 * k,
     )
 
     recalls: list[float] = []
     for trial in range(n_trials):
-        LOG.info("  trial %d/%d: inserting %d points...", trial + 1, n_trials, n)
+        LOG.info("  trial %d/%d ...", trial + 1, n_trials)
         t0 = time.perf_counter()
-        model = _build_gpumap_model(data, n_neighbors)
-        try:
-            model.run_with_n_ops(n, 0, 0)
-            nng = to_numpy(model.get_neighbor_indices())  # (n, k)
-        finally:
-            model.close()
+
+        index = nn_descent.build(index_params, data_gpu)
+        nng = np.asarray(index.graph).astype(np.int32)  # (n, graph_degree)
 
         nng_sub = nng[:n_check, :k]
         valid = (nng_sub >= 0) & (nng_sub < n)
@@ -167,10 +178,7 @@ def phase_nng_recall(
         hit = (nng_masked[:, :, None] == exact_sub[:, None, :]).any(axis=2)
         recall = float(hit[valid[:, : hit.shape[1]]].mean()) if valid.any() else 0.0
         recalls.append(recall)
-        LOG.info(
-            "  trial %d: recall=%.4f  elapsed=%.1fs",
-            trial + 1, recall, time.perf_counter() - t0,
-        )
+        LOG.info("    recall=%.4f  elapsed=%.1fs", recall, time.perf_counter() - t0)
 
     result: dict[str, Any] = {
         "n_neighbors": n_neighbors,
@@ -189,61 +197,157 @@ def phase_nng_recall(
     return result
 
 
-# ── Phase: ground truth neighbor union ────────────────────────────────────────
+# ── Phase: ground truth neighbor union (SMA convergence) ─────────────────────
+
+_UNION_INIT_COLS_PER_RUN = 20  # initial union capacity = this many runs worth
+_UNION_EXPAND_THR = 0.9        # expand union array when 90% full
+_HK_CHUNK = 8_192              # points processed per chunk in _hk_update_union
+
+GT_DEFAULT_MAX_RUNS = 300
+GT_DEFAULT_MA_WINDOW = 5
+GT_DEFAULT_MA_THRESHOLD = 0.2
+
+
+def _hk_update_union(
+    union: np.ndarray,
+    counts: np.ndarray,
+    new_knn: np.ndarray,
+) -> float:
+    """
+    Update union in-place with new_knn neighbors.
+    Returns mean h/k = (total new unique neighbors added) / (n * k).
+    """
+    n, k = new_knn.shape
+    total_new = 0
+
+    for s in range(0, n, _HK_CHUNK):
+        e = min(s + _HK_CHUNK, n)
+        c_chunk = counts[s:e]     # (chunk,)
+        knn_chunk = new_knn[s:e]  # (chunk, k)
+        max_c = int(c_chunk.max()) if c_chunk.size > 0 else 0
+
+        is_new = np.ones((e - s, k), dtype=bool)
+        if max_c > 0:
+            u_chunk = union[s:e, :max_c]   # (chunk, max_c)
+            for j in range(k):
+                is_new[:, j] = ~(knn_chunk[:, j:j+1] == u_chunk).any(axis=1)
+
+        total_new += int(is_new.sum())
+
+        for j in range(k):
+            rel_pts = np.where(is_new[:, j])[0]
+            if rel_pts.size == 0:
+                continue
+            abs_pts = rel_pts + s
+            in_bounds = counts[abs_pts] < union.shape[1]
+            valid = abs_pts[in_bounds]
+            if valid.size == 0:
+                continue
+            vc = counts[valid]
+            union[valid, vc] = new_knn[valid, j]
+            counts[valid] += 1
+
+    return total_new / (n * k)
 
 
 def phase_ground_truth(
     data: np.ndarray,
-    orig_indices: np.ndarray,
-    orig_distances: np.ndarray,
     n_neighbors: int,
-    n_umap_runs: int,
+    gt_max_runs: int,
+    gt_ma_window: int,
+    gt_ma_threshold: float,
     output_dir: Path,
     force: bool = False,
 ) -> np.ndarray:
     """
-    Run UMAP n_umap_runs times and accumulate the union of KNN neighborhoods
-    in embedding space. The union is the ground truth for fidelity evaluation.
+    Run UMAP up to gt_max_runs times, accumulating the union of KNN neighborhoods.
+    Stops early when SMA(h/k, window=gt_ma_window) <= gt_ma_threshold (convergence).
 
-    Output shape: (n, k * n_umap_runs + 1) where the last column is valid count.
+    h/k = mean fraction of each run's k neighbors that are new to the union.
+
+    Output: (n, max_unique + 1) where the last column = per-point unique count.
+    Also saves h/k convergence history as 'convergence_{k}' key in the npz.
     """
     out_path = output_dir / "ground_truth_neighbors.npz"
     key = f"k_{n_neighbors}"
+    convergence_key = f"convergence_{n_neighbors}"
     if out_path.exists() and not force:
         with np.load(out_path) as f:
             if key in f.files:
                 LOG.info("Loading cached ground_truth_neighbors.npz (key=%s)", key)
                 return f[key].astype(np.int32)
 
-    LOG.info(
-        "Building ground truth: %d UMAP runs, k=%d, n=%d",
-        n_umap_runs, n_neighbors, len(data),
-    )
-    knn_indices = orig_indices[:, :n_neighbors].astype(np.int32)
-    knn_distances = orig_distances[:, :n_neighbors].astype(np.float32)
-    precomputed_knn = (knn_indices, knn_distances)
+    n = len(data)
+    k = n_neighbors
+    init_cols = k * _UNION_INIT_COLS_PER_RUN
+    union = np.full((n, init_cols), -1, dtype=np.int32)
+    counts = np.zeros(n, dtype=np.int32)
+    run_umap = _build_umap_runner(data, k, n_components=2)
 
-    emb_nn_list: list[np.ndarray] = []
-    for i in range(n_umap_runs):
-        LOG.info("  UMAP run %d/%d ...", i + 1, n_umap_runs)
+    hk_history: list[float] = []
+    stop_reason = f"max_runs={gt_max_runs}"
+
+    LOG.info(
+        "Building ground truth: max_runs=%d  ma_window=%d  ma_threshold=%.2f  k=%d  n=%d",
+        gt_max_runs, gt_ma_window, gt_ma_threshold, k, n,
+    )
+
+    for run_idx in range(1, gt_max_runs + 1):
+        LOG.info("  GT run %d/%d ...", run_idx, gt_max_runs)
         t0 = time.perf_counter()
-        emb = compute_umap_embedding(data, precomputed_knn)
-        idx, _ = compute_knn_indices_and_distances(emb, n_neighbors)
-        emb_nn_list.append(idx[:, :n_neighbors].astype(np.int32))
-        LOG.info("    done in %.1fs", time.perf_counter() - t0)
+        emb = run_umap()
+        idx, _ = compute_knn_indices_and_distances(emb, k)
 
-    ground_truth = compute_ground_truth_neighbors(emb_nn_list, n_neighbors)
+        # Expand union array if nearly full
+        cur_max = int(counts.max())
+        if cur_max >= union.shape[1] * _UNION_EXPAND_THR:
+            new_cols = min(union.shape[1] * 2, gt_max_runs * k)
+            if new_cols > union.shape[1]:
+                LOG.info("  Expanding union: %d → %d cols", union.shape[1], new_cols)
+                new_union = np.full((n, new_cols), -1, dtype=np.int32)
+                new_union[:, :union.shape[1]] = union
+                union = new_union
+
+        mean_hk = _hk_update_union(union, counts, idx[:, :k])
+        hk_history.append(mean_hk)
+
+        LOG.info(
+            "    h/k=%.4f  mean_unique=%.1f  elapsed=%.1fs",
+            mean_hk, float(counts.mean()), time.perf_counter() - t0,
+        )
+
+        if len(hk_history) >= gt_ma_window:
+            sma = float(np.mean(hk_history[-gt_ma_window:]))
+            if sma <= gt_ma_threshold:
+                stop_reason = f"converged (run={run_idx}, sma={sma:.4f})"
+                LOG.info(
+                    "  Converged at run %d: SMA(h/k, window=%d)=%.4f <= %.2f",
+                    run_idx, gt_ma_window, sma, gt_ma_threshold,
+                )
+                break
+
+    actual_max = int(counts.max())
+    ground_truth = np.concatenate(
+        [union[:, :actual_max], counts[:, None].astype(np.int32)],
+        axis=1,
+    ).astype(np.int32)
+
     LOG.info(
-        "  union built: shape=%s  mean_unique=%.1f",
-        ground_truth.shape, float(ground_truth[:, -1].mean()),
+        "  union complete: shape=%s  mean_unique=%.1f  stop=%s",
+        ground_truth.shape, float(counts.mean()), stop_reason,
     )
 
-    # Merge with any existing keys (other k values) to avoid overwriting
-    existing: dict[str, np.ndarray] = {}
+    # Merge with any existing keys to avoid overwriting other k values
+    save_data: dict[str, np.ndarray] = {
+        key: ground_truth,
+        convergence_key: np.array(hk_history, dtype=np.float32),
+    }
     if out_path.exists():
         with np.load(out_path) as f:
-            existing = {k: f[k] for k in f.files if k != key}
-    np.savez(out_path, **existing, **{key: ground_truth})
+            for fname in f.files:
+                if fname not in (key, convergence_key):
+                    save_data[fname] = f[fname]
+    np.savez(out_path, **save_data)  # type: ignore[arg-type]
     LOG.info("Saved → %s  key=%s", out_path.name, key)
     return ground_truth
 
@@ -253,8 +357,6 @@ def phase_ground_truth(
 
 def phase_fidelity_baseline(
     data: np.ndarray,
-    orig_indices: np.ndarray,
-    orig_distances: np.ndarray,
     ground_truth: np.ndarray,
     n_neighbors: int,
     n_fidelity_runs: int,
@@ -276,15 +378,13 @@ def phase_fidelity_baseline(
         "UMAP fidelity baseline: %d runs, k=%d, n=%d",
         n_fidelity_runs, n_neighbors, len(data),
     )
-    knn_indices = orig_indices[:, :n_neighbors].astype(np.int32)
-    knn_distances = orig_distances[:, :n_neighbors].astype(np.float32)
-    precomputed_knn = (knn_indices, knn_distances)
+    run_umap = _build_umap_runner(data, n_neighbors, n_components=2)
 
     fidelity_values: list[float] = []
     for i in range(n_fidelity_runs):
         LOG.info("  fidelity run %d/%d ...", i + 1, n_fidelity_runs)
         t0 = time.perf_counter()
-        emb = compute_umap_embedding(data, precomputed_knn)
+        emb = run_umap()
         emb_idx, _ = compute_knn_indices_and_distances(emb, n_neighbors)
         score, _ = eval_emb_certainty(emb_idx[:, :n_neighbors], ground_truth)
         fidelity_values.append(float(score))
@@ -322,16 +422,24 @@ def parse_args() -> argparse.Namespace:
         help="Number of neighbors for KNN / UMAP (default: 15)",
     )
     p.add_argument(
-        "--n-umap-runs", type=int, default=30, metavar="N",
-        help="UMAP runs for building ground truth union (default: 30)",
+        "--gt-max-runs", type=int, default=GT_DEFAULT_MAX_RUNS, metavar="N",
+        help=f"Ground truth: max UMAP runs before forced stop (default: {GT_DEFAULT_MAX_RUNS})",
+    )
+    p.add_argument(
+        "--gt-ma-window", type=int, default=GT_DEFAULT_MA_WINDOW, metavar="W",
+        help=f"Ground truth: SMA window for h/k convergence (default: {GT_DEFAULT_MA_WINDOW})",
+    )
+    p.add_argument(
+        "--gt-ma-threshold", type=float, default=GT_DEFAULT_MA_THRESHOLD, metavar="T",
+        help=f"Ground truth: SMA threshold for convergence (default: {GT_DEFAULT_MA_THRESHOLD})",
     )
     p.add_argument(
         "--n-trials", type=int, default=5, metavar="N",
-        help="NNDescent insertion trials for recall baseline (default: 5)",
+        help="NNDescent recall: number of independent runs (default: 5)",
     )
     p.add_argument(
         "--n-fidelity-runs", type=int, default=10, metavar="N",
-        help="UMAP runs for UMAP fidelity baseline (default: 10)",
+        help="UMAP fidelity: number of independent runs (default: 10)",
     )
     p.add_argument(
         "--phases",
@@ -376,8 +484,8 @@ def main() -> None:
     _setup_logger(output_dir)
 
     LOG.info(
-        "prepare_baselines: dataset=%s  k=%d  umap_runs=%d  trials=%d  phases=%s",
-        args.dataset, args.n_neighbors, args.n_umap_runs, args.n_trials, sorted(phases),
+        "prepare_baselines: dataset=%s  k=%d  n_trials=%d  gt_max_runs=%d  phases=%s",
+        args.dataset, args.n_neighbors, args.n_trials, args.gt_max_runs, sorted(phases),
     )
     LOG.info("  data   : %s", npy_path)
     LOG.info("  output : %s", output_dir)
@@ -390,7 +498,9 @@ def main() -> None:
                 {
                     "dataset": args.dataset,
                     "n_neighbors": args.n_neighbors,
-                    "n_umap_runs": args.n_umap_runs,
+                    "gt_max_runs": args.gt_max_runs,
+                    "gt_ma_window": args.gt_ma_window,
+                    "gt_ma_threshold": args.gt_ma_threshold,
                     "n_trials": args.n_trials,
                     "n_fidelity_runs": args.n_fidelity_runs,
                     "phases": sorted(phases),
@@ -415,7 +525,9 @@ def main() -> None:
     if "nng_recall" in phases:
         assert orig_indices is not None
         phase_nng_recall(
-            data, orig_indices, args.n_neighbors,
+            data=data,
+            exact_indices=orig_indices,
+            n_neighbors=args.n_neighbors,
             n_trials=args.n_trials,
             output_dir=output_dir,
             force=args.force,
@@ -424,11 +536,12 @@ def main() -> None:
     # Phase: ground_truth
     ground_truth = None
     if "ground_truth" in phases or "fidelity" in phases:
-        assert orig_indices is not None and orig_distances is not None
         ground_truth = phase_ground_truth(
-            data, orig_indices, orig_distances,
+            data,
             n_neighbors=args.n_neighbors,
-            n_umap_runs=args.n_umap_runs,
+            gt_max_runs=args.gt_max_runs,
+            gt_ma_window=args.gt_ma_window,
+            gt_ma_threshold=args.gt_ma_threshold,
             output_dir=output_dir,
             force=args.force,
         )
@@ -447,9 +560,8 @@ def main() -> None:
                     sys.exit(1)
                 ground_truth = f[key].astype(np.int32)
 
-        assert orig_indices is not None and orig_distances is not None
         phase_fidelity_baseline(
-            data, orig_indices, orig_distances,
+            data,
             ground_truth=ground_truth,
             n_neighbors=args.n_neighbors,
             n_fidelity_runs=args.n_fidelity_runs,
@@ -471,10 +583,12 @@ def _print_summary(output_dir: Path, dataset: str) -> None:
     if recall_path.exists():
         with open(recall_path) as f:
             r = json.load(f)
+        vals = "  ".join(f"{v:.4f}" for v in r["recalls"])
         print(
-            f"  NND recall  : mean={r['mean_recall']:.4f}  std={r['std_recall']:.6f}"
+            f"  NNDescent recall: mean={r['mean_recall']:.4f}  std={r['std_recall']:.6f}"
             f"  (n_trials={r['n_trials']}, k={r['n_neighbors']})"
         )
+        print(f"    values: [{vals}]")
 
     fidelity_path = output_dir / "umap_fidelity_baseline.json"
     if fidelity_path.exists():

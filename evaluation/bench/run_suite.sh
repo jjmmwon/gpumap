@@ -47,8 +47,10 @@ E2E_LATENCY="${E2E_LATENCY:-10}"
 
 # ── Baseline preparation settings ──────────────────────────────────────────
 PREPARE_BASELINES="${PREPARE_BASELINES:-0}"
-BASELINE_N_UMAP_RUNS="${BASELINE_N_UMAP_RUNS:-30}"
 BASELINE_N_TRIALS="${BASELINE_N_TRIALS:-5}"
+BASELINE_GT_MAX_RUNS="${BASELINE_GT_MAX_RUNS:-300}"
+BASELINE_GT_MA_WINDOW="${BASELINE_GT_MA_WINDOW:-5}"
+BASELINE_GT_MA_THRESHOLD="${BASELINE_GT_MA_THRESHOLD:-0.2}"
 BASELINE_N_FIDELITY_RUNS="${BASELINE_N_FIDELITY_RUNS:-10}"
 
 # ── Run ────────────────────────────────────────────────────────────────────
@@ -62,16 +64,17 @@ for DATASET in $DATASETS; do
     echo "============================================================"
 
     MICRO_OUT="$RESULTS_DIR/micro_${DATASET}_${TAG}.json"
-    E2E_OUT="$RESULTS_DIR/e2e_${DATASET}_${E2E_STRATEGY}_${TAG}.json"
 
     # ── 0. Baseline preparation (optional) ────────────────────────────────
     if [[ "$PREPARE_BASELINES" == "1" ]]; then
         echo ""
-        echo ">>> [0/2] Baseline preparation  (umap_runs=$BASELINE_N_UMAP_RUNS, trials=$BASELINE_N_TRIALS)"
+        echo ">>> [0/2] Baseline preparation  (n_trials=$BASELINE_N_TRIALS, gt_max_runs=$BASELINE_GT_MAX_RUNS)"
         "$PYTHON_BIN" -m evaluation.bench.prepare_baselines \
             --dataset "$DATASET" \
-            --n-umap-runs "$BASELINE_N_UMAP_RUNS" \
             --n-trials "$BASELINE_N_TRIALS" \
+            --gt-max-runs "$BASELINE_GT_MAX_RUNS" \
+            --gt-ma-window "$BASELINE_GT_MA_WINDOW" \
+            --gt-ma-threshold "$BASELINE_GT_MA_THRESHOLD" \
             --n-fidelity-runs "$BASELINE_N_FIDELITY_RUNS"
         echo "    Baselines saved: data/${DATASET}/baselines/"
     fi
@@ -88,13 +91,13 @@ for DATASET in $DATASETS; do
 
     # ── 2. E2E benchmark ───────────────────────────────────────────────────
     echo ""
-    echo ">>> [2/2] E2E benchmark  (strategy=$E2E_STRATEGY, latency=${E2E_LATENCY}s)"
+    echo ">>> [2/2] E2E benchmark  (strategy=$E2E_STRATEGY, latency=${E2E_LATENCY}s, tag=$TAG)"
     "$PYTHON_BIN" -m evaluation.bench.e2e \
         --dataset "$DATASET" \
         --strategy "$E2E_STRATEGY" \
         --target-latency "$E2E_LATENCY" \
-        --output "$E2E_OUT"
-    echo "    Saved: $E2E_OUT"
+        --tag "$TAG"
+    echo "    Saved: progressive_results/${DATASET}_${E2E_STRATEGY}_${E2E_LATENCY}_${TAG}_*/"
 
     echo ""
     echo ">>> Done: $DATASET / $TAG"

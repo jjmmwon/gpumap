@@ -35,7 +35,7 @@ from gpumap import GPUMAP, GPUMAPParams  # noqa: E402
 from gpumap.gpumap import find_ab_params  # noqa: E402
 from gpumap.data_loader import NumpyDataLoader  # noqa: E402
 from gpumap.schedule import WeightedStrategy, DefaultLinearEstimator  # noqa: E402
-from evaluation.run_progressive_gpumap import (  # noqa: E402
+from evaluation.runner import (  # noqa: E402
     resolve_dataset_path,
     DEFAULT_DATA_ROOT,
 )
