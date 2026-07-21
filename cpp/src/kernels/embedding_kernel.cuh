@@ -459,20 +459,6 @@ float compute_rounding_factor(const int *coo_rows, int nnz, int n, float alpha,
   return std::ldexp(1.0f, exp);
 }
 
-// Shuffles (coo_rows, coo_cols, coo_vals) together as a zip.
-// Matches cuML thrust::shuffle on the zip of (head, tail, epochs_per_sample).
-void shuffle_edges(int *coo_rows, int *coo_cols, float *coo_vals, int nnz,
-                   uint64_t seed, cudaStream_t stream) {
-  if (nnz <= 1)
-    return;
-  auto first = thrust::make_zip_iterator(
-      cuda::std::make_tuple(thrust::device_pointer_cast(coo_rows),
-                            thrust::device_pointer_cast(coo_cols),
-                            thrust::device_pointer_cast(coo_vals)));
-  thrust::default_random_engine rng(static_cast<uint32_t>(seed));
-  thrust::shuffle(thrust::cuda::par.on(stream), first, first + nnz, rng);
-}
-
 // ─────────────────────────────────────────────────────────────────────────────
 // Kernel 7: make_epochs_per_sample
 // Converts weights → epochs_per_sample in-place.
@@ -758,9 +744,6 @@ void run_optimize_layout(float *embedding, int n, int *coo_rows, int *coo_cols,
                                                             max_w, n_epochs);
   }
   float *eps = coo_vals; // semantic alias
-
-  // Step 4: shuffle edges unconditionally (matches cuML behavior)
-  // shuffle_edges(coo_rows, coo_cols, eps, nnz, seed, stream);
 
   // Step 5: compute gradient rounding factor (matches cuML
   // create_gradient_rounding_factor)

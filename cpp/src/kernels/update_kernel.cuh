@@ -1008,66 +1008,31 @@ size_t UpdateAlgo<Data_t, Idx_t, Index_t>::run(
     static_assert(std::is_same<Idx_t, uint32_t>::value,
                  "sync_knn_rows scatter path assumes Idx_t == uint32_t");
     const size_t n_changed = neighbor_changed_indices.size();
-    // Stage every changed row's (indices, dists) contiguously on the host,
-    // then scatter them to their (arbitrary, non-contiguous) device rows in
-    // one kernel launch each, instead of issuing 2-3 tiny H2D copies per row.
-    std::vector<uint32_t> stg_row_ids(n_changed);
-    std::vector<uint32_t> stg_idx(n_changed * n_neighbors_);
-    std::vector<Data_t> stg_dist(n_changed * n_neighbors_);
 
-#pragma omp parallel for
-    for (size_t k = 0; k < n_changed; ++k) {
-      const Idx_t row_id = neighbor_changed_indices[k];
-      const size_t row = static_cast<size_t>(row_id);
-      auto row_graph = buffers_.h_graph.data_handle() + row * n_neighbors_;
-      auto row_dists = buffers_.h_dists.data_handle() + row * n_neighbors_;
-
-      stg_row_ids[k] = static_cast<uint32_t>(row_id);
-      uint32_t *dst_idx = stg_idx.data() + k * n_neighbors_;
-      Data_t *dst_dist = stg_dist.data() + k * n_neighbors_;
-      for (size_t j = 0; j < n_neighbors_; ++j) {
-        const int id = row_graph[j].id();
-        const bool valid_id =
-            (id >= 0 && static_cast<size_t>(id) < n_inserted_instances_) &&
-            (static_cast<size_t>(id) != row);
-
-        dst_idx[j] = valid_id ? static_cast<uint32_t>(id)
-                             : std::numeric_limits<uint32_t>::max();
-        dst_dist[j] =
-            valid_id ? row_dists[j] : std::numeric_limits<Data_t>::max();
-      }
-    }
-
-    utils::scatter_rows_host<uint32_t, uint32_t>(
+    std::vector<uint8_t> valid_row;
+    utils::stage_and_scatter_knn_rows<Data_t>(
         reinterpret_cast<uint32_t *>(neighbor_indices),
-        neighbor_indices_block_size_, stg_row_ids.data(), stg_idx.data(),
-        n_neighbors_, static_cast<uint32_t>(n_changed),
+        neighbor_indices_block_size_, neighbor_distances,
+        neighbor_dists_block_size_, buffers_.h_graph.data_handle(),
+        buffers_.h_dists.data_handle(), n_neighbors_,
+        reinterpret_cast<uint32_t *>(neighbor_changed_indices.data()),
+        n_changed, n_inserted_instances_,
         buffers_.sync_row_ids_scratch_.data_handle(),
         buffers_.sync_idx_scratch_.data_handle(),
-        rmm::cuda_stream_view(stream));
-    utils::scatter_rows_host<Data_t, uint32_t>(
-        neighbor_distances, neighbor_dists_block_size_, stg_row_ids.data(),
-        stg_dist.data(), n_neighbors_, static_cast<uint32_t>(n_changed),
-        buffers_.sync_row_ids_scratch_.data_handle(),
-        buffers_.sync_dist_scratch_.data_handle(),
+        buffers_.sync_dist_scratch_.data_handle(), valid_row,
         rmm::cuda_stream_view(stream));
 
-    // valid_row (any real, non-self neighbor survived filtering above) is
-    // exactly "the sentinel wasn't written to every slot of the row".
+    // Unlike the initial sync in impl.cuh, the dirty flag here is only ever
+    // raised for rows that gained a real neighbor -- never cleared for rows
+    // that didn't -- since a row's previous dirty state must survive until
+    // some later pass observes it.
     affected_indices.reserve(affected_indices.size() + n_changed);
     std::vector<uint32_t> stg_dirty_row_ids;
     stg_dirty_row_ids.reserve(n_changed);
     for (size_t k = 0; k < n_changed; ++k) {
-      const uint32_t *row_idx = stg_idx.data() + k * n_neighbors_;
-      bool valid_row = false;
-      for (size_t j = 0; j < n_neighbors_; ++j) {
-        if (row_idx[j] != std::numeric_limits<uint32_t>::max()) {
-          valid_row = true;
-          break;
-        }
-      }
-      if (valid_row) {
-        stg_dirty_row_ids.push_back(stg_row_ids[k]);
+      if (valid_row[k]) {
+        stg_dirty_row_ids.push_back(
+            static_cast<uint32_t>(neighbor_changed_indices[k]));
         affected_indices.push_back(neighbor_changed_indices[k]);
       }
     }

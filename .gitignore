@@ -100,6 +100,7 @@ results/
 evaluation/preprocess_results
 evaluation/progressive_results
 evaluation/data
+evaluation/data_scaled
 tests
 # -----------------------------
 # Test files
@@ -111,3 +112,4 @@ tests
 # -----------------------------
 build_scripts.txt
 BENCHMARK.md
+*.ipynb

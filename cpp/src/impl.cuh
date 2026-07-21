@@ -40,8 +40,6 @@ struct GPUMAP::Impl {
   InsertionQueue embedding_new_queue;
   UpdateQueue update_queue;
 
-  static constexpr size_t EMBEDDING_MAX_EPOCH = 200;
-
   // Sequential cursor-based embedding state
   // Stores the id of the last processed instance; next run starts from
   // cursor+1. Initialized to SIZE_MAX so that (cursor+1)%n == 0 on the first
@@ -105,8 +103,8 @@ struct GPUMAP::Impl {
   void sync_knn_rows_to_device(const std::vector<Idx_t> &rows,
                                cudaStream_t stream) {
     static_assert(std::is_same<Idx_t, uint32_t>::value,
-                 "sync_knn_rows_to_device scatter path assumes Idx_t == "
-                 "uint32_t");
+                  "sync_knn_rows_to_device scatter path assumes Idx_t == "
+                  "uint32_t");
     if (rows.empty())
       return;
 
@@ -117,61 +115,32 @@ struct GPUMAP::Impl {
 
     const size_t n = unique_rows.size();
     const size_t k = storage.n_neighbors;
-    // Stage all rows contiguously on the host, then scatter to their
-    // (arbitrary, non-contiguous) device rows in 3 kernel launches total
-    // instead of 3 tiny H2D copies per row.
-    std::vector<uint32_t> stg_idx(n * k);
-    std::vector<Data_t> stg_dist(n * k);
-    std::vector<uint32_t> stg_dirty(n);
-
-#pragma omp parallel for
-    for (size_t i = 0; i < n; ++i) {
-      const size_t row = static_cast<size_t>(unique_rows[i]);
-      auto row_graph =
-          storage.nnd_buffer.h_graph.data_handle() + row * k;
-      auto row_dists =
-          storage.nnd_buffer.h_dists.data_handle() + row * k;
-
-      uint32_t *dst_idx = stg_idx.data() + i * k;
-      Data_t *dst_dist = stg_dist.data() + i * k;
-      bool valid_row = false;
-      for (size_t j = 0; j < k; ++j) {
-        const int id = row_graph[j].id();
-        const bool valid_id =
-            (id >= 0 &&
-             static_cast<size_t>(id) < storage.n_inserted_instances &&
-             static_cast<size_t>(id) != row);
-        valid_row = valid_row || valid_id;
-
-        dst_idx[j] = valid_id ? static_cast<uint32_t>(id)
-                             : std::numeric_limits<uint32_t>::max();
-        dst_dist[j] =
-            valid_id ? row_dists[j] : std::numeric_limits<Data_t>::max();
-      }
-      stg_dirty[i] = valid_row ? 1u : 0u;
-    }
-
     auto &scratch = storage.nnd_buffer;
-    utils::scatter_rows_host<uint32_t, uint32_t>(
+
+    std::vector<uint8_t> valid_row(n);
+    utils::stage_and_scatter_knn_rows<Data_t>(
         reinterpret_cast<uint32_t *>(storage.neighbor_indices.data()),
-        storage.neighbor_indices_block_size,
-        reinterpret_cast<uint32_t *>(unique_rows.data()), stg_idx.data(), k,
-        static_cast<uint32_t>(n), scratch.sync_row_ids_scratch_.data_handle(),
+        storage.neighbor_indices_block_size, storage.neighbor_dists.data(),
+        storage.neighbor_dists_block_size,
+        storage.nnd_buffer.h_graph.data_handle(),
+        storage.nnd_buffer.h_dists.data_handle(), k,
+        reinterpret_cast<uint32_t *>(unique_rows.data()), n,
+        storage.n_inserted_instances,
+        scratch.sync_row_ids_scratch_.data_handle(),
         scratch.sync_idx_scratch_.data_handle(),
+        scratch.sync_dist_scratch_.data_handle(), valid_row,
         rmm::cuda_stream_view(stream));
-    utils::scatter_rows_host<Data_t, uint32_t>(
-        storage.neighbor_dists.data(), storage.neighbor_dists_block_size,
-        reinterpret_cast<uint32_t *>(unique_rows.data()), stg_dist.data(), k,
-        static_cast<uint32_t>(n), scratch.sync_row_ids_scratch_.data_handle(),
-        scratch.sync_dist_scratch_.data_handle(),
-        rmm::cuda_stream_view(stream));
+
+    // Unlike the incremental-update path, this initial sync always writes
+    // the dirty flag (0 or 1) for every row passed in, since these rows have
+    // never been synced to device before.
+    std::vector<uint32_t> stg_dirty(valid_row.begin(), valid_row.end());
     utils::scatter_rows_host<uint32_t, uint32_t>(
         reinterpret_cast<uint32_t *>(storage.neighbor_indices.data()) + k,
         storage.neighbor_indices_block_size,
         reinterpret_cast<uint32_t *>(unique_rows.data()), stg_dirty.data(), 1,
         static_cast<uint32_t>(n), scratch.sync_row_ids_scratch_.data_handle(),
-        scratch.sync_idx_scratch_.data_handle(),
-        rmm::cuda_stream_view(stream));
+        scratch.sync_idx_scratch_.data_handle(), rmm::cuda_stream_view(stream));
   }
 
   GPUMAPResult run(uint32_t n_insertion_ops, uint32_t n_update_ops,
@@ -481,35 +450,10 @@ struct GPUMAP::Impl {
                         coo_cols.data(), coo_vals.data(), actual_nnz,
                         params.alpha, // initial_alpha
                         1.0f,         // gamma (repulsion_strength)
-                        params.a, params.b,
-                        static_cast<int>(EMBEDDING_MAX_EPOCH),
+                        params.a, params.b, static_cast<int>(params.max_epoch),
                         static_cast<int>(params.negative_sample_rate),
                         42ULL, // seed
                         embedding_stream);
-
-    // ── Debug: print point-0 neighbors, distances, embedding ─────────────
-    if (n > 0) {
-      cudaStreamSynchronize(embedding_stream);
-
-      // Neighbors and distances (raw storage, stride = block_size)
-      const int bs_idx = static_cast<int>(storage.neighbor_indices_block_size);
-      const int bs_dst = static_cast<int>(storage.neighbor_dists_block_size);
-      const int k_print = std::min(k, 10); // cap at 10 for readability
-
-      std::vector<Idx_t> h_idx(bs_idx);
-      std::vector<float> h_dst(bs_dst);
-      cudaMemcpy(h_idx.data(), storage.neighbor_indices.data(),
-                 bs_idx * sizeof(Idx_t), cudaMemcpyDeviceToHost);
-      cudaMemcpy(h_dst.data(), storage.neighbor_dists.data(),
-                 bs_dst * sizeof(float), cudaMemcpyDeviceToHost);
-
-      // Embedding (n_components per row, row 0)
-      const int nc = static_cast<int>(params.n_components);
-      std::vector<float> h_emb(nc);
-      cudaMemcpy(h_emb.data(), storage.embedding.data(), nc * sizeof(float),
-                 cudaMemcpyDeviceToHost);
-    }
-    // ─────────────────────────────────────────────────────────────────────
 
     return static_cast<uint32_t>(batch_indices.size());
   }

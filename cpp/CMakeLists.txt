@@ -3,7 +3,6 @@ cmake_minimum_required(VERSION 3.24)
 find_package(CUDAToolkit REQUIRED)
 find_package(rmm   CONFIG REQUIRED)
 find_package(raft  CONFIG REQUIRED)
-find_package(cuvs  CONFIG REQUIRED)
 
 pybind11_add_module(_core MODULE
   ${CMAKE_CURRENT_SOURCE_DIR}/bindings/binding.cu
@@ -21,7 +20,6 @@ target_link_libraries(_core PRIVATE
   CUDA::cudart
   rmm::rmm
   raft::raft
-  cuvs::cuvs
 )
 
 target_compile_definitions(_core PRIVATE

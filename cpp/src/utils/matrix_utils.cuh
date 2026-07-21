@@ -4,6 +4,9 @@
 #include "raft/util/cudart_utils.hpp"
 #include "rmm/cuda_stream_view.hpp"
 #include <cstddef>
+#include <cstdint>
+#include <limits>
+#include <vector>
 
 namespace gpumap {
 namespace utils {
@@ -105,6 +108,69 @@ void scatter_rows_host(T *dst_device, Idx_t dst_row_stride,
       dst_device, dst_row_stride, row_ids_scratch, src_scratch, width,
       n_rows);
   RAFT_CUDA_TRY(cudaGetLastError());
+}
+
+// Stages `n_rows` KNN rows (selected by `row_ids`) from a host-side
+// authoritative graph (row stride == n_neighbors) into contiguous host
+// buffers -- filtering out self-references and out-of-range ids, whose slots
+// become sentinel values -- then scatters the result into
+// `dst_indices`/`dst_dists` (block-strided device matrices) via
+// scatter_rows_host(). `out_valid[i]` reports whether row_ids[i] had at least
+// one valid neighbor survive filtering; callers use this to drive their own
+// dirty-flag bookkeeping, which differs between insertion's initial sync
+// (flag always written) and incremental updates (flag only raised, never
+// cleared).
+//
+// `GraphEntry_t` only needs an `int id() const` accessor (satisfied by
+// InternalID_t); kept as a template parameter so this header does not need to
+// depend on buffers.cuh.
+template <typename Data_t, typename GraphEntry_t>
+void stage_and_scatter_knn_rows(
+    uint32_t *dst_indices, size_t indices_block_size, Data_t *dst_dists,
+    size_t dists_block_size, const GraphEntry_t *h_graph, const Data_t *h_dists,
+    size_t n_neighbors, const uint32_t *row_ids, size_t n_rows,
+    size_t n_inserted_instances, uint32_t *row_ids_scratch,
+    uint32_t *idx_scratch, Data_t *dist_scratch, std::vector<uint8_t> &out_valid,
+    rmm::cuda_stream_view stream) {
+  out_valid.assign(n_rows, 0);
+  if (n_rows == 0)
+    return;
+
+  std::vector<uint32_t> stg_idx(n_rows * n_neighbors);
+  std::vector<Data_t> stg_dist(n_rows * n_neighbors);
+
+#pragma omp parallel for
+  for (size_t i = 0; i < n_rows; ++i) {
+    const size_t row = static_cast<size_t>(row_ids[i]);
+    const GraphEntry_t *row_graph = h_graph + row * n_neighbors;
+    const Data_t *row_dists = h_dists + row * n_neighbors;
+
+    uint32_t *dst_idx = stg_idx.data() + i * n_neighbors;
+    Data_t *dst_dist = stg_dist.data() + i * n_neighbors;
+    bool valid_row = false;
+    for (size_t j = 0; j < n_neighbors; ++j) {
+      const int id = row_graph[j].id();
+      const bool valid_id =
+          (id >= 0 && static_cast<size_t>(id) < n_inserted_instances &&
+           static_cast<size_t>(id) != row);
+      valid_row = valid_row || valid_id;
+
+      dst_idx[j] = valid_id ? static_cast<uint32_t>(id)
+                           : std::numeric_limits<uint32_t>::max();
+      dst_dist[j] =
+          valid_id ? row_dists[j] : std::numeric_limits<Data_t>::max();
+    }
+    out_valid[i] = valid_row ? 1 : 0;
+  }
+
+  scatter_rows_host<uint32_t, uint32_t>(
+      dst_indices, static_cast<uint32_t>(indices_block_size), row_ids,
+      stg_idx.data(), static_cast<uint32_t>(n_neighbors),
+      static_cast<uint32_t>(n_rows), row_ids_scratch, idx_scratch, stream);
+  scatter_rows_host<Data_t, uint32_t>(
+      dst_dists, static_cast<uint32_t>(dists_block_size), row_ids,
+      stg_dist.data(), static_cast<uint32_t>(n_neighbors),
+      static_cast<uint32_t>(n_rows), row_ids_scratch, dist_scratch, stream);
 }
 } // namespace utils
 

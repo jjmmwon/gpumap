@@ -38,7 +38,12 @@ from gpumap import (  # noqa: E402
 )
 
 
-DEFAULT_DATA_ROOT = Path(__file__).resolve().parent / "data"
+RAW_DATA_ROOT = Path(__file__).resolve().parent / "data"
+SCALED_DATA_ROOT = Path(__file__).resolve().parent / "data_scaled"
+# All evaluation entry points load StandardScaler-scaled data by default so that
+# baselines (KNN ground truth, recall) are computed in the same space GPUMAP runs
+# on. See evaluation/bench/build_scaled_data.py to (re)populate SCALED_DATA_ROOT.
+DEFAULT_DATA_ROOT = SCALED_DATA_ROOT
 DEFAULT_OUTPUT_ROOT = Path(__file__).resolve().parent / "progressive_results"
 DEFAULT_MAX_RUNS = 10000
 DEFAULT_MAX_STALLED_RUNS = 5
