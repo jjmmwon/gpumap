@@ -15,6 +15,11 @@ class GPUMAPParams:
     b: float
     alpha: float
     verbose: bool
+    # Accepts/returns a metric name string ("euclidean", "cosine" --
+    # umap-learn style); an int or gpumap.Metric (enum.IntEnum) also works
+    # for the setter. See cpp/bindings/binding.cu for why this isn't a
+    # py::enum_-bound type.
+    metric: str
     n_instances: int
     n_features: int
 

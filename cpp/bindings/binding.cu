@@ -2,14 +2,57 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
+#include <cctype>
+#include <string>
+
 #include "gpumap/gpumap.cuh"
 #include "gpumap_wrapper.cuh"
 
 namespace py = pybind11;
 
+namespace {
+
+std::string metric_to_string(gpumap::Metric m) {
+  switch (m) {
+  case gpumap::Metric::Cosine:
+    return "cosine";
+  case gpumap::Metric::Euclidean:
+  default:
+    return "euclidean";
+  }
+}
+
+// Accepts a metric name string (e.g. "cosine", case-insensitive -- matches
+// umap-learn's `metric=` kwarg style), or a plain int / gpumap.Metric
+// IntEnum (which pybind11 sees as an int either way).
+gpumap::Metric metric_from_object(const py::object &v) {
+  if (py::isinstance<py::str>(v)) {
+    std::string s = v.cast<std::string>();
+    for (char &c : s)
+      c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    if (s == "euclidean")
+      return gpumap::Metric::Euclidean;
+    if (s == "cosine")
+      return gpumap::Metric::Cosine;
+    throw py::value_error("Unknown metric '" + s +
+                          "' -- expected 'euclidean' or 'cosine'");
+  }
+  return static_cast<gpumap::Metric>(v.cast<int>());
+}
+
+} // namespace
+
 PYBIND11_MODULE(_core, m) {
   m.doc() = "gpumap CUDA extension module";
 
+  // NOTE: gpumap::Metric is bound as a string-valued property (not
+  // py::enum_) -- py::enum_<gpumap::Metric>'s generated value-constructor
+  // triggers an ambiguous-template-instantiation error under this project's
+  // nvcc/g++ toolchain (a known pybind11/nvcc incompatibility, unrelated to
+  // Metric's definition). The C++ side keeps full enum type safety; Python
+  // callers pass a metric name string (umap-learn style, e.g.
+  // `params.metric = "cosine"`) or, for backwards compatibility, an int /
+  // the gpumap.Metric IntEnum (gpumap/metric.py).
   py::class_<gpumap::GPUMAPParams>(m, "GPUMAPParams")
       .def(py::init<>())
       .def_readwrite("n_neighbors", &gpumap::GPUMAPParams::n_neighbors)
@@ -22,6 +65,14 @@ PYBIND11_MODULE(_core, m) {
       .def_readwrite("b", &gpumap::GPUMAPParams::b)
       .def_readwrite("alpha", &gpumap::GPUMAPParams::alpha)
       .def_readwrite("verbose", &gpumap::GPUMAPParams::verbose)
+      .def_property(
+          "metric",
+          [](const gpumap::GPUMAPParams &p) {
+            return metric_to_string(p.metric);
+          },
+          [](gpumap::GPUMAPParams &p, const py::object &v) {
+            p.metric = metric_from_object(v);
+          })
       .def_readwrite("n_instances", &gpumap::GPUMAPParams::n_instances)
       .def_readwrite("n_features", &gpumap::GPUMAPParams::n_features);
 

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "buffers.cuh"
+#include "gpumap/gpumap.cuh"
 #include "raft/util/cuda_rt_essentials.hpp"
 #include <algorithm>
 #include <cstdint>
@@ -20,10 +21,18 @@ __device__ __forceinline__ bool list_contains_id(const Idx_t *arr, int k,
   return false;
 }
 
+// Computes each row's squared L2 norm and writes it to the extra column at
+// input_data[row_offset + n_features] (see storage.cuh: data_block_size =
+// n_features + 1). Under Metric::Cosine, additionally normalizes the row to
+// unit length in place first, so the existing squared-Euclidean formula used
+// throughout the rest of the NNDescent pipeline (l2_a + l2_b - 2*dot)
+// reduces to 2*(1 - cos(a,b)) -- a monotonic function of cosine distance --
+// without any changes to the hot-path distance kernels.
 template <typename Data_t>
 __global__ void
 preprocess_l2_norms_kernel(Data_t *input_data, uint32_t batch_size,
-                           uint32_t n_features, uint32_t data_block_size) {
+                           uint32_t n_features, uint32_t data_block_size,
+                           Metric metric) {
   const size_t row = static_cast<size_t>(blockIdx.x);
 
   if (row >= batch_size)
@@ -50,8 +59,24 @@ preprocess_l2_norms_kernel(Data_t *input_data, uint32_t batch_size,
     __syncthreads();
   }
 
-  if (threadIdx.x == 0) {
-    input_data[row_offset + n_features] = static_cast<Data_t>(sdata[0]);
+  if (metric == Metric::Cosine) {
+    const float norm = sqrtf(sdata[0]);
+    if (norm > 0.0f) {
+      for (size_t j = static_cast<size_t>(threadIdx.x); j < n_features;
+           j += blockDim.x) {
+        input_data[row_offset + j] = static_cast<Data_t>(
+            static_cast<float>(input_data[row_offset + j]) / norm);
+      }
+    }
+    if (threadIdx.x == 0) {
+      // True squared norm after normalization is exactly 1 (skip re-reading
+      // the now-stale pre-normalization sdata[0]).
+      input_data[row_offset + n_features] = static_cast<Data_t>(1.0f);
+    }
+  } else {
+    if (threadIdx.x == 0) {
+      input_data[row_offset + n_features] = static_cast<Data_t>(sdata[0]);
+    }
   }
 }
 
@@ -901,8 +926,9 @@ template <typename Data_t, typename Idx_t, typename Index_t = int>
 void run_insertion(
     NNDBuffers<Data_t, Index_t> &buffers, std::vector<Idx_t> &batch_indices,
     Data_t *input_data, uint32_t data_block_size, uint32_t n_features,
-    uint32_t n_neighbors, uint32_t n_inserted_instances, uint32_t max_iter,
-    size_t seed, cudaStream_t stream, std::vector<Idx_t> &affected_indices,
+    uint32_t n_neighbors, uint32_t n_inserted_instances, Metric metric,
+    uint32_t max_iter, size_t seed, cudaStream_t stream,
+    std::vector<Idx_t> &affected_indices,
     std::vector<std::tuple<Idx_t, Idx_t, float, float, float>> &new_edges,
     Data_t *embedding = nullptr, uint32_t n_components = 0,
     uint32_t window_start = 0) {
@@ -938,7 +964,7 @@ void run_insertion(
         <<<static_cast<int>(batch_size), BLOCK_SIZE, shmem, stream>>>(
             input_data +
                 static_cast<size_t>(batch_start_offset) * data_block_size,
-            batch_size, n_features, data_block_size);
+            batch_size, n_features, data_block_size, metric);
     RAFT_CUDA_TRY(cudaGetLastError());
   }
 

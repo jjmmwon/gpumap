@@ -10,6 +10,8 @@
 
 namespace gpumap {
 
+enum class Metric { Euclidean = 0, Cosine = 1 };
+
 struct GPUMAPParams {
   size_t n_neighbors = 15;
   size_t n_components = 2;
@@ -20,6 +22,7 @@ struct GPUMAPParams {
   float b = 1.0f;
   float alpha = 1.0f;
   bool verbose = false;
+  Metric metric = Metric::Euclidean;
 
   size_t n_instances = 0;
   size_t n_features = 0;

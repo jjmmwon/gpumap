@@ -237,7 +237,7 @@ struct GPUMAP::Impl {
     run_insertion<Data_t, Idx_t>(
         storage.nnd_buffer, batch_indices, storage.data.data(),
         storage.data_block_size, storage.n_features, storage.n_neighbors,
-        storage.n_inserted_instances,
+        storage.n_inserted_instances, params.metric,
         /*max_iter=*/10, /*seed=*/seed, insertion_stream, affected_indices,
         new_edges, storage.embedding.data(), storage.n_components,
         window_start);
