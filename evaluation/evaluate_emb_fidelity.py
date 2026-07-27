@@ -1,7 +1,7 @@
 import numpy as np
 
 
-def eval_emb_certainty(
+def eval_emb_fidelity(
     emb_knn_indices: np.ndarray, ground_truth_sets: np.ndarray
 ) -> tuple[float, np.ndarray]:
     """
