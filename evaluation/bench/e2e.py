@@ -65,13 +65,13 @@ from evaluation.runner import (  # noqa: E402
     DEFAULT_MAX_STALLED_RUNS,
     DEFAULT_OUTPUT_ROOT,
 )
-from evaluation.utils import compute_knn_indices_and_distances  # noqa: E402
-from evaluation.evaluate_emb_certainty import eval_emb_certainty  # noqa: E402
+from evaluation.bench.quality import (  # noqa: E402
+    backfill_run_quality,
+    compute_quality,
+    load_baselines,
+)
 
 LOG = logging.getLogger("bench.e2e")
-
-BASELINES_DIR_NAME = "baselines"
-RECALL_SUBSAMPLE = 10_000
 
 
 def _git_hash() -> str:
@@ -84,107 +84,6 @@ def _git_hash() -> str:
         return h.decode().strip()
     except Exception:
         return "unknown"
-
-
-def _load_baselines(dataset: str) -> dict[str, Any]:
-    baselines_dir = DEFAULT_DATA_ROOT / dataset / BASELINES_DIR_NAME
-    result: dict[str, Any] = {}
-
-    orig_knn_path = baselines_dir / "original_nn_infos.npz"
-    if orig_knn_path.exists():
-        result["original_nn_infos_path"] = str(orig_knn_path)
-
-    gt_path = baselines_dir / "ground_truth_neighbors.npz"
-    if gt_path.exists():
-        result["ground_truth_path"] = str(gt_path)
-
-    fidelity_path = baselines_dir / "umap_fidelity_baseline.json"
-    if fidelity_path.exists():
-        with open(fidelity_path) as f:
-            result["umap_fidelity_baseline"] = json.load(f)
-
-    return result
-
-
-def _compute_final_quality(
-    model: GPUMAP,
-    baselines: dict[str, Any],
-    n_neighbors: int,
-    n_total: int,
-) -> dict[str, Any]:
-    quality: dict[str, Any] = {}
-
-    # NNG recall vs brute-force KNN
-    if "original_nn_infos_path" in baselines:
-        LOG.info("Computing NNG recall ...")
-        nng = to_numpy(model.get_neighbor_indices())
-        n_check = min(RECALL_SUBSAMPLE, n_total)
-        nng_sub = nng[:n_check].astype(np.int32)
-
-        with np.load(baselines["original_nn_infos_path"]) as f:
-            exact_sub = f["indices"].astype(np.int32)[:n_check]
-
-        k = min(nng_sub.shape[1], exact_sub.shape[1])
-        nng_sub = nng_sub[:, :k]
-        exact_sub = exact_sub[:, :k]
-
-        valid = (nng_sub >= 0) & (nng_sub < n_total)
-        nng_masked = np.where(valid, nng_sub, -1)
-        hit = (nng_masked[:, :, None] == exact_sub[:, None, :]).any(axis=2)
-        recall = float(hit[valid[:, : hit.shape[1]]].mean()) if valid.any() else 0.0
-
-        quality["nng_recall"] = recall
-        quality["nng_recall_n_check"] = n_check
-        quality["nng_recall_k"] = k
-        LOG.info("NNG recall=%.4f  (n_check=%d, k=%d)", recall, n_check, k)
-    else:
-        LOG.info(
-            "No original_nn_infos.npz found — skipping NNG recall. "
-            "Run: python -m evaluation.bench.prepare_baselines --dataset <dataset>"
-        )
-
-    # Embedding fidelity vs ground truth
-    if "ground_truth_path" in baselines:
-        LOG.info("Computing embedding fidelity ...")
-        embedding = to_numpy(model.get_embedding())
-
-        ground_truth = None
-        with np.load(baselines["ground_truth_path"]) as f:
-            key = f"k_{n_neighbors}"
-            if key not in f.files:
-                available = list(f.files)
-                LOG.warning(
-                    "Key %s not in ground_truth_neighbors.npz — available: %s",
-                    key, available,
-                )
-                key = available[0] if available else None
-            if key is not None:
-                ground_truth = f[key].astype(np.int32)
-
-        if ground_truth is not None:
-            emb_idx, _ = compute_knn_indices_and_distances(embedding, n_neighbors)
-            score, _ = eval_emb_certainty(emb_idx[:, :n_neighbors], ground_truth)
-            quality["fidelity"] = float(score)
-            quality["fidelity_k"] = n_neighbors
-
-            fb = baselines.get("umap_fidelity_baseline")
-            if fb:
-                quality["fidelity_baseline_mean"] = fb["mean"]
-                quality["fidelity_baseline_std"] = fb["std"]
-                quality["fidelity_vs_baseline"] = float(score) - fb["mean"]
-                LOG.info(
-                    "Fidelity=%.4f  baseline_mean=%.4f  Δ=%+.4f",
-                    score, fb["mean"], float(score) - fb["mean"],
-                )
-            else:
-                LOG.info("Fidelity=%.4f  (no fidelity baseline)", score)
-    else:
-        LOG.info(
-            "No ground_truth_neighbors.npz found — skipping fidelity. "
-            "Run: python -m evaluation.bench.prepare_baselines --dataset <dataset>"
-        )
-
-    return quality
 
 
 def _build_run_record(
@@ -276,8 +175,13 @@ def run_e2e(
     strategy_name: str,
     target_latency: float,
     tag: str,
-    compute_quality: bool,
+    eval_final_quality: bool,
     weights: tuple[float, float, float] | None = None,
+    eval_quality_trend: bool = False,
+    step_insertion: int = 1,
+    step_update: int = 1,
+    step_embedding: int = 1,
+    max_measurements: int | None = None,
 ) -> Path:
     dataset_path = (
         Path(npy_path)
@@ -339,6 +243,10 @@ def run_e2e(
     stop_reason = "max_runs_reached"
     stalled_runs = 0
     prev_state: tuple[int, int, int] | None = None
+
+    baselines: dict[str, Any] = {}
+    if eval_final_quality or eval_quality_trend:
+        baselines = load_baselines(dataset)
 
     bench_start = time.perf_counter()
     try:
@@ -415,12 +323,15 @@ def run_e2e(
 
         # Final quality (only when all operations completed)
         final_quality: dict[str, Any] = {}
-        if compute_quality and stop_reason == "completed":
-            baselines = _load_baselines(dataset)
-            final_quality = _compute_final_quality(
-                model, baselines, params.n_neighbors, data_loader.n_instances
+        if eval_final_quality and stop_reason == "completed":
+            final_quality = compute_quality(
+                to_numpy(model.get_neighbor_indices()),
+                to_numpy(model.get_embedding()),
+                baselines,
+                params.n_neighbors,
+                verbose=True,
             )
-        elif compute_quality:
+        elif eval_final_quality:
             LOG.info("Skipping final quality: stop_reason=%s", stop_reason)
 
     finally:
@@ -428,6 +339,17 @@ def run_e2e(
         close_estimator(ins_est)
         close_estimator(upd_est)
         close_estimator(emb_est)
+
+    # Per-run quality trend, computed after the fact from each selected run's saved
+    # .npz — never mid-loop, since a KNN pass between runs would bleed GPU time into
+    # the next run's wall_time via queue contention even though it never touches that
+    # field directly.
+    if eval_quality_trend:
+        n_done = backfill_run_quality(
+            records, runs_dir, baselines, step_insertion, step_update, step_embedding,
+            max_measurements,
+        )
+        LOG.info("Backfilled quality for %d/%d run(s)", n_done, len(records))
 
     summary = _compute_summary(records)
 
@@ -483,7 +405,7 @@ def _print_summary(r: dict[str, Any]) -> None:
     if q.get("nng_recall") is not None:
         print(
             f"  NNG recall      : {q['nng_recall']:.4f}"
-            f"  (k={q.get('nng_recall_k', '?')}, n_check={q.get('nng_recall_n_check', '?')})"
+            f"  (k={q.get('nng_recall_k', '?')}, n={q.get('nng_recall_n_check', '?')})"
         )
     if q.get("fidelity") is not None:
         line = f"  Fidelity        : {q['fidelity']:.4f}  (k={q['fidelity_k']})"
@@ -519,6 +441,42 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--tag", default="", help="Tag appended to output dir name (e.g. v1-opt)")
     p.add_argument("--skip-final-quality", action="store_true")
+    p.add_argument(
+        "--eval-quality-trend",
+        action="store_true",
+        help="After the benchmark finishes, backfill fidelity/nng_recall for a "
+             "sampled subset of runs (in addition to the final quality) by reloading "
+             "each selected run's saved runs/*.npz — never mid-loop, so it can't "
+             "distort per-run wall_time. Sampling is controlled by "
+             "--step-insertion/--step-update/--step-embedding, or --max-measurements. "
+             "Equivalent to running eval_runs_quality.py separately afterwards, just "
+             "automatic.",
+    )
+    p.add_argument(
+        "--step-insertion", type=int, default=1, metavar="N",
+        help="Backfill quality every Nth run from the insertion stage (before "
+             "insertion completed) (default: 1 = every run). Ignored if "
+             "--max-measurements is set. Only used with --eval-quality-trend.",
+    )
+    p.add_argument(
+        "--step-update", type=int, default=1, metavar="N",
+        help="Backfill quality every Nth run from the update stage (insertion "
+             "completed, update not yet) (default: 1). Ignored if --max-measurements "
+             "is set. Only used with --eval-quality-trend.",
+    )
+    p.add_argument(
+        "--step-embedding", type=int, default=1, metavar="N",
+        help="Backfill quality every Nth run from the embedding-only stage (insertion "
+             "and update completed, embedding not yet) (default: 1). Ignored if "
+             "--max-measurements is set. Only used with --eval-quality-trend.",
+    )
+    p.add_argument(
+        "--max-measurements", type=int, default=None, metavar="N",
+        help="Cap backfilled quality evaluations to at most N per stage (insertion, "
+             "update, embedding each capped independently), evenly spaced across the "
+             "stage — overrides --step-insertion/--step-update/--step-embedding. Only "
+             "used with --eval-quality-trend.",
+    )
     return p.parse_args()
 
 
@@ -535,8 +493,13 @@ def main() -> None:
         strategy_name=args.strategy,
         target_latency=args.target_latency,
         tag=args.tag,
-        compute_quality=not args.skip_final_quality,
+        eval_final_quality=not args.skip_final_quality,
         weights=tuple(args.weights) if args.weights is not None else None,
+        eval_quality_trend=args.eval_quality_trend,
+        step_insertion=args.step_insertion,
+        step_update=args.step_update,
+        step_embedding=args.step_embedding,
+        max_measurements=args.max_measurements,
     )
 
 

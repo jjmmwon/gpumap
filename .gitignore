@@ -101,6 +101,7 @@ evaluation/preprocess_results
 evaluation/progressive_results
 evaluation/data
 evaluation/data_scaled
+evaluation/progressive-umap
 tests
 # -----------------------------
 # Test files

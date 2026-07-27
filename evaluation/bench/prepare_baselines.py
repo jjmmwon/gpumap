@@ -50,7 +50,7 @@ from evaluation.runner import (  # noqa: E402
     DEFAULT_DATA_ROOT,
 )
 from evaluation.utils import compute_knn_indices_and_distances  # noqa: E402
-from evaluation.evaluate_emb_certainty import eval_emb_certainty  # noqa: E402
+from evaluation.evaluate_emb_fidelity import eval_emb_fidelity  # noqa: E402
 
 LOG = logging.getLogger("bench.prepare_baselines")
 
@@ -91,7 +91,6 @@ def _build_umap_runner(data: np.ndarray, n_neighbors: int, n_components: int = 2
             )
 
         return run_umap
-RECALL_SUBSAMPLE = 10_000
 
 
 def _setup_logger(output_dir: Path) -> None:
@@ -150,18 +149,16 @@ def phase_nng_recall(
 
     n = len(data)
     k = n_neighbors
-    n_check = min(RECALL_SUBSAMPLE, n)
-    exact_sub = exact_indices[:n_check, :k].astype(np.int32)
+    exact_full = exact_indices[:, :k].astype(np.int32)
 
     LOG.info(
-        "NNDescent recall (cuvs): %d trials  n=%d  k=%d  subsample=%d",
-        n_trials, n, k, n_check,
+        "NNDescent recall (cuvs): %d trials  n=%d  k=%d",
+        n_trials, n, k,
     )
 
     data_gpu = cp.asarray(np.ascontiguousarray(data, dtype=np.float32))
     index_params = nn_descent.IndexParams(
-        graph_degree=k,
-        intermediate_graph_degree=2 * k,
+        graph_degree=k
     )
 
     recalls: list[float] = []
@@ -172,10 +169,10 @@ def phase_nng_recall(
         index = nn_descent.build(index_params, data_gpu)
         nng = np.asarray(index.graph).astype(np.int32)  # (n, graph_degree)
 
-        nng_sub = nng[:n_check, :k]
-        valid = (nng_sub >= 0) & (nng_sub < n)
-        nng_masked = np.where(valid, nng_sub, -1)
-        hit = (nng_masked[:, :, None] == exact_sub[:, None, :]).any(axis=2)
+        nng_full = nng[:, :k]
+        valid = (nng_full >= 0) & (nng_full < n)
+        nng_masked = np.where(valid, nng_full, -1)
+        hit = (nng_masked[:, :, None] == exact_full[:, None, :]).any(axis=2)
         recall = float(hit[valid[:, : hit.shape[1]]].mean()) if valid.any() else 0.0
         recalls.append(recall)
         LOG.info("    recall=%.4f  elapsed=%.1fs", recall, time.perf_counter() - t0)
@@ -183,7 +180,7 @@ def phase_nng_recall(
     result: dict[str, Any] = {
         "n_neighbors": n_neighbors,
         "n_trials": n_trials,
-        "n_check": n_check,
+        "n_check": n,
         "recalls": recalls,
         "mean_recall": float(np.mean(recalls)),
         "std_recall": float(np.std(recalls)),
@@ -386,7 +383,7 @@ def phase_fidelity_baseline(
         t0 = time.perf_counter()
         emb = run_umap()
         emb_idx, _ = compute_knn_indices_and_distances(emb, n_neighbors)
-        score, _ = eval_emb_certainty(emb_idx[:, :n_neighbors], ground_truth)
+        score, _ = eval_emb_fidelity(emb_idx[:, :n_neighbors], ground_truth)
         fidelity_values.append(float(score))
         LOG.info(
             "    fidelity=%.4f  elapsed=%.1fs", score, time.perf_counter() - t0
