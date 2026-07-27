@@ -17,6 +17,8 @@ Usage (from core/):
         --weights 1,1,1 1,4,1 1,8,1 1,12,4 1,16,1 4,12,1
     python -m evaluation.bench.weight_sweep --dataset svhn --tag-prefix sweepA --retries 2
     python -m evaluation.bench.weight_sweep --dataset svhn --force   # rerun everything
+    python -m evaluation.bench.weight_sweep --dataset svhn --eval-quality-trend \\
+        --step-insertion 5 --step-update 5   # also populate per-run quality for trend charts
 
 Then open evaluation/bench/weight_sweep_analysis.ipynb, set DATASET / TAG_PREFIX
 to match, and run all cells.
@@ -47,11 +49,14 @@ CORE_DIR = REPO_ROOT
 # workload; mirrors weight configs already explored ad hoc in progressive_results/.
 DEFAULT_WEIGHTS_GRID: list[tuple[float, float, float]] = [
     (1.0, 1.0, 1.0),
+    (1.0, 2.0, 1.0),
+    (2.0, 1.0, 1.0),
+    (1.0, 1.0, 2.0),
     (1.0, 4.0, 1.0),
     (1.0, 8.0, 1.0),
     (1.0, 12.0, 1.0),
-    (1.0, 12.0, 4.0),
     (1.0, 16.0, 1.0),
+    (1.0, 12.0, 4.0),
     (4.0, 12.0, 1.0),
 ]
 
@@ -99,6 +104,11 @@ def run_config(
     tag: str,
     retries: int,
     retry_cooldown: float,
+    eval_quality_trend: bool = False,
+    step_insertion: int = 1,
+    step_update: int = 1,
+    step_embedding: int = 1,
+    max_measurements: int | None = None,
 ) -> dict[str, Any] | None:
     cmd = [
         python_bin, "-m", "evaluation.bench.e2e",
@@ -109,6 +119,15 @@ def run_config(
     ]
     if weights is not None:
         cmd += ["--weights", *[str(w) for w in weights]]
+    if eval_quality_trend:
+        cmd += [
+            "--eval-quality-trend",
+            "--step-insertion", str(step_insertion),
+            "--step-update", str(step_update),
+            "--step-embedding", str(step_embedding),
+        ]
+        if max_measurements is not None:
+            cmd += ["--max-measurements", str(max_measurements)]
 
     for attempt in range(1, retries + 1):
         print(f"\n>>> [{tag}] attempt {attempt}/{retries}: {' '.join(cmd)}")
@@ -151,6 +170,33 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--force", action="store_true", help="Rerun configs even if already completed")
     p.add_argument("--python-bin", default=sys.executable)
     p.add_argument("--summary-out", default=None, metavar="FILE")
+    p.add_argument(
+        "--eval-quality-trend",
+        action="store_true",
+        help="Pass --eval-quality-trend through to each e2e.py config, so "
+             "runs[i]['quality'] (fidelity, nng_recall) is populated across the run "
+             "for trend charts, not just the final value. See --step-* below.",
+    )
+    p.add_argument(
+        "--step-insertion", type=int, default=1, metavar="N",
+        help="Forwarded to e2e.py --step-insertion (default: 1). Only used with "
+             "--eval-quality-trend.",
+    )
+    p.add_argument(
+        "--step-update", type=int, default=1, metavar="N",
+        help="Forwarded to e2e.py --step-update (default: 1). Only used with "
+             "--eval-quality-trend.",
+    )
+    p.add_argument(
+        "--step-embedding", type=int, default=1, metavar="N",
+        help="Forwarded to e2e.py --step-embedding (default: 1). Only used with "
+             "--eval-quality-trend.",
+    )
+    p.add_argument(
+        "--max-measurements", type=int, default=None, metavar="N",
+        help="Forwarded to e2e.py --max-measurements. Only used with "
+             "--eval-quality-trend.",
+    )
     return p.parse_args()
 
 
@@ -181,6 +227,11 @@ def main() -> None:
             benchmark = run_config(
                 args.python_bin, args.dataset, strategy, weights,
                 args.target_latency, tag, args.retries, args.retry_cooldown,
+                eval_quality_trend=args.eval_quality_trend,
+                step_insertion=args.step_insertion,
+                step_update=args.step_update,
+                step_embedding=args.step_embedding,
+                max_measurements=args.max_measurements,
             )
 
         if benchmark is None:
