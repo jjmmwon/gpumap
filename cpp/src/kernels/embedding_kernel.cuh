@@ -601,7 +601,8 @@ __global__ void
 prepend_self_knn_kernel(const Idx_t *__restrict__ src_indices,
                         int src_idx_stride, const float *__restrict__ src_dists,
                         int src_dist_stride, Idx_t *__restrict__ dst_indices,
-                        float *__restrict__ dst_dists, int n, int k) {
+                        float *__restrict__ dst_dists, int n, int k,
+                        bool src_dists_are_squared_euclidean) {
   // Each thread handles one output element; output size = n * k
   int tid = blockIdx.x * blockDim.x + threadIdx.x;
   int total = n * k;
@@ -619,8 +620,13 @@ prepend_self_knn_kernel(const Idx_t *__restrict__ src_indices,
     int src_col = col - 1;
     dst_indices[(size_t)row * k + col] =
         src_indices[(size_t)row * src_idx_stride + src_col];
+    // NND stores squared L2 (dot-product trick: l2_a + l2_b - 2*dot) for
+    // Metric::Euclidean; smooth_knn_dist_kernel expects true distances, so
+    // convert here at the single point where the internal ranking
+    // representation becomes the embedding-facing one.
+    float d = src_dists[(size_t)row * src_dist_stride + src_col];
     dst_dists[(size_t)row * k + col] =
-        src_dists[(size_t)row * src_dist_stride + src_col];
+        src_dists_are_squared_euclidean ? sqrtf(fmaxf(d, 0.0f)) : d;
   }
 }
 

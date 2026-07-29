@@ -408,7 +408,8 @@ struct GPUMAP::Impl {
           static_cast<int>(storage.neighbor_indices_block_size),
           storage.neighbor_dists.data(),
           static_cast<int>(storage.neighbor_dists_block_size),
-          d_embed_indices.data(), d_embed_dists.data(), n_int, k);
+          d_embed_indices.data(), d_embed_dists.data(), n_int, k,
+          params.metric == Metric::Euclidean);
     }
 
     // ── Allocate COO (2*n_batch*k: first half directed, second half extras) ──
