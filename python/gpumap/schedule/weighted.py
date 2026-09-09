@@ -17,7 +17,7 @@ class WeightedStrategy(BaseStrategy):
         self,
         n_instances: int,
         n_neighbors: int = 15,
-        weights: tuple[float, float, float] = (1.0, 12.0, 1.0),
+        weights: tuple[float, float, float] = (1.0, 2.0, 1.0),
         reserved: float = 0.1,
         insertion_estimator: Optional[Estimator] = None,
         update_estimator: Optional[Estimator] = None,

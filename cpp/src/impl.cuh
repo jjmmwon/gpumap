@@ -418,13 +418,35 @@ struct GPUMAP::Impl {
     rmm::device_uvector<int> coo_cols(max_nnz, embedding_stream);
     rmm::device_uvector<float> coo_vals(max_nnz, embedding_stream);
 
+    // Complement of batch_indices, computed early so we know below whether
+    // to allocate d_sigmas/d_rhos for the heuristic reposition step.
+    std::vector<Idx_t> unselected;
+    {
+      std::vector<char> in_batch(n, 0);
+      for (Idx_t id : batch_indices)
+        in_batch[id] = 1;
+      unselected.reserve(n - batch_indices.size());
+      for (size_t i = 0; i < n; ++i)
+        if (!in_batch[i])
+          unselected.push_back(static_cast<Idx_t>(i));
+    }
+    const bool has_unselected = !unselected.empty();
+
     // ── Build fuzzy simplicial set graph ─────────────────────────────────
     // sigma/rho computed for all n; COO built only for batch rows.
     // Returns actual nnz (directed + asymmetric reverse entries).
+    // out_sigmas/out_rhos let the heuristic reposition step below reuse
+    // sigma/rho instead of recomputing them.
+    rmm::device_uvector<float> d_sigmas(has_unselected ? n_int : 0,
+                                        embedding_stream);
+    rmm::device_uvector<float> d_rhos(has_unselected ? n_int : 0,
+                                      embedding_stream);
     const int actual_nnz = compute_fuzzy_graph<Idx_t>(
         d_embed_indices.data(), k, d_embed_dists.data(), k, n_int, k,
         d_batch.data(), n_batch, coo_rows.data(), coo_cols.data(),
-        coo_vals.data(), embedding_stream);
+        coo_vals.data(), embedding_stream,
+        has_unselected ? d_sigmas.data() : nullptr,
+        has_unselected ? d_rhos.data() : nullptr);
 
     if (embedding_sweeps_done_ > 2) {
       storage.embedding_completed = storage.update_completed;
@@ -455,6 +477,24 @@ struct GPUMAP::Impl {
                         static_cast<int>(params.negative_sample_rate),
                         42ULL, // seed
                         embedding_stream);
+
+    // ── Heuristic reposition for rows NOT selected this round ─────────────
+    // Purely additive (doesn't affect batch_indices/cursor state or the SGD
+    // pass above). Reuses d_embed_indices/d_embed_dists/d_sigmas/d_rhos
+    // already computed for all n rows, so no extra passes are needed.
+    if (has_unselected) {
+      rmm::device_uvector<Idx_t> d_unselected(unselected.size(),
+                                              embedding_stream);
+      cudaMemcpyAsync(d_unselected.data(), unselected.data(),
+                      unselected.size() * sizeof(Idx_t),
+                      cudaMemcpyHostToDevice, embedding_stream);
+
+      run_heuristic_neighbor_avg_update<Idx_t>(
+          d_embed_indices.data(), k, d_embed_dists.data(), k, n_int, k,
+          d_sigmas.data(), d_rhos.data(), d_unselected.data(),
+          static_cast<int>(unselected.size()), storage.embedding.data(),
+          embedding_stream);
+    }
 
     return static_cast<uint32_t>(batch_indices.size());
   }

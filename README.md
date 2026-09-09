@@ -75,6 +75,7 @@ params.n_neighbors   = 15      # k for k-NN graph
 params.n_components  = 2       # output dimensionality
 params.min_dist      = 0.1     # controls compactness of the embedding
 params.max_epoch     = 200     # number of optimization epochs per embedding step
+params.metric        = "euclidean"   # or "cosine"
 ```
 
 ### Data Loaders

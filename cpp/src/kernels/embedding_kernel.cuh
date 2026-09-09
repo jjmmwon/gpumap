@@ -641,13 +641,18 @@ prepend_self_knn_kernel(const Idx_t *__restrict__ src_indices,
 //   here)
 //
 // Returns actual nnz = n_batch*k + number of asymmetric reverse entries added.
+//
+// out_sigmas / out_rhos: optional (default nullptr). If non-null, the
+// per-row sigma/rho computed in Step 2 are also copied there (n floats
+// each) for a caller to reuse.
 // ─────────────────────────────────────────────────────────────────────────────
 template <typename Idx_t>
 int compute_fuzzy_graph(const Idx_t *knn_indices, int knn_idx_stride,
                         const float *knn_dists, int knn_dist_stride, int n,
                         int k, const Idx_t *batch_indices, int n_batch,
                         int *coo_rows, int *coo_cols, float *coo_vals,
-                        cudaStream_t stream) {
+                        cudaStream_t stream, float *out_sigmas = nullptr,
+                        float *out_rhos = nullptr) {
   const int tpb = 256;
   const int total = n * k;
   const int blk_total = (total + tpb - 1) / tpb;
@@ -676,6 +681,15 @@ int compute_fuzzy_graph(const Idx_t *knn_indices, int knn_idx_stride,
   cudaMemsetAsync(rhos.data(), 0, n * sizeof(float), stream);
   smooth_knn_dist_kernel<<<blk_n, tpb, 0, stream>>>(
       knn_dists, knn_dist_stride, n, k, mean_dist, sigmas.data(), rhos.data());
+
+  if (out_sigmas) {
+    cudaMemcpyAsync(out_sigmas, sigmas.data(), (size_t)n * sizeof(float),
+                    cudaMemcpyDeviceToDevice, stream);
+  }
+  if (out_rhos) {
+    cudaMemcpyAsync(out_rhos, rhos.data(), (size_t)n * sizeof(float),
+                    cudaMemcpyDeviceToDevice, stream);
+  }
 
   // Step 3: directed membership strengths p_ij → first half of COO
   compute_membership_strength_kernel<Idx_t><<<blk_batch, tpb, 0, stream>>>(
@@ -780,6 +794,102 @@ void run_optimize_layout(float *embedding, int n, int *coo_rows, int *coo_cols,
 
   // Sync before returning so that next_sample/next_neg (local uvectors) are
   // not freed while the last optimize_batch_kernel is still running.
+  cudaStreamSynchronize(stream);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Kernel: heuristic_neighbor_avg_kernel
+//
+// Repositions rows NOT selected this round to the fuzzy-membership-weighted
+// average of their k-NN neighbors' current embedding position, using the
+// same v_ij weighting as compute_membership_strength_kernel. Reads from
+// `embedding_in` (a pre-launch snapshot) and writes to `embedding_out` so
+// concurrently-updated rows never observe each other's new value. Rows with
+// no positively-weighted neighbor are left untouched. n_components is
+// hardcoded to 2, matching optimize_batch_kernel's layout assumption.
+// ─────────────────────────────────────────────────────────────────────────────
+template <typename Idx_t>
+__global__ void heuristic_neighbor_avg_kernel(
+    const Idx_t *__restrict__ knn_indices, int idx_stride,
+    const float *__restrict__ knn_dists, int dist_stride,
+    const float *__restrict__ sigmas, const float *__restrict__ rhos,
+    const Idx_t *__restrict__ update_indices, int n_update, int k,
+    const float *__restrict__ embedding_in, float *__restrict__ embedding_out) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= n_update)
+    return;
+
+  int row = static_cast<int>(update_indices[idx]);
+  const float sigma = sigmas[row];
+  const float rho = rhos[row];
+
+  float wsum = 0.0f;
+  float acc0 = 0.0f, acc1 = 0.0f;
+
+  for (int ki = 0; ki < k; ++ki) {
+    Idx_t raw_col = knn_indices[(size_t)row * idx_stride + ki];
+    int col = static_cast<int>(raw_col);
+    if (col == row)
+      continue; // self at knn col 0 (embed-time KNN layout)
+
+    float dist = knn_dists[(size_t)row * dist_stride + ki];
+    bool valid_dist = isfinite(dist) && dist >= 0.0f && dist < FLT_MAX / 2.0f;
+    if (!valid_dist)
+      continue;
+
+    float w;
+    if (dist - rho <= 0.0f || sigma == 0.0f) {
+      w = 1.0f;
+    } else {
+      w = __expf(-((dist - rho) / sigma));
+      if (w < FLT_MIN)
+        w = FLT_MIN;
+    }
+
+    wsum += w;
+    acc0 += w * embedding_in[(size_t)col * 2 + 0];
+    acc1 += w * embedding_in[(size_t)col * 2 + 1];
+  }
+
+  if (wsum > 0.0f) {
+    embedding_out[(size_t)row * 2 + 0] = acc0 / wsum;
+    embedding_out[(size_t)row * 2 + 1] = acc1 / wsum;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Host launcher: run_heuristic_neighbor_avg_update
+//
+// Takes sigma/rho as caller-supplied buffers (e.g. compute_fuzzy_graph's
+// out_sigmas/out_rhos) to avoid a duplicate sigma/rho pass. Safe to call
+// with n_update == 0 (no-op).
+// ─────────────────────────────────────────────────────────────────────────────
+template <typename Idx_t>
+void run_heuristic_neighbor_avg_update(const Idx_t *knn_indices,
+                                       int knn_idx_stride,
+                                       const float *knn_dists,
+                                       int knn_dist_stride, int n, int k,
+                                       const float *sigmas, const float *rhos,
+                                       const Idx_t *update_indices,
+                                       int n_update, float *embedding,
+                                       cudaStream_t stream) {
+  if (n_update <= 0 || n <= 0 || k <= 0)
+    return;
+
+  const int tpb = 256;
+  const int blk_update = (n_update + tpb - 1) / tpb;
+
+  // Snapshot current embedding so rows updated in this launch never read a
+  // neighbor's partially-written new value.
+  rmm::device_uvector<float> embedding_snapshot((size_t)n * 2, stream);
+  cudaMemcpyAsync(embedding_snapshot.data(), embedding,
+                  (size_t)n * 2 * sizeof(float), cudaMemcpyDeviceToDevice,
+                  stream);
+
+  heuristic_neighbor_avg_kernel<Idx_t><<<blk_update, tpb, 0, stream>>>(
+      knn_indices, knn_idx_stride, knn_dists, knn_dist_stride, sigmas, rhos,
+      update_indices, n_update, k, embedding_snapshot.data(), embedding);
+
   cudaStreamSynchronize(stream);
 }
 

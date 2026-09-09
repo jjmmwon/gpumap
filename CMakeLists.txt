@@ -39,6 +39,15 @@ if(CCACHE_PROGRAM)
   message(STATUS "[gpumap] ccache: ${CCACHE_PROGRAM}")
 endif()
 
+# Compile for the GPU actually installed on this machine.
+# Override with -DCMAKE_CUDA_ARCHITECTURES=xx if cross-compiling.
+# Must be set before project()/enable_language(CUDA) -- that call gives
+# CMAKE_CUDA_ARCHITECTURES its own built-in (non-native) default if unset,
+# after which this guard's "NOT DEFINED" check no longer triggers.
+if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES OR CMAKE_CUDA_ARCHITECTURES STREQUAL "")
+  set(CMAKE_CUDA_ARCHITECTURES native)
+endif()
+
 # ── Project ───────────────────────────────────────────────────────────────────
 project(gpumap LANGUAGES CXX CUDA)
 
@@ -47,12 +56,6 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CUDA_STANDARD 17)
 set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 set(PYBIND11_FINDPYTHON ON)
-
-# Compile for the GPU actually installed on this machine.
-# Override with -DCMAKE_CUDA_ARCHITECTURES=xx if cross-compiling.
-if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES OR CMAKE_CUDA_ARCHITECTURES STREQUAL "")
-  set(CMAKE_CUDA_ARCHITECTURES native)
-endif()
 
 find_package(CUDAToolkit REQUIRED)
 find_package(pybind11 CONFIG REQUIRED)
