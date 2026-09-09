@@ -97,16 +97,12 @@ data/
 outputs/
 checkpoints/
 results/
-evaluation/preprocess_results
-evaluation/progressive_results
-evaluation/data
-evaluation/data_scaled
-evaluation/progressive-umap
 tests
+
 # -----------------------------
-# Test files
+# Evaluation files
 # -----------------------------
-# tests/
+evaluation/
 
 # -----------------------------
 # Misc
@@ -114,3 +110,6 @@ tests
 build_scripts.txt
 BENCHMARK.md
 *.ipynb
+*.png
+*.npy
+*.npz
